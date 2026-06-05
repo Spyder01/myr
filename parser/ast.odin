@@ -107,8 +107,14 @@ ForStatement :: struct {
 BreakStatement    :: struct {}
 ContinueStatement :: struct {}
 
+ConstStatement :: struct {
+	name:  lexer.Token,
+	value: ExpressionIdx,
+}
+
 Statement :: union {
 	LetStatement,
+	ConstStatement,
 	ReturnStatement,
 	ExpressionStatement,
 	WithContextStatement,
@@ -155,11 +161,17 @@ EnumDecl :: struct {
 
 ImportDecl :: distinct lexer.Token
 
+ConstDecl :: struct {
+	name:  lexer.Token,
+	value: ExpressionIdx,
+}
+
 Declaration :: union {
 	FunctionDecl,
 	StructDecl,
 	EnumDecl,
 	ImportDecl,
+	ConstDecl,
 }
 
 NamedType :: distinct lexer.Token
@@ -206,10 +218,12 @@ ast_destroy :: proc(ast: ^AST) {
 				delete(d.variants)
 				delete(d.fields)
 			case ImportDecl:
+		case ConstDecl:
 			}
 		case Statement:
 			switch s in n {
 			case LetStatement:
+			case ConstStatement:
 			case ReturnStatement:
 			case ExpressionStatement:
 			case WithContextStatement:

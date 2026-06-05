@@ -12,7 +12,7 @@ visit_decl :: proc(ast: ^AST, idx: DeclarationIdx, visit: Visitor) {
 	switch d in ast.nodes[idx].(Declaration) {
 	case FunctionDecl:
 		visit_block(ast, d.body, visit)
-	case StructDecl, EnumDecl, ImportDecl:
+	case StructDecl, EnumDecl, ImportDecl, ConstDecl:
 		// leaves
 	}
 }
@@ -26,6 +26,8 @@ visit_stmt :: proc(ast: ^AST, idx: StatementIdx, visit: Visitor) {
 	if idx == StatementIdx(INVALID_IDX) do return
 	visit(ast.nodes[idx], ast.spans[idx])
 	switch s in ast.nodes[idx].(Statement) {
+	case ConstStatement:
+		visit_expr(ast, s.value, visit)
 	case LetStatement:
 		visit_expr(ast, s.value, visit)
 	case ReturnStatement:
@@ -163,6 +165,8 @@ walker_push_expr :: proc(w: ^WalkerCursor, e: Expression) {
 @private
 walker_push_stmt :: proc(w: ^WalkerCursor, s: Statement) {
 	switch v in s {
+	case ConstStatement:
+		append(&w.stack, u32(v.value))
 	case LetStatement:
 		append(&w.stack, u32(v.value))
 	case ReturnStatement:

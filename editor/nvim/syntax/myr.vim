@@ -3,7 +3,7 @@ if exists("b:current_syntax")
 endif
 
 " keywords
-syntax keyword myrKeyword function let return if else for break continue
+syntax keyword myrKeyword function let return if else for break continue const
 syntax keyword myrKeyword struct enum import with context soa aos match
 syntax keyword myrBoolean true false
 syntax keyword myrNil    nil

@@ -4,6 +4,7 @@ import "../../parser"
 import "../../lexer"
 import "core:strconv"
 import "core:fmt"
+import "core:strings"
 
 CompilerError :: struct {
 	message: string,
@@ -23,17 +24,20 @@ Compiler :: struct {
 	errors:      [MAX_ERROR_COUNT]CompilerError,
 	error_count: u8,
 	loop_ctx:    ^LoopCtx,
+	const_table: map[string]Value,
 }
 
 new_compiler :: proc(ast: ^parser.AST) -> Compiler {
 	return Compiler{
-		bc  = new_bytecode_compiler("__main__", 0),
-		ast = ast,
+		bc          = new_bytecode_compiler("__main__", 0),
+		ast         = ast,
+		const_table = make(map[string]Value),
 	}
 }
 
 compiler_destroy :: proc(c: ^Compiler) {
 	compiler_free(&c.bc)
+	delete(c.const_table)
 }
 
 compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
@@ -78,6 +82,10 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 	switch d in node.(parser.Declaration) {
 	case parser.FunctionDecl:
 		compile_function(c, d, span)
+	case parser.ConstDecl:
+		if val, ok := eval_const_expr(c, d.value, span); ok {
+			c.const_table[d.name.data] = val
+		}
 	case parser.ImportDecl:
 		// skip for now
 	case parser.StructDecl, parser.EnumDecl:
@@ -97,7 +105,7 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 	}
 
 	// compile body
-	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count}
+	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table}
 	compile_block(&child, d.body)
 	emit(&child.bc, .RETURN, span)
 	c.errors      = child.errors
@@ -142,6 +150,11 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 	span := c.ast.spans[idx]
 
 	switch s in node.(parser.Statement) {
+	case parser.ConstStatement:
+		if val, ok := eval_const_expr(c, s.value, span); ok {
+			c.const_table[s.name.data] = val
+		}
+
 	case parser.LetStatement:
 		compile_expr(c, s.value)
 		if c.bc.scope_depth == 0 {
@@ -273,6 +286,11 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.IdentExpression:
 		tok := lexer.Token(e)
 		name := tok.data
+		// const table is checked first — inlined as an immediate value
+		if val, ok := c.const_table[name]; ok {
+			emit_constant(&c.bc, val, span)
+			return
+		}
 		// check locals first (inner → outer)
 		slot, found := resolve_local(&c.bc, name)
 		if found {
@@ -416,15 +434,105 @@ parse_literal :: proc(tok: lexer.Token) -> Value {
 		f, _ := strconv.parse_f64(tok.data)
 		return f64(f)
 	case .STRING:
-		// strip surrounding quotes
-		if len(tok.data) >= 2 {
-			return tok.data[1:len(tok.data)-1]
-		}
-		return ""
+		if len(tok.data) < 2 { return "" }
+		raw := tok.data[1:len(tok.data)-1]
+		return decode_string_escapes(raw)
+
 	case .TRUE:  return true
 	case .FALSE: return false
 	}
 	return Nil{}
+}
+
+eval_const_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: lexer.Span) -> (Value, bool) {
+	node := c.ast.nodes[idx]
+
+	#partial switch e in node.(parser.Expression) {
+	case parser.LiteralExpression:
+		return parse_literal(lexer.Token(e)), true
+
+	case parser.IdentExpression:
+		name := lexer.Token(e).data
+		if val, ok := c.const_table[name]; ok {
+			return val, true
+		}
+		compiler_error(c, "undefined constant", span)
+		return Nil{}, false
+
+	case parser.UnaryExpression:
+		val, ok := eval_const_expr(c, e.operand, span)
+		if !ok { return Nil{}, false }
+		#partial switch e.op.kind {
+		case .MINUS:
+			if n, ok2 := val.(i64); ok2 { return -n, true }
+			if f, ok2 := val.(f64); ok2 { return -f, true }
+		case .BANG:
+			if b, ok2 := val.(bool); ok2 { return !b, true }
+		}
+		compiler_error(c, "invalid unary operator in const expression", span)
+		return Nil{}, false
+
+	case parser.BinaryExpression:
+		lv, lok := eval_const_expr(c, e.left,  span)
+		rv, rok := eval_const_expr(c, e.right, span)
+		if !lok || !rok { return Nil{}, false }
+		if ln, ok := lv.(i64); ok {
+			if rn, ok2 := rv.(i64); ok2 {
+				#partial switch e.operation.kind {
+				case .PLUS:    return ln + rn, true
+				case .MINUS:   return ln - rn, true
+				case .STAR:    return ln * rn, true
+				case .SLASH:
+					if rn == 0 { compiler_error(c, "division by zero in const expression", span); return Nil{}, false }
+					return ln / rn, true
+				case .PERCENT:
+					if rn == 0 { compiler_error(c, "modulo by zero in const expression", span); return Nil{}, false }
+					return ln % rn, true
+				}
+			}
+		}
+		if lf, ok := lv.(f64); ok {
+			if rf, ok2 := rv.(f64); ok2 {
+				#partial switch e.operation.kind {
+				case .PLUS:  return lf + rf, true
+				case .MINUS: return lf - rf, true
+				case .STAR:  return lf * rf, true
+				case .SLASH: return lf / rf, true
+				}
+			}
+		}
+		compiler_error(c, "invalid operands in const expression", span)
+		return Nil{}, false
+	}
+
+	compiler_error(c, "not a compile-time constant expression", span)
+	return Nil{}, false
+}
+
+decode_string_escapes :: proc(s: string) -> string {
+	if !strings.contains(s, "\\") { return s }
+	b := strings.builder_make()
+	i := 0
+	for i < len(s) {
+		if s[i] == '\\' && i + 1 < len(s) {
+			i += 1
+			switch s[i] {
+			case 'n':  strings.write_byte(&b, '\n')
+			case 't':  strings.write_byte(&b, '\t')
+			case 'r':  strings.write_byte(&b, '\r')
+			case '\\': strings.write_byte(&b, '\\')
+			case '"':  strings.write_byte(&b, '"')
+			case '0':  strings.write_byte(&b, 0)
+			case:
+				strings.write_byte(&b, '\\')
+				strings.write_byte(&b, s[i])
+			}
+		} else {
+			strings.write_byte(&b, s[i])
+		}
+		i += 1
+	}
+	return strings.to_string(b)
 }
 
 compiler_error :: proc(c: ^Compiler, msg: string, span: lexer.Span) {

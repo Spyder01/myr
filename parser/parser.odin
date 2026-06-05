@@ -105,6 +105,7 @@ parse_declarations :: proc(p: ^Parser) {
 	case .STRUCT: parse_struct_declarations(p)
 	case .ENUM:   parse_enum_declarations(p)
 	case .IMPORT: parse_import_declarations(p)
+	case .CONST:  parse_const_declarations(p)
 	case:
 			append_elem(&p.errors, ParserError{kind = .UNEXPECTED_TOKEN, span = peek_span(p)})
 			advance(p)
@@ -213,6 +214,7 @@ parse_struct_fields :: proc(p: ^Parser) -> []StructField {
 parse_stmt :: proc(p: ^Parser) -> StatementIdx {
 	#partial switch peek(p) {
 	case .LET:      return parse_let_stmt(p)
+	case .CONST:    return parse_const_stmt(p)
 	case .RETURN:   return parse_return_stmt(p)
 	case .LOOP:     return parse_for(p)
 	case .BREAK:
@@ -271,6 +273,17 @@ parse_for :: proc(p: ^Parser) -> StatementIdx {
 }
 
 @private
+parse_const_stmt :: proc(p: ^Parser) -> StatementIdx {
+	expect(p, .CONST)
+	name  := expect(p, .IDENT)
+	expect(p, .EQ)
+	value := parse_expr(p)
+	stmt  := ConstStatement{name = name, value = value}
+	append_elem(&p.ast.nodes, Node(Statement(stmt)))
+	append_elem(&p.ast.spans, name.span)
+	return StatementIdx(len(p.ast.nodes) - 1)
+}
+
 parse_let_stmt :: proc(p: ^Parser) -> StatementIdx {
 	expect(p, .LET)
 	name := expect(p, .IDENT)
@@ -530,6 +543,18 @@ parse_import_declarations :: proc(p: ^Parser) {
 
 	append_elem(&p.ast.nodes, Node(Declaration(decl)))
 	append_elem(&p.ast.spans, path.span)
+}
+
+@private
+parse_const_declarations :: proc(p: ^Parser) {
+	expect(p, .CONST)
+	name  := expect(p, .IDENT)
+	expect(p, .EQ)
+	value := parse_expr(p)
+
+	decl := ConstDecl{name = name, value = value}
+	append_elem(&p.ast.nodes, Node(Declaration(decl)))
+	append_elem(&p.ast.spans, name.span)
 }
 
 

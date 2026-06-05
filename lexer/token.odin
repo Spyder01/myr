@@ -14,6 +14,7 @@ TokenType :: enum(u8) {
 
 	// Keywords
 	LET,
+	CONST,
 	FN,
 	IF,
 	ELSE,

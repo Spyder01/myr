@@ -91,6 +91,7 @@ is_alpha :: proc(ch: byte) -> bool {
 check_keyword :: proc(s: string) -> TokenType {
 	switch s {
 	case KW_LET:     return .LET
+	case KW_CONST:   return .CONST
 	case KW_FN:      return .FN
 	case KW_IF:      return .IF
 	case KW_ELSE:    return .ELSE
@@ -138,10 +139,11 @@ scan_number :: proc(l: ^Lexer) -> Token {
 
 scan_string :: proc(l: ^Lexer) -> Token {
 	for peek(l) != byte(Symbols.QUOTE) && !is_eof(l) {
+		if peek(l) == '\\' { advance(l) } // skip the escaped character
 		advance(l)
 	}
 	if is_eof(l) do return error_token(l, "unterminated string")
-	advance(l) 
+	advance(l)
 	return make_token(l, .STRING)
 }
 

@@ -72,4 +72,5 @@ KW_FOR      :: "for"
 KW_BREAK    :: "break"
 KW_CONTINUE :: "continue"
 KW_PRINT    :: "print"
+KW_CONST 		:: "const"
 

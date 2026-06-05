@@ -278,6 +278,265 @@ test_e2e_break_with_locals :: proc(t: ^testing.T) {
 	testing.expect_value(t, val.(i64), i64(6))
 }
 
+// ---- strings ----
+
+@(test)
+test_e2e_string_literal :: proc(t: ^testing.T) {
+	val := result(`function main() { return "hello" }`)
+	testing.expect_value(t, val.(string), "hello")
+}
+
+@(test)
+test_e2e_string_eq :: proc(t: ^testing.T) {
+	val := result(`function main() { return "abc" == "abc" }`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_string_neq :: proc(t: ^testing.T) {
+	val := result(`function main() { return "abc" == "xyz" }`)
+	testing.expect_value(t, val.(bool), false)
+}
+
+@(test)
+test_e2e_string_escape_newline :: proc(t: ^testing.T) {
+	val := result(`function main() { return "a\nb" }`)
+	testing.expect_value(t, val.(string), "a\nb")
+}
+
+@(test)
+test_e2e_string_escape_tab :: proc(t: ^testing.T) {
+	val := result(`function main() { return "a\tb" }`)
+	testing.expect_value(t, val.(string), "a\tb")
+}
+
+@(test)
+test_e2e_string_escape_backslash :: proc(t: ^testing.T) {
+	val := result(`function main() { return "a\\b" }`)
+	testing.expect_value(t, val.(string), "a\\b")
+}
+
+@(test)
+test_e2e_string_escape_quote :: proc(t: ^testing.T) {
+	val := result(`function main() { return "say \"hi\"" }`)
+	testing.expect_value(t, val.(string), "say \"hi\"")
+}
+
+@(test)
+test_e2e_string_escape_in_condition :: proc(t: ^testing.T) {
+	// escaped string compares equal to the decoded value
+	val := result(`
+		function main() -> bool {
+			let s = "hello\nworld"
+			return s == "hello\nworld"
+		}
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_string_no_escape_fast_path :: proc(t: ^testing.T) {
+	// plain string with no backslash takes the fast path
+	val := result(`function main() { return "no escapes here" }`)
+	testing.expect_value(t, val.(string), "no escapes here")
+}
+
+// ---- constants ----
+
+@(test)
+test_e2e_const_int :: proc(t: ^testing.T) {
+	val := result(`
+		const N = 42
+		function main() { return N }
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_const_float :: proc(t: ^testing.T) {
+	val := result(`
+		const F = 3.14
+		function main() { return F }
+	`)
+	testing.expect_value(t, val.(f64), f64(3.14))
+}
+
+@(test)
+test_e2e_const_bool :: proc(t: ^testing.T) {
+	val := result(`
+		const FLAG = true
+		function main() { return FLAG }
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_const_string :: proc(t: ^testing.T) {
+	val := result(`
+		const MSG = "hello"
+		function main() { return MSG }
+	`)
+	testing.expect_value(t, val.(string), "hello")
+}
+
+@(test)
+test_e2e_const_folded_add :: proc(t: ^testing.T) {
+	val := result(`
+		const A = 10
+		const B = 20
+		const C = A + B
+		function main() { return C }
+	`)
+	testing.expect_value(t, val.(i64), i64(30))
+}
+
+@(test)
+test_e2e_const_folded_arithmetic :: proc(t: ^testing.T) {
+	val := result(`
+		const MAX  = 100
+		const HALF = MAX / 2
+		const OFF  = HALF - 5
+		function main() { return OFF }
+	`)
+	testing.expect_value(t, val.(i64), i64(45))
+}
+
+@(test)
+test_e2e_const_negative :: proc(t: ^testing.T) {
+	val := result(`
+		const NEG = -7
+		function main() { return NEG }
+	`)
+	testing.expect_value(t, val.(i64), i64(-7))
+}
+
+@(test)
+test_e2e_const_in_loop_bound :: proc(t: ^testing.T) {
+	val := result(`
+		const LIMIT = 5
+		function main() -> int {
+			let sum = 0
+			let i = 0
+			for i < LIMIT {
+				sum = sum + i
+				i = i + 1
+			}
+			return sum
+		}
+	`)
+	// 0+1+2+3+4 = 10
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_const_in_condition :: proc(t: ^testing.T) {
+	val := result(`
+		const THRESHOLD = 10
+		function main() -> bool {
+			let x = 5
+			return x < THRESHOLD
+		}
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_const_visible_in_function :: proc(t: ^testing.T) {
+	val := result(`
+		const BASE = 100
+		function add_base(n: int) -> int {
+			return n + BASE
+		}
+		function main() { return add_base(5) }
+	`)
+	testing.expect_value(t, val.(i64), i64(105))
+}
+
+// ---- local constants ----
+
+@(test)
+test_e2e_local_const_int :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> int {
+			const N = 99
+			return N
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_local_const_folded :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> int {
+			const A = 6
+			const B = A * 7
+			return B
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_local_const_in_loop :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> int {
+			const LIMIT = 5
+			let sum = 0
+			let i = 0
+			for i < LIMIT {
+				sum = sum + i
+				i = i + 1
+			}
+			return sum
+		}
+	`)
+	// 0+1+2+3+4 = 10
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_local_const_in_condition :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> bool {
+			const THRESHOLD = 100
+			let x = 50
+			return x < THRESHOLD
+		}
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_local_const_shadows_global :: proc(t: ^testing.T) {
+	val := result(`
+		const X = 1
+		function main() -> int {
+			const X = 2
+			return X
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(2))
+}
+
+@(test)
+test_e2e_local_const_mixed_with_let :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> int {
+			const STEP = 3
+			let total = 0
+			let i = 0
+			for i < 9 {
+				total = total + STEP
+				i = i + STEP
+			}
+			return total
+		}
+	`)
+	// 3 iterations: i=0,3,6 → total=3,6,9
+	testing.expect_value(t, val.(i64), i64(9))
+}
+
 // ---- runtime errors ----
 
 @(test)
