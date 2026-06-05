@@ -11,9 +11,10 @@ CompilerError :: struct {
 }
 
 LoopCtx :: struct {
-	start:      u16,         // bytecode offset of the condition (for continue)
-	local_base: int,         // len(locals) at loop entry (for emit POPs on break/continue)
-	breaks:     [dynamic]u16, // JUMP offsets waiting to be patched to after the loop
+	start:       u16,                  // bytecode offset of the condition (for continue)
+	local_base:  int,                  // len(locals) at loop entry (for emit POPs on break/continue)
+	breaks:      [MAX_BREAK_COUNT]u16, // JUMP offsets waiting to be patched to after the loop
+	break_count: u8,
 }
 
 Compiler :: struct {
@@ -174,8 +175,13 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 		}
 		n := len(c.bc.locals) - c.loop_ctx.local_base
 		for _ in 0..<n { emit(&c.bc, .POP, span) }
+		if c.loop_ctx.break_count >= MAX_BREAK_COUNT {
+			compiler_error(c, "too many break statements in one loop", span)
+			return
+		}
 		jmp, _ := emit_jump(&c.bc, .JUMP, span)
-		append(&c.loop_ctx.breaks, jmp)
+		c.loop_ctx.breaks[c.loop_ctx.break_count] = jmp
+		c.loop_ctx.break_count += 1
 
 	case parser.ContinueStatement:
 		if c.loop_ctx == nil {
@@ -207,7 +213,6 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 	ctx := LoopCtx{
 		start      = loop_start,
 		local_base = len(c.bc.locals),
-		breaks     = make([dynamic]u16),
 	}
 	outer_ctx  := c.loop_ctx
 	c.loop_ctx  = &ctx
@@ -237,10 +242,9 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 	}
 
 	// break jumps land here — after the condition POP, before init cleanup
-	for jump_offset in ctx.breaks {
-		patch_jump(&c.bc, jump_offset)
+	for i in 0..<int(ctx.break_count) {
+		patch_jump(&c.bc, ctx.breaks[i])
 	}
-	delete(ctx.breaks)
 	c.loop_ctx = outer_ctx
 
 	// close the init scope so the loop variable doesn't outlive the loop

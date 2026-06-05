@@ -1,3 +1,4 @@
 .claude/
 install-editor.sh
 benchmarks/results.bench
+bin/
