@@ -1,0 +1,25 @@
+{
+  "name": "myr",
+  "displayName": "Myr",
+  "description": "Syntax highlighting for the Myr programming language",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "myr",
+        "aliases": ["Myr", "myr"],
+        "extensions": [".myr"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "myr",
+        "scopeName": "source.myr",
+        "path": "./syntaxes/myr.tmLanguage.json"
+      }
+    ]
+  }
+}

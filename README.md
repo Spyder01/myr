@@ -1,8 +1,8 @@
 # Myr
 
-A systems language for games and performance-critical code.
+A language designed around simplicity and control.
 
-Algebraic types and FP ergonomics without a borrow checker. Data-layout awareness as a first-class concern. Compiled to bytecode, interpreted by a fast VM written in [Odin](https://odin-lang.org).
+Algebraic types and FP ergonomics without a borrow checker. No hidden costs, no magic — you see what the program does and you decide how it does it. Implemented in [Odin](https://odin-lang.org).
 
 ---
 

@@ -167,7 +167,7 @@ offset_to_line_col :: proc(source: string, offset: u32) -> (line, col: int) {
 // ---- help ----
 
 print_usage :: proc() {
-	fmt.println("myr — a systems language for games and performance-critical code")
+	fmt.println("myr — a language designed around simplicity and control")
 	fmt.println()
 	fmt.printfln("version: %s", VERSION)
 	fmt.println()
