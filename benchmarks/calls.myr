@@ -1,0 +1,13 @@
+function add(a: int, b: int) -> int {
+    return a + b
+}
+
+function main() {
+    let i = 0
+    let sum = 0
+    for i < 100000 {
+        sum = add(sum, i)
+        i = i + 1
+    }
+    print(sum)
+}

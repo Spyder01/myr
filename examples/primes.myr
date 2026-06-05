@@ -1,0 +1,25 @@
+function is_prime(n: int) -> int {
+    if n < 2 {
+        return 0
+    }
+    let i = 2
+    for i * i <= n {
+        if n % i == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+function main() {
+    let n = 2
+    let count = 0
+    for count < 10 {
+        if is_prime(n) == 1 {
+            print(n)
+            count = count + 1
+        }
+        n = n + 1
+    }
+}

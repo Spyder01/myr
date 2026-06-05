@@ -1,0 +1,16 @@
+function fib(n: int) -> int {
+    if n <= 1 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+print(0)
+
+function main() {
+    let i = 0
+    for i <= 10 {
+        print(fib(i))
+        i = i + 1
+    }
+}

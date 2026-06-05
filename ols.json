@@ -1,0 +1,13 @@
+{
+    "collections": [
+        { "name": "core",   "path": "/Users/suhanj/.lang/Odin/core" },
+        { "name": "vendor", "path": "/Users/suhanj/.lang/Odin/vendor" }
+    ],
+    "enable_document_symbols": true,
+    "enable_hover": true,
+    "enable_snippets": true,
+    "enable_semantic_tokens": false,
+    "enable_inlay_hints": true,
+    "checker_args": "",
+    "verbose": true 
+}

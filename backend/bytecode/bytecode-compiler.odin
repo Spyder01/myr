@@ -1,0 +1,431 @@
+package bytecode
+
+import "../../parser"
+import "../../lexer"
+import "core:strconv"
+import "core:fmt"
+
+CompilerError :: struct {
+	message: string,
+	span:    lexer.Span,
+}
+
+LoopCtx :: struct {
+	start:      u16,         // bytecode offset of the condition (for continue)
+	local_base: int,         // len(locals) at loop entry (for emit POPs on break/continue)
+	breaks:     [dynamic]u16, // JUMP offsets waiting to be patched to after the loop
+}
+
+Compiler :: struct {
+	bc:          ByteCodeCompiler,
+	ast:         ^parser.AST,
+	errors:      [MAX_ERROR_COUNT]CompilerError,
+	error_count: u8,
+	loop_ctx:    ^LoopCtx,
+}
+
+new_compiler :: proc(ast: ^parser.AST) -> Compiler {
+	return Compiler{
+		bc  = new_bytecode_compiler("__main__", 0),
+		ast = ast,
+	}
+}
+
+compiler_destroy :: proc(c: ^Compiler) {
+	compiler_free(&c.bc)
+}
+
+compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
+	c := new_compiler(ast)
+
+	for node, i in ast.nodes {
+		if _, is_decl := node.(parser.Declaration); is_decl {
+			compile_decl(&c, parser.DeclarationIdx(i))
+		}
+	}
+
+	// call main — leave its return value on the stack so __main__ returns it
+	main_idx, main_err := chunk_add_constant(current_chunk(&c.bc), "main")
+	if main_err == nil {
+		emit(&c.bc, .GET_GLOBAL, {})
+		emit_byte(&c.bc, u8(main_idx), {})
+		emit(&c.bc, .CALL, {})
+		emit_byte(&c.bc, 0, {})
+		// no POP — __main__'s RETURN will pop and store it at stack[0]
+	} else {
+		emit(&c.bc, .NIL, {})
+	}
+
+	emit(&c.bc, .RETURN, {})
+
+	errors := c.errors[:c.error_count]
+	if c.error_count > 0 {
+		fn := compiler_end(&c.bc)
+		function_free(fn)
+		return nil, errors
+	}
+
+	return compiler_end(&c.bc), errors
+}
+
+// ---- declarations ----
+
+compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
+	node := c.ast.nodes[idx]
+	span := c.ast.spans[idx]
+
+	switch d in node.(parser.Declaration) {
+	case parser.FunctionDecl:
+		compile_function(c, d, span)
+	case parser.ImportDecl:
+		// skip for now
+	case parser.StructDecl, parser.EnumDecl:
+		// type declarations — no bytecode in Phase 1
+	}
+}
+
+compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span) {
+	// create a child compiler for this function
+	fn_compiler := new_bytecode_compiler(d.name.data, u8(len(d.params)), &c.bc)
+
+	// slot 0 is the function itself (allows recursion, matches VM frame layout)
+	add_local(&fn_compiler, d.name.data)
+	// parameters start at slot 1
+	for param in d.params {
+		add_local(&fn_compiler, param.name.data)
+	}
+
+	// compile body
+	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count}
+	compile_block(&child, d.body)
+	emit(&child.bc, .RETURN, span)
+	c.errors      = child.errors
+	c.error_count = child.error_count
+
+	// get compiled function
+	fn := compiler_end(&child.bc)
+
+	// emit function as a constant in parent, bind to name
+	emit_constant(&c.bc, fn, span)
+	name_idx, _ := chunk_add_constant(current_chunk(&c.bc), d.name.data)
+	emit(&c.bc, .DEFINE_GLOBAL, span)
+	emit_byte(&c.bc, u8(name_idx), span)
+}
+
+// ---- blocks ----
+
+compile_block :: proc(c: ^Compiler, block: parser.BlockExpression) {
+	c.bc.scope_depth += 1
+	for stmt in block.stmts {
+		compile_stmt(c, stmt)
+	}
+	if result, ok := block.result.?; ok {
+		compile_expr(c, result)
+	}
+	end_scope(c)
+}
+
+end_scope :: proc(c: ^Compiler) {
+	c.bc.scope_depth -= 1
+	for len(c.bc.locals) > 0 &&
+	    c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
+		emit(&c.bc, .POP, {})
+		pop(&c.bc.locals)
+	}
+}
+
+// ---- statements ----
+
+compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
+	node := c.ast.nodes[idx]
+	span := c.ast.spans[idx]
+
+	switch s in node.(parser.Statement) {
+	case parser.LetStatement:
+		compile_expr(c, s.value)
+		if c.bc.scope_depth == 0 {
+			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), s.name.data)
+			emit(&c.bc, .DEFINE_GLOBAL, span)
+			emit_byte(&c.bc, u8(name_idx), span)
+		} else {
+			add_local(&c.bc, s.name.data)
+			// value stays on stack as the local's slot
+		}
+
+	case parser.ReturnStatement:
+		if val, ok := s.value.?; ok {
+			compile_expr(c, val)
+		} else {
+			emit(&c.bc, .NIL, span)
+		}
+		emit(&c.bc, .RETURN, span)
+
+	case parser.ExpressionStatement:
+		compile_expr(c, s.expr)
+		emit(&c.bc, .POP, span)
+
+	case parser.ForStatement:
+		compile_for(c, s, span)
+
+	case parser.BreakStatement:
+		if c.loop_ctx == nil {
+			compiler_error(c, "break outside of loop", span)
+			return
+		}
+		n := len(c.bc.locals) - c.loop_ctx.local_base
+		for _ in 0..<n { emit(&c.bc, .POP, span) }
+		jmp, _ := emit_jump(&c.bc, .JUMP, span)
+		append(&c.loop_ctx.breaks, jmp)
+
+	case parser.ContinueStatement:
+		if c.loop_ctx == nil {
+			compiler_error(c, "continue outside of loop", span)
+			return
+		}
+		n := len(c.bc.locals) - c.loop_ctx.local_base
+		for _ in 0..<n { emit(&c.bc, .POP, span) }
+		emit_loop(&c.bc, c.loop_ctx.start, span)
+
+	case parser.WithContextStatement:
+		// TODO
+	}
+}
+
+compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
+	// compile init once before loop_start so the variable exists for the condition
+	has_init := false
+	if init, ok := s.init.?; ok {
+		has_init = true
+		c.bc.scope_depth += 1
+		compile_stmt(c, init)
+	}
+
+	loop_start := u16(len(current_chunk(&c.bc).code))
+
+	// local_base is after init — break/continue pop body locals only;
+	// the init local is cleaned up separately after the loop
+	ctx := LoopCtx{
+		start      = loop_start,
+		local_base = len(c.bc.locals),
+		breaks     = make([dynamic]u16),
+	}
+	outer_ctx  := c.loop_ctx
+	c.loop_ctx  = &ctx
+
+	exit_jump: u16 = 0
+	has_condition := false
+
+	if cond, ok := s.condition.?; ok {
+		has_condition = true
+		compile_expr(c, cond)
+		exit_jump, _ = emit_jump(&c.bc, .JUMP_IF_FALSE, span)
+		emit(&c.bc, .POP, span)
+	}
+
+	compile_block(c, s.body)
+
+	if post, ok := s.post.?; ok {
+		compile_stmt(c, post)
+		// ExpressionStatement already emits POP — no extra POP needed
+	}
+
+	emit_loop(&c.bc, loop_start, span)
+
+	if has_condition {
+		patch_jump(&c.bc, exit_jump)
+		emit(&c.bc, .POP, span)
+	}
+
+	// break jumps land here — after the condition POP, before init cleanup
+	for jump_offset in ctx.breaks {
+		patch_jump(&c.bc, jump_offset)
+	}
+	delete(ctx.breaks)
+	c.loop_ctx = outer_ctx
+
+	// close the init scope so the loop variable doesn't outlive the loop
+	if has_init {
+		c.bc.scope_depth -= 1
+		for len(c.bc.locals) > 0 &&
+		    c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
+			emit(&c.bc, .POP, span)
+			pop(&c.bc.locals)
+		}
+	}
+}
+
+// ---- expressions ----
+
+compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
+	node := c.ast.nodes[idx]
+	span := c.ast.spans[idx]
+
+	switch e in node.(parser.Expression) {
+	case parser.LiteralExpression:
+		tok := lexer.Token(e)
+		val := parse_literal(tok)
+		emit_constant(&c.bc, val, span)
+
+	case parser.IdentExpression:
+		tok := lexer.Token(e)
+		name := tok.data
+		// check locals first (inner → outer)
+		slot, found := resolve_local(&c.bc, name)
+		if found {
+			emit(&c.bc, .GET_LOCAL, span)
+			emit_byte(&c.bc, u8(slot), span)
+		} else {
+			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+			emit(&c.bc, .GET_GLOBAL, span)
+			emit_byte(&c.bc, u8(name_idx), span)
+		}
+
+	case parser.UnaryExpression:
+		compile_expr(c, e.operand)
+		#partial switch e.op.kind {
+		case .MINUS: emit(&c.bc, .NEGATE, span)
+		case .BANG:  emit(&c.bc, .NOT, span)
+		}
+
+	case parser.BinaryExpression:
+		// assignment is special
+		if e.operation.kind == .EQ {
+			compile_assignment(c, e, span)
+			return
+		}
+		compile_expr(c, e.left)
+		compile_expr(c, e.right)
+		emit(&c.bc, op_to_opcode(e.operation.kind), span)
+
+	case parser.CallExpression:
+		// check for print builtin
+		callee_node := c.ast.nodes[e.callee]
+		if expr, ok := callee_node.(parser.Expression); ok {
+			if id, ok2 := expr.(parser.IdentExpression); ok2 {
+				if lexer.Token(id).data == "print" {
+					for arg in e.args {
+						compile_expr(c, arg)
+						emit(&c.bc, .PRINT, span)
+					}
+					emit(&c.bc, .NIL, span)  // print returns nil
+					return
+				}
+			}
+		}
+		compile_expr(c, e.callee)
+		for arg in e.args {
+			compile_expr(c, arg)
+		}
+		emit(&c.bc, .CALL, span)
+		emit_byte(&c.bc, u8(len(e.args)), span)
+
+	case parser.IfExpression:
+		compile_if(c, e, span)
+
+	case parser.BlockExpression:
+		compile_block(c, e)
+
+	case parser.FieldAccessExpression, parser.IndexExpression,
+	     parser.MatchExpression:
+		compiler_error(c, "not yet implemented", span)
+	}
+}
+
+compile_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer.Span) {
+	compile_expr(c, e.right)
+	// figure out what the left side is
+	lhs := c.ast.nodes[e.left]
+	if ident, ok := lhs.(parser.Expression); ok {
+		if id, ok2 := ident.(parser.IdentExpression); ok2 {
+			name := lexer.Token(id).data
+			slot, found := resolve_local(&c.bc, name)
+			if found {
+				emit(&c.bc, .SET_LOCAL, span)
+				emit_byte(&c.bc, u8(slot), span)
+			} else {
+				name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+				emit(&c.bc, .SET_GLOBAL, span)
+				emit_byte(&c.bc, u8(name_idx), span)
+			}
+			return
+		}
+	}
+	compiler_error(c, "invalid assignment target", span)
+}
+
+compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
+	compile_expr(c, e.condition)
+	then_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
+	emit(&c.bc, .POP, span)   // pop condition (true path)
+
+	compile_block(c, e.then_block)
+	emit(&c.bc, .NIL, span)   // if always produces a value
+
+	if else_block, ok := e.else_block.?; ok {
+		else_jump, _ := emit_jump(&c.bc, .JUMP, span)
+		patch_jump(&c.bc, then_jump)
+		emit(&c.bc, .POP, span)   // pop condition (false path)
+		compile_block(c, else_block)
+		emit(&c.bc, .NIL, span)   // else always produces a value
+		patch_jump(&c.bc, else_jump)
+	} else {
+		patch_jump(&c.bc, then_jump)
+		emit(&c.bc, .POP, span)   // pop condition (no-else path)
+		emit(&c.bc, .NIL, span)
+	}
+}
+
+// ---- helpers ----
+
+resolve_local :: proc(bc: ^ByteCodeCompiler, name: string) -> (slot: int, found: bool) {
+	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
+		if bc.locals[i].name == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+op_to_opcode :: proc(kind: lexer.TokenType) -> Opcode {
+	#partial switch kind {
+	case .PLUS:    return .ADD
+	case .MINUS:   return .SUB
+	case .STAR:    return .MUL
+	case .SLASH:   return .DIV
+	case .PERCENT: return .MOD
+	case .EQ_EQ:   return .EQ
+	case .BANG_EQ: return .NEQ
+	case .LT:      return .LT
+	case .LT_EQ:   return .LTE
+	case .GT:      return .GT
+	case .GT_EQ:   return .GTE
+	}
+	return .ADD // unreachable
+}
+
+parse_literal :: proc(tok: lexer.Token) -> Value {
+	#partial switch tok.kind {
+	case .INT:
+		n, _ := strconv.parse_i64(tok.data)
+		return i64(n)
+	case .FLOAT:
+		f, _ := strconv.parse_f64(tok.data)
+		return f64(f)
+	case .STRING:
+		// strip surrounding quotes
+		if len(tok.data) >= 2 {
+			return tok.data[1:len(tok.data)-1]
+		}
+		return ""
+	case .TRUE:  return true
+	case .FALSE: return false
+	}
+	return Nil{}
+}
+
+compiler_error :: proc(c: ^Compiler, msg: string, span: lexer.Span) {
+	if c.error_count < MAX_ERROR_COUNT {
+		c.errors[c.error_count] = CompilerError{message = msg, span = span}
+		c.error_count += 1
+	}
+}
