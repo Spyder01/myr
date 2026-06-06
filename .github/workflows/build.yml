@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: bin/myr
+            artifact: myr-linux
+          - os: macos-latest
+            binary: bin/myr
+            artifact: myr-macos
+          - os: windows-latest
+            binary: bin/myr.exe
+            artifact: myr-windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p bin
+          odin build . -o:speed -out:${{ matrix.binary }}
+
+      - name: Test (lexer)
+        shell: bash
+        run: odin test ./lexer
+
+      - name: Test (vm)
+        shell: bash
+        run: odin test ./backend/bytecode/vm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
