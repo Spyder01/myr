@@ -26,6 +26,12 @@ Opcode :: enum u8 {
 	DIV,
 	MOD,
 	NEGATE,
+	SHL,
+	SHR,
+	BAND,
+	BOR,
+	BXOR,
+	BNOT,
 
 	EQ,
 	NEQ,

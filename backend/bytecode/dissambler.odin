@@ -44,6 +44,12 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .GT:           return simple_instruction("GT", offset)
     case .GTE:          return simple_instruction("GTE", offset)
     case .MOD:          return simple_instruction("MOD", offset)
+    case .SHL:          return simple_instruction("SHL",  offset)
+    case .SHR:          return simple_instruction("SHR",  offset)
+    case .BAND:         return simple_instruction("BAND", offset)
+    case .BOR:          return simple_instruction("BOR",  offset)
+    case .BXOR:         return simple_instruction("BXOR", offset)
+    case .BNOT:         return simple_instruction("BNOT", offset)
 
     // instructions with one byte operand
     case .CONST:        return const_instruction("CONST", chunk, offset)

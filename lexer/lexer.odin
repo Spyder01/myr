@@ -31,6 +31,11 @@ peek_next :: proc(l: ^Lexer) -> byte {
 	return l.source[l.current + 1]
 }
 
+peek_prev :: proc(l: ^Lexer) -> byte {
+	if l.current == 0 do return 0
+	return l.source[l.current - 1]
+}
+
 advance :: proc(l: ^Lexer) -> byte {
 	ch := peek(l)
 	if ch == 0 do return ch
@@ -134,7 +139,21 @@ scan_ident :: proc(l: ^Lexer) -> Token {
 	return make_token(l, kind)
 }
 
+is_hex_digit :: proc(ch: byte) -> bool {
+	return is_digit(ch) ||
+	       (ch >= 'a' && ch <= 'f') ||
+	       (ch >= 'A' && ch <= 'F')
+}
+
 scan_number :: proc(l: ^Lexer) -> Token {
+	// hex literal: 0x…
+	if peek_prev(l) == '0' && (peek(l) == 'x' || peek(l) == 'X') {
+		advance(l) // consume 'x'
+		for is_hex_digit(peek(l)) {
+			advance(l)
+		}
+		return make_token(l, .INT)
+	}
 	for is_digit(peek(l)) {
 		advance(l)
 	}

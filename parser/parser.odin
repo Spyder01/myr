@@ -384,11 +384,15 @@ binding_power :: proc(kind: lexer.TokenType) -> (left: int, right: int) {
 	     .STAR_EQ, .SLASH_EQ, .PERCENT_EQ:      return 1,  2
 	case .OR:                                    return 3,  4
 	case .AND:                                   return 5,  6
+	case .PIPE:                                  return 7,  8
+	case .CARET:                                 return 9,  10
+	case .AMPERSAND:                             return 11, 12
 	case .EQ_EQ, .BANG_EQ,
-	     .LT, .GT, .LT_EQ, .GT_EQ:              return 7,  8
-	case .PLUS, .MINUS:                          return 9,  10
-	case .STAR, .SLASH, .PERCENT:                return 11, 12
-	case .DOT, .LEFT_BRACKET, .LEFT_PAREN:       return 15, 16
+	     .LT, .GT, .LT_EQ, .GT_EQ:              return 13, 14
+	case .LT_LT, .GT_GT:                        return 15, 16
+	case .PLUS, .MINUS:                          return 17, 18
+	case .STAR, .SLASH, .PERCENT:                return 19, 20
+	case .DOT, .LEFT_BRACKET, .LEFT_PAREN:       return 23, 24
 	}
 	return 0, 0
 }
@@ -445,9 +449,9 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 		append_elem(&p.ast.spans, tok.span)
 		return ExpressionIdx(len(p.ast.nodes) - 1)
 
-	case .MINUS, .BANG:
+	case .MINUS, .BANG, .TILDE:
 		advance(p)
-		operand := parse_expr(p, 13)
+		operand := parse_expr(p, 21)
 		expr    := UnaryExpression{op = tok, operand = operand}
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
 		append_elem(&p.ast.spans, tok.span)

@@ -694,3 +694,84 @@ test_e2e_division_by_zero :: proc(t: ^testing.T) {
 	_, err := run_source("function main() { return 1 / 0 }")
 	testing.expect_value(t, err, Maybe(VMError)(.DIVISION_BY_ZERO))
 }
+
+// ---- bit shift ----
+
+@(test)
+test_e2e_shl_basic :: proc(t: ^testing.T) {
+	val := result("function main() { return 1 << 3 }")
+	testing.expect_value(t, val.(i64), i64(8))
+}
+
+@(test)
+test_e2e_shr_basic :: proc(t: ^testing.T) {
+	val := result("function main() { return 16 >> 2 }")
+	testing.expect_value(t, val.(i64), i64(4))
+}
+
+@(test)
+test_e2e_shl_zero :: proc(t: ^testing.T) {
+	val := result("function main() { return 5 << 0 }")
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+@(test)
+test_e2e_shr_to_zero :: proc(t: ^testing.T) {
+	val := result("function main() { return 1 >> 1 }")
+	testing.expect_value(t, val.(i64), i64(0))
+}
+
+@(test)
+test_e2e_shl_precedence_add :: proc(t: ^testing.T) {
+	// + binds tighter: (1 + 2) << 1 = 6, not 1 + (2 << 1) = 5
+	val := result("function main() { return 1 + 2 << 1 }")
+	testing.expect_value(t, val.(i64), i64(6))
+}
+
+@(test)
+test_e2e_shr_precedence_mul :: proc(t: ^testing.T) {
+	// * binds tighter: 8 >> (1 * 2) = 2
+	val := result("function main() { return 8 >> 1 * 2 }")
+	testing.expect_value(t, val.(i64), i64(2))
+}
+
+@(test)
+test_e2e_shl_variable :: proc(t: ^testing.T) {
+	val := result(`function main() {
+		let n = 4
+		return n << 2
+	}`)
+	testing.expect_value(t, val.(i64), i64(16))
+}
+
+@(test)
+test_e2e_shr_variable :: proc(t: ^testing.T) {
+	val := result(`function main() {
+		let n = 64
+		return n >> 3
+	}`)
+	testing.expect_value(t, val.(i64), i64(8))
+}
+
+@(test)
+test_e2e_shift_in_loop :: proc(t: ^testing.T) {
+	// sum powers of 2: 1+2+4+8+16 = 31
+	val := result(`function main() {
+		let sum = 0
+		let i = 0
+		for i < 5 {
+			sum += 1 << i
+			i += 1
+		}
+		return sum
+	}`)
+	testing.expect_value(t, val.(i64), i64(31))
+}
+
+@(test)
+test_e2e_shift_comparison :: proc(t: ^testing.T) {
+	// shift has lower precedence than comparison? No — shift > comparison
+	// (8 >> 1) > 3  =  4 > 3  = true
+	val := result("function main() { return 8 >> 1 > 3 }")
+	testing.expect_value(t, val.(bool), true)
+}

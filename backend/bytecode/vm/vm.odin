@@ -12,12 +12,14 @@ CallFrame :: struct {
 	slots:    u16,
 }
 
+
 VM :: struct {
 	frames:      [FRAMES_MAX]CallFrame,
-	frame_count: u8,
 	stack:       [STACK_MAX]Value,
-	stack_top:   u16,
 	globals:     map[string]Value,
+	strings: 		 StringPool,
+	stack_top:   u16,
+	frame_count: u8,
 	stdin:       io.Reader, // nil → use os.stdin
 }
 
@@ -38,11 +40,13 @@ new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
 	} else {
 		vm.globals = make(map[string]Value)
 	}
+	vm.strings = string_pool_new()
 	return vm
 }
 
 destroy_vm :: proc(vm: ^VM) {
 	delete(vm.globals)
+	string_pool_destroy(&vm.strings)
 }
 
 vm_push :: proc(vm: ^VM, val: Value) -> Maybe(VMError) {
@@ -97,10 +101,16 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 
         case .CONST:
             val := read_constant(vm)
+            if s, ok := val.(string); ok {
+                val = string_pool_intern(&vm.strings, s)
+            }
             if err := vm_push(vm, val); err != nil do return err
 
         case .CONST_LONG:
             val := read_constant_long(vm)
+            if s, ok := val.(string); ok {
+                val = string_pool_intern(&vm.strings, s)
+            }
             if err := vm_push(vm, val); err != nil do return err
 
         case .NIL:
@@ -131,7 +141,10 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             case string:
                 bv, ok := b.(string)
                 if !ok do return .TYPE_ERROR
-                if err := vm_push(vm, strings.concatenate({av, bv})); err != nil do return err
+                tmp := strings.concatenate({av, bv})
+                interned := string_pool_intern(&vm.strings, tmp)
+                if raw_data(tmp) != raw_data(interned) { delete(tmp) }
+                if err := vm_push(vm, interned); err != nil do return err
             case: return .TYPE_ERROR
             }
 
@@ -147,6 +160,28 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
         case .MOD:
             if err := vm_binary_op(vm, .MOD); err != nil do return err
 
+        case .SHL:
+            if err := vm_binary_op(vm, .SHL); err != nil do return err
+
+        case .SHR:
+            if err := vm_binary_op(vm, .SHR); err != nil do return err
+
+        case .BAND:
+            if err := vm_binary_op(vm, .BAND); err != nil do return err
+
+        case .BOR:
+            if err := vm_binary_op(vm, .BOR); err != nil do return err
+
+        case .BXOR:
+            if err := vm_binary_op(vm, .BXOR); err != nil do return err
+
+        case .BNOT:
+            a, err := vm_pop(vm)
+            if err != nil do return err
+            av, ok := a.(i64)
+            if !ok do return .TYPE_ERROR
+            if err2 := vm_push(vm, ~av); err2 != nil do return err2
+
         case .NEGATE:
             a, err := vm_pop(vm)
             if err != nil do return err
@@ -159,12 +194,12 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
         case .EQ:
             b, _ := vm_pop(vm)
             a, _ := vm_pop(vm)
-            if err := vm_push(vm, bc.values_equal(a, b)); err != nil do return err
+            if err := vm_push(vm, vm_values_equal(a, b)); err != nil do return err
 
         case .NEQ:
             b, _ := vm_pop(vm)
             a, _ := vm_pop(vm)
-            if err := vm_push(vm, !bc.values_equal(a, b)); err != nil do return err
+            if err := vm_push(vm, !vm_values_equal(a, b)); err != nil do return err
 
         case .LT:
             if err := vm_compare(vm, .LT); err != nil do return err
@@ -199,8 +234,10 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             if s, ok := prompt.(string); ok && len(s) > 0 {
                 fmt.printf("%s", s)
             }
-            line := read_line(vm.stdin)
-            vm_push(vm, line)
+            tmp := read_line(vm.stdin)
+            interned := string_pool_intern(&vm.strings, tmp)
+            if raw_data(tmp) != raw_data(interned) { delete(tmp) }
+            vm_push(vm, interned)
 
         case .DEFINE_GLOBAL:
             name := read_constant(vm).(string)
@@ -315,6 +352,17 @@ print_value :: proc(val: Value) {
     }
 }
 
+// String comparison uses pointer equality — valid because all VM strings are interned.
+vm_values_equal :: proc(a, b: Value) -> bool {
+    if as, ok := a.(string); ok {
+        if bs, ok2 := b.(string); ok2 {
+            return raw_data(as) == raw_data(bs)
+        }
+        return false
+    }
+    return bc.values_equal(a, b)
+}
+
 vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
     b, err1 := vm_pop(vm)
     if err1 != nil do return err1
@@ -333,6 +381,11 @@ vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
         case .MOD:
             if bv == 0 do return .DIVISION_BY_ZERO
             return vm_push(vm, av % bv)
+        case .SHL:  return vm_push(vm, av << uint(bv))
+        case .SHR:  return vm_push(vm, av >> uint(bv))
+        case .BAND: return vm_push(vm, av & bv)
+        case .BOR:  return vm_push(vm, av | bv)
+        case .BXOR: return vm_push(vm, av ~ bv)
         }
     case f64:
         bv, ok := b.(f64)

@@ -307,6 +307,7 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		#partial switch e.op.kind {
 		case .MINUS: emit(&c.bc, .NEGATE, span)
 		case .BANG:  emit(&c.bc, .NOT, span)
+		case .TILDE: emit(&c.bc, .BNOT, span)
 		}
 
 	case parser.BinaryExpression:
@@ -491,6 +492,11 @@ op_to_opcode :: proc(kind: lexer.TokenType) -> Opcode {
 	case .STAR:    return .MUL
 	case .SLASH:   return .DIV
 	case .PERCENT: return .MOD
+	case .LT_LT:      return .SHL
+	case .GT_GT:      return .SHR
+	case .AMPERSAND:  return .BAND
+	case .PIPE:       return .BOR
+	case .CARET:      return .BXOR
 	case .EQ_EQ:   return .EQ
 	case .BANG_EQ: return .NEQ
 	case .LT:      return .LT
@@ -504,6 +510,10 @@ op_to_opcode :: proc(kind: lexer.TokenType) -> Opcode {
 parse_literal :: proc(tok: lexer.Token) -> Value {
 	#partial switch tok.kind {
 	case .INT:
+		if len(tok.data) > 2 && tok.data[0] == '0' && (tok.data[1] == 'x' || tok.data[1] == 'X') {
+			n, _ := strconv.parse_i64(tok.data[2:], 16)
+			return i64(n)
+		}
 		n, _ := strconv.parse_i64(tok.data)
 		return i64(n)
 	case .FLOAT:
@@ -564,6 +574,11 @@ eval_const_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: lexer.Spa
 				case .PERCENT:
 					if rn == 0 { compiler_error(c, "modulo by zero in const expression", span); return Nil{}, false }
 					return ln % rn, true
+				case .LT_LT:     return ln << uint(rn), true
+				case .GT_GT:     return ln >> uint(rn), true
+				case .AMPERSAND: return ln & rn, true
+				case .PIPE:      return ln | rn, true
+				case .CARET:     return ln ~ rn, true
 				}
 			}
 		}

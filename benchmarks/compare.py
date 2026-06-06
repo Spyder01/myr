@@ -8,11 +8,22 @@ import subprocess, os, sys, tempfile
 ODIN  = os.environ.get("ODIN",  "/Users/suhanj/.lang/Odin/odin")
 NODE  = os.environ.get("NODE",  "node")
 PY    = os.environ.get("PYTHON", sys.executable)
+LUA   = os.environ.get("LUA",   "lua")
 RUNS  = 3
 
 # ---- runtime programs ----
 
 PYTHON = {
+    "bitshift": """\
+x = 1
+count = 0
+for _ in range(10000000):
+    x = (x << 3) >> 1
+    if x > 1073741824:
+        x = 1
+    count += x & 1
+print(count)
+""",
     "callbacks": """\
 def double(x): return x * 2
 def square(x): return x * x
@@ -67,6 +78,11 @@ print(count)
 }
 
 NODE_JS = {
+    "bitshift": """\
+let x=1,count=0;
+for(let i=0;i<10000000;i++){x=(x<<3)>>1;if(x>1073741824)x=1;count+=x&1;}
+console.log(count);
+""",
     "callbacks": """\
 function double(x){return x*2;}
 function square(x){return x*x;}
@@ -102,6 +118,75 @@ console.log(count);
 let count=0;
 for(let i=0;i<100000;i++){const s="hello"+" "+"world";if(s==="hello world")count++;}
 console.log(count);
+""",
+}
+
+LUA_LANG = {
+    "bitshift": """\
+local x,count=1,0
+for i=1,10000000 do
+  x=(x<<3)>>1
+  if x>1073741824 then x=1 end
+  count=count+(x&1)
+end
+print(count)
+""",
+    "callbacks": """\
+local function double(x) return x*2 end
+local function square(x) return x*x end
+local function sum_with(f,n)
+  local t=0
+  for i=0,n-1 do t=t+f(i) end
+  return t
+end
+print(sum_with(double,100000))
+print(sum_with(square,1000))
+""",
+    "fib": """\
+local function fib(n)
+  if n<=1 then return n end
+  return fib(n-1)+fib(n-2)
+end
+print(fib(30))
+""",
+    "loop": """\
+local s=0
+for i=0,999999 do s=s+i end
+print(s)
+""",
+    "calls": """\
+local function add(a,b) return a+b end
+local s=0
+for i=0,99999 do s=add(s,i) end
+print(s)
+""",
+    "primes": """\
+local function is_prime(n)
+  if n<2 then return false end
+  local i=2
+  while i*i<=n do
+    if n%i==0 then return false end
+    i=i+1
+  end
+  return true
+end
+local c=0
+for n=2,10000 do if is_prime(n) then c=c+1 end end
+print(c)
+""",
+    "str_compare": """\
+local a,b="hello world","hello world"
+local count=0
+for i=1,1000000 do if a==b then count=count+1 end end
+print(count)
+""",
+    "str_concat": """\
+local count=0
+for i=1,100000 do
+  local s="hello".." ".."world"
+  if s=="hello world" then count=count+1 end
+end
+print(count)
 """,
 }
 
@@ -145,6 +230,7 @@ MYR_ONLY = [
 ]
 
 CROSS = [
+    ("bitshift",    "benchmarks/bitshift.myr",        "625000"),
     ("callbacks",   "benchmarks/callbacks.myr",      "9999900000\n332833500"),
     ("fib",         "benchmarks/fib.myr",           "832040"),
     ("loop",        "benchmarks/loop.myr",           "499999500000"),
@@ -201,32 +287,33 @@ def main():
 
     # --- cross-runtime comparison ---
     print("=== cross-runtime comparison ===\n")
-    print("  collecting results (3 runs each × 3 runtimes × 6 benchmarks) ...")
+    print("  collecting results (3 runs each × 4 runtimes × 8 benchmarks) ...")
 
     results = {}
     for name, myr_file, _ in CROSS:
         myr_ms,  myr_kib,  _ = measure(["./myr-bench", myr_file])
-        py_ms,   py_kib,   _ = run_script([PY],   PYTHON[name],  ".py")
-        node_ms, node_kib, _ = run_script([NODE], NODE_JS[name], ".js")
-        results[name] = (myr_ms, myr_kib, py_ms, py_kib, node_ms, node_kib)
+        py_ms,   py_kib,   _ = run_script([PY],   PYTHON[name],   ".py")
+        node_ms, node_kib, _ = run_script([NODE], NODE_JS[name],  ".js")
+        lua_ms,  lua_kib,  _ = run_script([LUA],  LUA_LANG[name], ".lua")
+        results[name] = (myr_ms, myr_kib, py_ms, py_kib, node_ms, node_kib, lua_ms, lua_kib)
 
     print()
     print("  performance — time in ms, lower is better\n")
     rows = []
-    for name, (myr_ms, _, py_ms, _, nd_ms, _) in results.items():
+    for name, (myr_ms, _, py_ms, _, nd_ms, _, lua_ms, _) in results.items():
         rows.append([name,
-            fmt_ms(myr_ms), fmt_ms(py_ms),  fmt_ms(nd_ms),
-            cmp_label(myr_ms, py_ms), cmp_label(myr_ms, nd_ms)])
-    print_table(rows, ["benchmark", "myr", "python", "node", "vs python", "vs node"])
+            fmt_ms(myr_ms), fmt_ms(py_ms), fmt_ms(nd_ms), fmt_ms(lua_ms),
+            cmp_label(myr_ms, py_ms), cmp_label(myr_ms, nd_ms), cmp_label(myr_ms, lua_ms)])
+    print_table(rows, ["benchmark", "myr", "python", "node", "lua", "vs python", "vs node", "vs lua"])
 
     print()
     print("  memory — peak RSS, lower is better\n")
     rows = []
-    for name, (_, myr_kib, _, py_kib, _, nd_kib) in results.items():
+    for name, (_, myr_kib, _, py_kib, _, nd_kib, _, lua_kib) in results.items():
         rows.append([name,
-            fmt_mem(myr_kib), fmt_mem(py_kib),  fmt_mem(nd_kib),
-            cmp_label(myr_kib, py_kib), cmp_label(myr_kib, nd_kib)])
-    print_table(rows, ["benchmark", "myr", "python", "node", "vs python", "vs node"])
+            fmt_mem(myr_kib), fmt_mem(py_kib), fmt_mem(nd_kib), fmt_mem(lua_kib),
+            cmp_label(myr_kib, py_kib), cmp_label(myr_kib, nd_kib), cmp_label(myr_kib, lua_kib)])
+    print_table(rows, ["benchmark", "myr", "python", "node", "lua", "vs python", "vs node", "vs lua"])
 
     print()
     print("note: myr numbers include parse+compile time; python/node are pure execution.")
