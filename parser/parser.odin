@@ -15,22 +15,38 @@ ParserError :: struct {
 	kind: ParserErrorType,
 }
 
+offset_to_line_col :: proc(source: string, offset: u32) -> (line, col: int) {
+	line = 1
+	col  = 1
+	for i := u32(0); i < offset && int(i) < len(source); i += 1 {
+		if source[i] == '\n' {
+			line += 1
+			col   = 1
+		} else {
+			col  += 1
+		}
+	}
+	return
+}
+
 decode_parser_error_message :: proc(err: ^ParserError, source: string) -> string {
-	slice := source[err.span.start:err.span.end]
+	slice      := source[err.span.start:err.span.end]
+	line, col  := offset_to_line_col(source, err.span.start)
 	switch err.kind {
 	case .UNEXPECTED_TOKEN:
-		return fmt.tprintf("unexpected token '%s' at %d:%d", slice, err.span.start, err.span.end)
+		return fmt.tprintf("unexpected token '%s' at %d:%d", slice, line, col)
 	case .SYNTAX:
-		return fmt.tprintf("syntax error near '%s' at %d:%d", slice, err.span.start, err.span.end)
+		return fmt.tprintf("syntax error near '%s' at %d:%d", slice, line, col)
 	}
 	return "unknown error"
 } 
 
 Parser :: struct {
-	lex: 				 	 lexer.Lexer,
+	lex:           lexer.Lexer,
 	current_token: lexer.Token,
-	ast: 					 AST,
-	errors: 			 [dynamic]ParserError,
+	ast:           AST,
+	errors:        [dynamic]ParserError,
+	no_struct_lit: bool,
 }
 
 parser_destroy :: proc(p: ^Parser) {
@@ -274,12 +290,14 @@ parse_for :: proc(p: ^Parser) -> StatementIdx {
 
 	// traditional: for let i = 0; cond; post { }
 	if peek(p) == .LET {
-		init      := parse_let_stmt(p)
+		init := parse_let_stmt(p)
 		expect(p, .SEMICOLON)
+		p.no_struct_lit = true
 		condition := parse_expr(p)
+		p.no_struct_lit = false
 		expect(p, .SEMICOLON)
-		post      := parse_expr_stmt(p)
-		body      := parse_block(p)
+		post := parse_expr_stmt(p)
+		body := parse_block(p)
 		stmt := ForStatement{
 			init      = init,
 			condition = condition,
@@ -292,8 +310,10 @@ parse_for :: proc(p: ^Parser) -> StatementIdx {
 	}
 
 	// condition loop: for cond { }
+	p.no_struct_lit = true
 	condition := parse_expr(p)
-	body      := parse_block(p)
+	p.no_struct_lit = false
+	body := parse_block(p)
 	stmt := ForStatement{condition = condition, body = body}
 	append_elem(&p.ast.nodes, Node(Statement(stmt)))
 	append_elem(&p.ast.spans, tok.span)
@@ -417,6 +437,9 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 
 	case .IDENT:
 		advance(p)
+		if !p.no_struct_lit && peek(p) == .LEFT_BRACE {
+			return parse_struct_literal(p, tok)
+		}
 		expr := IdentExpression(tok)
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
 		append_elem(&p.ast.spans, tok.span)
@@ -446,9 +469,31 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 }
 
 @private
+parse_struct_literal :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionIdx {
+	expect(p, .LEFT_BRACE)
+	fields := make([dynamic]StructLiteralField)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		name  := expect(p, .IDENT)
+		expect(p, .EQ)
+		value := parse_expr(p, 0)
+		append_elem(&fields, StructLiteralField{name = name, value = value})
+		if peek(p) != .RIGHT_BRACE {
+			expect(p, .COMMA)
+		}
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := StructLiteralExpression{type_name = type_name, fields = fields[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, type_name.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+@private
 parse_if :: proc(p: ^Parser) -> ExpressionIdx {
 	tok := expect(p, .IF)
-	condition  := parse_expr(p, 0)
+	p.no_struct_lit = true
+	condition := parse_expr(p, 0)
+	p.no_struct_lit = false
 	then_block := parse_block(p)
 
 	else_block: Maybe(BlockExpression) = nil

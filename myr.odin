@@ -126,7 +126,7 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	fn, comp_errors := bc.compile(&ast)
 	if len(comp_errors) > 0 {
 		for e in comp_errors {
-			line, col := offset_to_line_col(source, e.span.start)
+			line, col := parser.offset_to_line_col(source, e.span.start)
 			fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
 		}
 		os.exit(1)
@@ -146,22 +146,6 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 		fmt.eprintfln("%s: runtime error: %v", file, vm_err)
 		os.exit(1)
 	}
-}
-
-// ---- helpers ----
-
-offset_to_line_col :: proc(source: string, offset: u32) -> (line, col: int) {
-	line = 1
-	col  = 1
-	for i := u32(0); i < offset && int(i) < len(source); i += 1 {
-		if source[i] == '\n' {
-			line += 1
-			col   = 1
-		} else {
-			col  += 1
-		}
-	}
-	return
 }
 
 // ---- help ----

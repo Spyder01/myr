@@ -381,7 +381,7 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		compile_block(c, e)
 
 	case parser.FieldAccessExpression, parser.IndexExpression,
-	     parser.MatchExpression:
+	     parser.MatchExpression, parser.StructLiteralExpression:
 		compiler_error(c, "not yet implemented", span)
 	}
 }

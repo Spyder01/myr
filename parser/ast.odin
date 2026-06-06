@@ -60,6 +60,16 @@ BlockExpression :: struct {
 	result: Maybe(ExpressionIdx),
 }
 
+StructLiteralField :: struct {
+	name:  lexer.Token,
+	value: ExpressionIdx,
+}
+
+StructLiteralExpression :: struct {
+	type_name: lexer.Token,
+	fields:    []StructLiteralField,
+}
+
 Expression :: union {
 	LiteralExpression,
 	IdentExpression,
@@ -71,6 +81,7 @@ Expression :: union {
 	IfExpression,
 	MatchExpression,
 	BlockExpression,
+	StructLiteralExpression,
 }
 
 LetStatement :: struct {
@@ -244,6 +255,8 @@ ast_destroy :: proc(ast: ^AST) {
 			case IfExpression:
 				delete(e.then_block.stmts)
 				if eb, ok := e.else_block.?; ok do delete(eb.stmts)
+			case StructLiteralExpression:
+				delete(e.fields)
 			case BinaryExpression, UnaryExpression,
 			     FieldAccessExpression, IndexExpression,
 			     LiteralExpression, IdentExpression:
