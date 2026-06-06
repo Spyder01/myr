@@ -118,6 +118,43 @@ test_skip_whitespace_comment :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_skip_whitespace_block_comment :: proc(t: ^testing.T) {
+	l := make_lexer("/* block comment */abc")
+	skip_whitespace(&l)
+	testing.expect_value(t, peek(&l), byte('a'))
+}
+
+@(test)
+test_skip_whitespace_block_comment_multiline :: proc(t: ^testing.T) {
+	l := make_lexer("/* line one\n   line two\n*/abc")
+	skip_whitespace(&l)
+	testing.expect_value(t, peek(&l), byte('a'))
+}
+
+@(test)
+test_skip_whitespace_block_comment_inline :: proc(t: ^testing.T) {
+	// block comment between tokens — lexer lands on next non-whitespace
+	l := make_lexer("/* skip */xyz")
+	skip_whitespace(&l)
+	testing.expect_value(t, peek(&l), byte('x'))
+}
+
+@(test)
+test_skip_whitespace_block_comment_then_line_comment :: proc(t: ^testing.T) {
+	l := make_lexer("/* block */ // line\nabc")
+	skip_whitespace(&l)
+	testing.expect_value(t, peek(&l), byte('a'))
+}
+
+@(test)
+test_skip_whitespace_block_comment_unterminated :: proc(t: ^testing.T) {
+	// unterminated block comment — lexer should reach EOF without panicking
+	l := make_lexer("/* no end")
+	skip_whitespace(&l)
+	testing.expect(t, is_eof(&l), "unterminated block comment should reach EOF")
+}
+
+@(test)
 test_skip_whitespace_no_whitespace :: proc(t: ^testing.T) {
 	l := make_lexer("abc")
 	skip_whitespace(&l)

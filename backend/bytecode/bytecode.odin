@@ -43,6 +43,7 @@ Opcode :: enum u8 {
 
 	JUMP,
 	JUMP_IF_FALSE,
+	JUMP_IF_TRUE,
 	LOOP,
 
 	CALL,
@@ -50,6 +51,7 @@ Opcode :: enum u8 {
 
 	POP,
 	PRINT,
+	INPUT,
 }
 
 

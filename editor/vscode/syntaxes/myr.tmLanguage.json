@@ -18,8 +18,17 @@
   ],
   "repository": {
     "comment": {
-      "name": "comment.line.double-slash.myr",
-      "match": "//.*$"
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.myr",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.myr",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
     },
     "string": {
       "name": "string.quoted.double.myr",

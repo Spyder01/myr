@@ -36,6 +36,7 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .POP:          return simple_instruction("POP", offset)
     case .RETURN:       return simple_instruction("RETURN", offset)
     case .PRINT:        return simple_instruction("PRINT", offset)
+    case .INPUT:        return simple_instruction("INPUT", offset)
     case .EQ:           return simple_instruction("EQ", offset)
     case .NEQ:          return simple_instruction("NEQ", offset)
     case .LT:           return simple_instruction("LT", offset)
@@ -57,6 +58,7 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .CONST_LONG:   return const_long_instruction("CONST_LONG", chunk, offset)
     case .JUMP:         return jump_instruction("JUMP", 1, chunk, offset)
     case .JUMP_IF_FALSE: return jump_instruction("JUMP_IF_FALSE", 1, chunk, offset)
+    case .JUMP_IF_TRUE:  return jump_instruction("JUMP_IF_TRUE",  1, chunk, offset)
     case .LOOP:         return jump_instruction("LOOP", -1, chunk, offset)
 
     case:

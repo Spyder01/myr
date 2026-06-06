@@ -315,6 +315,23 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 			compile_assignment(c, e, span)
 			return
 		}
+		// short-circuit logical operators
+		if e.operation.kind == .AND {
+			compile_expr(c, e.left)
+			jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
+			emit(&c.bc, .POP, span)
+			compile_expr(c, e.right)
+			patch_jump(&c.bc, jump)
+			return
+		}
+		if e.operation.kind == .OR {
+			compile_expr(c, e.left)
+			jump, _ := emit_jump(&c.bc, .JUMP_IF_TRUE, span)
+			emit(&c.bc, .POP, span)
+			compile_expr(c, e.right)
+			patch_jump(&c.bc, jump)
+			return
+		}
 		compile_expr(c, e.left)
 		compile_expr(c, e.right)
 		emit(&c.bc, op_to_opcode(e.operation.kind), span)
@@ -324,12 +341,22 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		callee_node := c.ast.nodes[e.callee]
 		if expr, ok := callee_node.(parser.Expression); ok {
 			if id, ok2 := expr.(parser.IdentExpression); ok2 {
-				if lexer.Token(id).data == "print" {
+				switch lexer.Token(id).data {
+				case "print":
 					for arg in e.args {
 						compile_expr(c, arg)
 						emit(&c.bc, .PRINT, span)
 					}
-					emit(&c.bc, .NIL, span)  // print returns nil
+					emit(&c.bc, .NIL, span)
+					return
+				case "input":
+					// emit prompt (empty string if no argument given)
+					if len(e.args) > 0 {
+						compile_expr(c, e.args[0])
+					} else {
+						emit_constant(&c.bc, "", span)
+					}
+					emit(&c.bc, .INPUT, span)
 					return
 				}
 			}

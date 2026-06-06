@@ -61,6 +61,17 @@ skip_whitespace :: proc(l: ^Lexer) {
 								for !is_eof(l) && peek(l) != byte(Spaces.NEW_LINE) {
 										advance(l)
 								}
+						} else if peek_next(l) == byte(Symbols.STAR) {
+								advance(l) // /
+								advance(l) // *
+								for !is_eof(l) {
+										if peek(l) == byte(Symbols.STAR) && peek_next(l) == byte(Symbols.SLASH) {
+												advance(l) // *
+												advance(l) // /
+												break
+										}
+										advance(l)
+								}
 						} else {
 								return
 						}

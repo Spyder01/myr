@@ -3,6 +3,8 @@ package vm
 import bc "../../bytecode"
 import "core:fmt"
 import "core:strings"
+import "core:os"
+import "core:io"
 
 CallFrame :: struct {
 	ip:       int,
@@ -16,6 +18,7 @@ VM :: struct {
 	stack:       [STACK_MAX]Value,
 	stack_top:   u16,
 	globals:     map[string]Value,
+	stdin:       io.Reader, // nil → use os.stdin
 }
 
 VMError :: enum {
@@ -188,6 +191,15 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             print_value(a)
             fmt.println()
 
+        case .INPUT:
+            prompt, err := vm_pop(vm)
+            if err != nil do return err
+            if s, ok := prompt.(string); ok && len(s) > 0 {
+                fmt.printf("%s", s)
+            }
+            line := read_line(vm.stdin)
+            vm_push(vm, line)
+
         case .DEFINE_GLOBAL:
             name := read_constant(vm).(string)
             top, _ := vm_peek(vm)
@@ -229,6 +241,13 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
                 current_frame(vm).ip += int(offset)
             }
 
+        case .JUMP_IF_TRUE:
+            offset := read_short(vm)
+            top, _ := vm_peek(vm)
+            if !is_falsy(top) {
+                current_frame(vm).ip += int(offset)
+            }
+
         case .LOOP:
             offset := read_short(vm)
             current_frame(vm).ip -= int(offset)
@@ -266,6 +285,21 @@ is_falsy :: proc(val: Value) -> bool {
     case ^Function: return false
     }
     return true
+}
+
+read_line :: proc(src: io.Reader) -> string {
+    r := src if src.data != nil else io.Reader(os.to_reader(os.stdin))
+    b := strings.builder_make()
+    buf := [1]byte{}
+    for {
+        n, err := io.read(r, buf[:])
+        if n > 0 {
+            if buf[0] == '\n' { break }
+            if buf[0] != '\r' { strings.write_byte(&b, buf[0]) }
+        }
+        if err != nil { break }
+    }
+    return strings.to_string(b)
 }
 
 print_value :: proc(val: Value) {

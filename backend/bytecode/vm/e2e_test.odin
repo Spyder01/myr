@@ -2,12 +2,13 @@
 package vm
 
 import "core:testing"
+import "core:strings"
 import bc "../../bytecode"
 import "../../../parser"
 
 // ---- helpers ----
 
-run_source :: proc(source: string) -> (Value, Maybe(VMError)) {
+run_source :: proc(source: string, stdin_data: string = "") -> (Value, Maybe(VMError)) {
 	p   := parser.new_parser(source)
 	ast := parser.parse_program(&p)
 	defer parser.ast_destroy(&ast)
@@ -19,6 +20,10 @@ run_source :: proc(source: string) -> (Value, Maybe(VMError)) {
 
 	machine := new_vm()
 	defer destroy_vm(&machine)
+	if len(stdin_data) > 0 {
+		sr: strings.Reader
+		machine.stdin = strings.to_reader(&sr, stdin_data)
+	}
 	vm_err := vm_interpret(&machine, fn)
 	if vm_err != nil do return Nil{}, vm_err
 	if machine.stack_top == 0 do return Nil{}, nil
@@ -27,6 +32,11 @@ run_source :: proc(source: string) -> (Value, Maybe(VMError)) {
 
 result :: proc(source: string) -> Value {
 	val, _ := run_source(source)
+	return val
+}
+
+result_with_stdin :: proc(source: string, stdin_data: string) -> Value {
+	val, _ := run_source(source, stdin_data)
 	return val
 }
 
@@ -535,6 +545,60 @@ test_e2e_local_const_mixed_with_let :: proc(t: ^testing.T) {
 	`)
 	// 3 iterations: i=0,3,6 → total=3,6,9
 	testing.expect_value(t, val.(i64), i64(9))
+}
+
+// ---- input ----
+
+@(test)
+test_e2e_input_returns_string :: proc(t: ^testing.T) {
+	val := result_with_stdin(`
+		function main() { return input() }
+	`, "hello\n")
+	testing.expect_value(t, val.(string), "hello")
+}
+
+@(test)
+test_e2e_input_strips_newline :: proc(t: ^testing.T) {
+	val := result_with_stdin(`
+		function main() { return input() }
+	`, "world\n")
+	testing.expect_value(t, val.(string), "world")
+}
+
+@(test)
+test_e2e_input_with_prompt :: proc(t: ^testing.T) {
+	// prompt is printed to stdout — just verify the return value is correct
+	val := result_with_stdin(`
+		function main() { return input("name: ") }
+	`, "myr\n")
+	testing.expect_value(t, val.(string), "myr")
+}
+
+@(test)
+test_e2e_input_eq :: proc(t: ^testing.T) {
+	val := result_with_stdin(`
+		function main() -> bool {
+			let s = input()
+			return s == "yes"
+		}
+	`, "yes\n")
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_input_multiple :: proc(t: ^testing.T) {
+	// second input call reads the next line
+	val := result_with_stdin(`
+		function main() -> int {
+			let a = input()
+			let b = input()
+			let ok = 0
+			if a == "foo" { ok = ok + 1 }
+			if b == "bar" { ok = ok + 1 }
+			return ok
+		}
+	`, "foo\nbar\n")
+	testing.expect_value(t, val.(i64), i64(2))
 }
 
 // ---- runtime errors ----

@@ -15,6 +15,7 @@ syntax keyword myrType int float bool str
 syntax match   myrNumber  '\<[0-9]\+\(\.[0-9]\+\)\?\>'
 syntax region  myrString  start='"' end='"' skip='\\"'
 syntax match   myrComment '//.*$'
+syntax region  myrComment start='/\*' end='\*/'
 
 " decorators
 syntax match   myrDecorator '@\w\+'
