@@ -175,10 +175,38 @@ parse_params :: proc(p: ^Parser) -> []Param {
 
 @private
 parse_type :: proc(p: ^Parser) -> TypeIdx {
+	if peek(p) == .LEFT_PAREN {
+		return parse_fn_type(p)
+	}
 	tok := expect(p, .IDENT)
 	named := NamedType(tok)
 	append_elem(&p.ast.nodes, Node(Type(named)))
 	append_elem(&p.ast.spans, tok.span)
+	return TypeIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_fn_type :: proc(p: ^Parser) -> TypeIdx {
+	span := peek_span(p)
+	expect(p, .LEFT_PAREN)
+	params := make([dynamic]TypeIdx)
+	for peek(p) != .RIGHT_PAREN && peek(p) != .EOF {
+		append_elem(&params, parse_type(p))
+		if peek(p) != .RIGHT_PAREN {
+			expect(p, .COMMA)
+		}
+	}
+	expect(p, .RIGHT_PAREN)
+
+	return_type: Maybe(TypeIdx) = nil
+	if peek(p) == .ARROW {
+		advance(p)
+		return_type = parse_type(p)
+	}
+
+	fn_type := FnType{params = params[:], return_type = return_type}
+	append_elem(&p.ast.nodes, Node(Type(fn_type)))
+	append_elem(&p.ast.spans, span)
 	return TypeIdx(len(p.ast.nodes) - 1)
 }
 
@@ -332,7 +360,8 @@ parse_expr_stmt :: proc(p: ^Parser) -> StatementIdx {
 @private
 binding_power :: proc(kind: lexer.TokenType) -> (left: int, right: int) {
 	#partial switch kind {
-	case .EQ:                                    return 1,  2
+	case .EQ, .PLUS_EQ, .MINUS_EQ,
+	     .STAR_EQ, .SLASH_EQ, .PERCENT_EQ:      return 1,  2
 	case .OR:                                    return 3,  4
 	case .AND:                                   return 5,  6
 	case .EQ_EQ, .BANG_EQ,

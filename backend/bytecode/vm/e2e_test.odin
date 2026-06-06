@@ -547,6 +547,92 @@ test_e2e_local_const_mixed_with_let :: proc(t: ^testing.T) {
 	testing.expect_value(t, val.(i64), i64(9))
 }
 
+// ---- first-class functions / callbacks ----
+
+@(test)
+test_e2e_fn_passed_as_arg :: proc(t: ^testing.T) {
+	val := result(`
+		function double(x: int) -> int { return x * 2 }
+		function apply(f: (int) -> int, x: int) -> int { return f(x) }
+		function main() { return apply(double, 5) }
+	`)
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_fn_stored_in_let :: proc(t: ^testing.T) {
+	val := result(`
+		function square(x: int) -> int { return x * x }
+		function main() -> int {
+			let f = square
+			return f(6)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(36))
+}
+
+@(test)
+test_e2e_fn_called_in_loop :: proc(t: ^testing.T) {
+	val := result(`
+		function double(x: int) -> int { return x * 2 }
+		function sum_with(f: (int) -> int, n: int) -> int {
+			let total = 0
+			let i = 0
+			for i < n {
+				total += f(i)
+				i += 1
+			}
+			return total
+		}
+		function main() { return sum_with(double, 5) }
+	`)
+	// double(0)+double(1)+double(2)+double(3)+double(4) = 0+2+4+6+8 = 20
+	testing.expect_value(t, val.(i64), i64(20))
+}
+
+@(test)
+test_e2e_fn_passed_to_multiple_callers :: proc(t: ^testing.T) {
+	val := result(`
+		function inc(x: int) -> int { return x + 1 }
+		function apply(f: (int) -> int, x: int) -> int { return f(x) }
+		function main() -> int {
+			let a = apply(inc, 10)
+			let b = apply(inc, a)
+			return b
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(12))
+}
+
+@(test)
+test_e2e_two_fn_args :: proc(t: ^testing.T) {
+	val := result(`
+		function add(a: int, b: int) -> int { return a + b }
+		function mul(a: int, b: int) -> int { return a * b }
+		function combine(f: (int, int) -> int, g: (int, int) -> int, a: int, b: int) -> int {
+			return f(a, b) + g(a, b)
+		}
+		function main() { return combine(add, mul, 3, 4) }
+	`)
+	// add(3,4) + mul(3,4) = 7 + 12 = 19
+	testing.expect_value(t, val.(i64), i64(19))
+}
+
+@(test)
+test_e2e_fn_returned_from_fn :: proc(t: ^testing.T) {
+	val := result(`
+		function double(x: int) -> int { return x * 2 }
+		function get_fn(which: int) -> (int) -> int {
+			return double
+		}
+		function main() -> int {
+			let f = get_fn(0)
+			return f(7)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(14))
+}
+
 // ---- input ----
 
 @(test)

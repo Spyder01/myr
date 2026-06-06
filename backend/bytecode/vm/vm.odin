@@ -117,6 +117,7 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             if err1 != nil do return err1
             a, err2 := vm_pop(vm)
             if err2 != nil do return err2
+
             #partial switch av in a {
             case i64:
                 bv, ok := b.(i64)

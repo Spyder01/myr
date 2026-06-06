@@ -13,6 +13,16 @@ RUNS  = 3
 # ---- runtime programs ----
 
 PYTHON = {
+    "callbacks": """\
+def double(x): return x * 2
+def square(x): return x * x
+def sum_with(f, n):
+    total = 0
+    for i in range(n): total += f(i)
+    return total
+print(sum_with(double, 100000))
+print(sum_with(square, 1000))
+""",
     "fib": """\
 def fib(n):
     if n <= 1: return n
@@ -57,6 +67,13 @@ print(count)
 }
 
 NODE_JS = {
+    "callbacks": """\
+function double(x){return x*2;}
+function square(x){return x*x;}
+function sumWith(f,n){let t=0;for(let i=0;i<n;i++)t+=f(i);return t;}
+console.log(sumWith(double,100000));
+console.log(sumWith(square,1000));
+""",
     "fib": """\
 function fib(n){if(n<=1)return n;return fib(n-1)+fib(n-2);}
 console.log(fib(30));
@@ -128,6 +145,7 @@ MYR_ONLY = [
 ]
 
 CROSS = [
+    ("callbacks",   "benchmarks/callbacks.myr",      "9999900000\n332833500"),
     ("fib",         "benchmarks/fib.myr",           "832040"),
     ("loop",        "benchmarks/loop.myr",           "499999500000"),
     ("calls",       "benchmarks/calls.myr",          "4999950000"),

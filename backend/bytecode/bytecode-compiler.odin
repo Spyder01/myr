@@ -315,6 +315,12 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 			compile_assignment(c, e, span)
 			return
 		}
+		if e.operation.kind == .PLUS_EQ  || e.operation.kind == .MINUS_EQ ||
+		   e.operation.kind == .STAR_EQ  || e.operation.kind == .SLASH_EQ ||
+		   e.operation.kind == .PERCENT_EQ {
+			compile_compound_assignment(c, e, span)
+			return
+		}
 		// short-circuit logical operators
 		if e.operation.kind == .AND {
 			compile_expr(c, e.left)
@@ -377,6 +383,49 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.FieldAccessExpression, parser.IndexExpression,
 	     parser.MatchExpression:
 		compiler_error(c, "not yet implemented", span)
+	}
+}
+
+compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer.Span) {
+	lhs := c.ast.nodes[e.left]
+	ident, ok := lhs.(parser.Expression)
+	if !ok { compiler_error(c, "invalid assignment target", span); return }
+	id, ok2 := ident.(parser.IdentExpression)
+	if !ok2 { compiler_error(c, "invalid assignment target", span); return }
+
+	name := lexer.Token(id).data
+	slot, found := resolve_local(&c.bc, name)
+
+	// push current value
+	if found {
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(slot), span)
+	} else {
+		name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+		emit(&c.bc, .GET_GLOBAL, span)
+		emit_byte(&c.bc, u8(name_idx), span)
+	}
+
+	// push rhs and apply op
+	compile_expr(c, e.right)
+	op: Opcode
+	#partial switch e.operation.kind {
+	case .PLUS_EQ:    op = .ADD
+	case .MINUS_EQ:   op = .SUB
+	case .STAR_EQ:    op = .MUL
+	case .SLASH_EQ:   op = .DIV
+	case .PERCENT_EQ: op = .MOD
+	}
+	emit(&c.bc, op, span)
+
+	// write back (SET peeks — result stays on stack)
+	if found {
+		emit(&c.bc, .SET_LOCAL, span)
+		emit_byte(&c.bc, u8(slot), span)
+	} else {
+		name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+		emit(&c.bc, .SET_GLOBAL, span)
+		emit_byte(&c.bc, u8(name_idx), span)
 	}
 }
 

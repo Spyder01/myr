@@ -251,7 +251,8 @@ ast_destroy :: proc(ast: ^AST) {
 		case Type:
 			switch ty in n {
 			case GenericType: delete(ty.args)
-			case NamedType, FnType:
+			case FnType:      delete(ty.params)
+			case NamedType:
 			}
 		}
 	}

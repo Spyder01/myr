@@ -53,6 +53,13 @@ TokenType :: enum(u8) {
 	SLASH,
 	PERCENT,
 
+	// Compound assignment
+	PLUS_EQ,
+	MINUS_EQ,
+	STAR_EQ,
+	SLASH_EQ,
+	PERCENT_EQ,
+
 	// Comparison
 	EQ,
 	EQ_EQ,
