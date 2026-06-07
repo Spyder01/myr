@@ -78,6 +78,10 @@ visit_expr :: proc(ast: ^AST, idx: ExpressionIdx, visit: Visitor) {
 		visit_block(ast, e, visit)
 	case StructLiteralExpression:
 		for field in e.fields do visit_expr(ast, field.value, visit)
+	case NewExpression:
+		for field in e.fields do visit_expr(ast, field.value, visit)
+	case DerefExpression:
+		visit_expr(ast, e.operand, visit)
 	case LiteralExpression, IdentExpression:
 		// leaves
 	}
@@ -163,6 +167,12 @@ walker_push_expr :: proc(w: ^WalkerCursor, e: Expression) {
 		for i := len(v.fields) - 1; i >= 0; i -= 1 {
 			append(&w.stack, u32(v.fields[i].value))
 		}
+	case NewExpression:
+		for i := len(v.fields) - 1; i >= 0; i -= 1 {
+			append(&w.stack, u32(v.fields[i].value))
+		}
+	case DerefExpression:
+		append(&w.stack, u32(v.operand))
 	case LiteralExpression, IdentExpression:
 		// leaves
 	}

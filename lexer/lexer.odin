@@ -122,9 +122,11 @@ check_keyword :: proc(s: string) -> TokenType {
 	case KW_IMPORT:  return .IMPORT
 	case KW_TRUE:    return .TRUE
 	case KW_FALSE:   return .FALSE
+	case KW_NIL:     return .NIL
 	case KW_FOR:      return .LOOP
 	case KW_BREAK:    return .BREAK
 	case KW_CONTINUE: return .CONTINUE
+	case KW_NEW:      return .NEW
 	}
 	return .IDENT
 }

@@ -21,7 +21,8 @@ LoopCtx :: struct {
 StructLayout :: struct {
 	field_names:        []string,
 	field_offsets:      []int,
-	field_struct_types: []string, // "" for scalar fields, struct name for struct-typed fields
+	field_struct_types: []string, // "" for scalars/pointers, struct name for flat struct fields
+	field_ptr_inners:   []string, // "" for non-pointers, "T" for ^T pointer fields
 	total_slots:        int,
 }
 
@@ -140,13 +141,14 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 	// parameters start at slot 1; register each with its actual slot count
 	for param in d.params {
 		struct_name := type_ann_struct_name(c, param.type)
+		ptr_inner   := type_ann_ptr_inner(c, param.type)
 		slots := 1
 		if struct_name != "" {
 			if layout, ok := c.struct_layouts[struct_name]; ok {
 				slots = layout.total_slots
 			}
 		}
-		add_local(&fn_compiler, param.name.data, slots, struct_name)
+		add_local(&fn_compiler, param.name.data, slots, struct_name, ptr_inner)
 	}
 
 	// compile body
@@ -212,9 +214,11 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			emit_byte(&c.bc, u8(name_idx), span)
 		} else {
 			struct_type := expr_struct_type(c, s.value)
-			if struct_type == "" {
+			ptr_inner   := expr_ptr_inner(c, s.value)
+			if struct_type == "" && ptr_inner == "" {
 				if ann_idx, has_ann := s.type.?; has_ann {
 					struct_type = type_ann_struct_name(c, ann_idx)
+					ptr_inner   = type_ann_ptr_inner(c, ann_idx)
 				}
 			}
 			slots := 1
@@ -223,7 +227,7 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 					slots = layout.total_slots
 				}
 			}
-			add_local(&c.bc, s.name.data, slots, struct_type)
+			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner)
 		}
 
 	case parser.ReturnStatement:
@@ -355,6 +359,10 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	switch e in node.(parser.Expression) {
 	case parser.LiteralExpression:
 		tok := lexer.Token(e)
+		if tok.kind == .NIL {
+			emit(&c.bc, .NIL, span)
+			return
+		}
 		val := parse_literal(tok)
 		emit_constant(&c.bc, val, span)
 
@@ -466,6 +474,12 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.StructLiteralExpression:
 		compile_struct_literal(c, e, span)
 
+	case parser.NewExpression:
+		compile_new_expr(c, e, span)
+
+	case parser.DerefExpression:
+		compile_deref_expr(c, e, span)
+
 	case parser.IndexExpression, parser.MatchExpression:
 		compiler_error(c, "not yet implemented", span)
 	}
@@ -509,19 +523,53 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 		}
 
 	case parser.FieldAccessExpression:
-		base_slot, parent_type, chain_ok := resolve_access_chain(c, lhs.object)
-		if !chain_ok { compiler_error(c, "invalid compound assignment target", span); return }
-		layout, has_layout := c.struct_layouts[parent_type]
-		if !has_layout { compiler_error(c, "compound assignment on non-struct field", span); return }
-		field_offset, _, _, field_found := find_field(layout, lhs.field.data)
-		if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
-		abs_slot := base_slot + field_offset
-		emit(&c.bc, .GET_LOCAL, span)
-		emit_byte(&c.bc, u8(abs_slot), span)
-		compile_expr(c, e.right)
-		emit(&c.bc, op, span)
-		emit(&c.bc, .SET_LOCAL, span)
-		emit_byte(&c.bc, u8(abs_slot), span)
+		base_slot, heap_offset, parent_type, chain_ok := resolve_access_chain(c, lhs.object)
+		if chain_ok && parent_type != "" {
+			layout, has_layout := c.struct_layouts[parent_type]
+			if !has_layout { compiler_error(c, "compound assignment on non-struct field", span); return }
+			field_offset, _, _, _, field_found := find_field(layout, lhs.field.data)
+			if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
+			if heap_offset >= 0 {
+				abs_heap := heap_offset + field_offset
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(base_slot), span)
+				emit(&c.bc, .HEAP_GET, span)
+				emit_byte(&c.bc, u8(abs_heap), span)
+				compile_expr(c, e.right)
+				emit(&c.bc, op, span)
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(base_slot), span)
+				emit(&c.bc, .HEAP_SET, span)
+				emit_byte(&c.bc, u8(abs_heap), span)
+			} else {
+				abs_slot := base_slot + field_offset
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(abs_slot), span)
+				compile_expr(c, e.right)
+				emit(&c.bc, op, span)
+				emit(&c.bc, .SET_LOCAL, span)
+				emit_byte(&c.bc, u8(abs_slot), span)
+			}
+		} else {
+			// Fallback: chain passes through a pointer-typed field.
+			// GET: emit ptr, HEAP_GET field; apply op; SET: emit ptr again, HEAP_SET field.
+			heap_base1, container_type, ok1 := compile_ptr_to_container(c, lhs.object, span)
+			if !ok1 { compiler_error(c, "invalid compound assignment target", span); return }
+			layout, has := c.struct_layouts[container_type]
+			if !has { compiler_error(c, "compound assignment on non-struct field", span); return }
+			field_offset, _, _, _, field_found := find_field(layout, lhs.field.data)
+			if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
+			abs_heap := heap_base1 + field_offset
+			emit(&c.bc, .HEAP_GET, span)
+			emit_byte(&c.bc, u8(abs_heap), span)
+			compile_expr(c, e.right)
+			emit(&c.bc, op, span)
+			// Re-acquire the ptr for HEAP_SET.
+			heap_base2, _, ok2 := compile_ptr_to_container(c, lhs.object, span)
+			if !ok2 { compiler_error(c, "invalid compound assignment target", span); return }
+			emit(&c.bc, .HEAP_SET, span)
+			emit_byte(&c.bc, u8(heap_base2 + field_offset), span)
+		}
 
 	case:
 		compiler_error(c, "invalid compound assignment target", span)
@@ -762,11 +810,22 @@ local_struct_type :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
 	return ""
 }
 
+local_ptr_inner :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
+	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
+		if bc.locals[i].name == name {
+			return bc.locals[i].ptr_inner
+		}
+	}
+	return ""
+}
+
 type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 	if int(type_idx) >= len(c.ast.nodes) do return 1
 	node := c.ast.nodes[int(type_idx)]
 	ty, ok := node.(parser.Type)
 	if !ok do return 1
+	// Pointer types always occupy exactly 1 slot.
+	if _, is_ptr := ty.(parser.PointerType); is_ptr do return 1
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return 1
 	name := lexer.Token(named).data
@@ -781,6 +840,8 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	node := c.ast.nodes[int(type_idx)]
 	ty, ok := node.(parser.Type)
 	if !ok do return ""
+	// Pointer types are not flat structs — the local holds 1 pointer slot.
+	if _, is_ptr := ty.(parser.PointerType); is_ptr do return ""
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
@@ -788,6 +849,22 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 		return name
 	}
 	return ""
+}
+
+// type_ann_ptr_inner returns the name of T when the annotation is ^T, or "".
+type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
+	if int(type_idx) >= len(c.ast.nodes) do return ""
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok do return ""
+	ptr, is_ptr := ty.(parser.PointerType)
+	if !is_ptr do return ""
+	inner_node := c.ast.nodes[int(ptr.inner)]
+	inner_ty, ok2 := inner_node.(parser.Type)
+	if !ok2 do return ""
+	named, ok3 := inner_ty.(parser.NamedType)
+	if !ok3 do return ""
+	return lexer.Token(named).data
 }
 
 expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
@@ -801,32 +878,39 @@ build_struct_layout :: proc(c: ^Compiler, d: parser.StructDecl) -> StructLayout 
 	field_names        := make([]string, len(d.fields))
 	field_offsets      := make([]int,    len(d.fields))
 	field_struct_types := make([]string, len(d.fields))
+	field_ptr_inners   := make([]string, len(d.fields))
 	offset := 0
 	for field, i in d.fields {
 		field_names[i]        = field.name.data
 		field_offsets[i]      = offset
 		field_struct_types[i] = type_ann_struct_name(c, field.type)
+		field_ptr_inners[i]   = type_ann_ptr_inner(c, field.type)
 		offset += type_slot_count(c, field.type)
 	}
 	return StructLayout{
 		field_names        = field_names,
 		field_offsets      = field_offsets,
 		field_struct_types = field_struct_types,
+		field_ptr_inners   = field_ptr_inners,
 		total_slots        = offset,
 	}
 }
 
-find_field :: proc(layout: StructLayout, field_name: string) -> (offset: int, slots: int, struct_type: string, found: bool) {
+find_field :: proc(layout: StructLayout, field_name: string) -> (offset: int, slots: int, struct_type: string, ptr_inner: string, found: bool) {
 	for i in 0..<len(layout.field_names) {
 		if layout.field_names[i] == field_name {
 			next := layout.total_slots
 			if i + 1 < len(layout.field_offsets) {
 				next = layout.field_offsets[i + 1]
 			}
-			return layout.field_offsets[i], next - layout.field_offsets[i], layout.field_struct_types[i], true
+			pi := ""
+			if len(layout.field_ptr_inners) > i {
+				pi = layout.field_ptr_inners[i]
+			}
+			return layout.field_offsets[i], next - layout.field_offsets[i], layout.field_struct_types[i], pi, true
 		}
 	}
-	return 0, 0, "", false
+	return 0, 0, "", "", false
 }
 
 call_return_struct_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
@@ -849,6 +933,27 @@ call_return_struct_type :: proc(c: ^Compiler, e: parser.CallExpression) -> strin
 	return ""
 }
 
+// call_return_ptr_inner returns "T" if the callee's return type is ^T, or "".
+call_return_ptr_inner :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
+	callee_node := c.ast.nodes[e.callee]
+	expr, ok := callee_node.(parser.Expression)
+	if !ok do return ""
+	id, ok2 := expr.(parser.IdentExpression)
+	if !ok2 do return ""
+	fn_name := lexer.Token(id).data
+	for node in c.ast.nodes {
+		decl, ok3 := node.(parser.Declaration)
+		if !ok3 do continue
+		fn, ok4 := decl.(parser.FunctionDecl)
+		if !ok4 do continue
+		if fn.name.data != fn_name do continue
+		ret_idx, has_ret := fn.return_type.?
+		if !has_ret do return ""
+		return type_ann_ptr_inner(c, ret_idx)
+	}
+	return ""
+}
+
 expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	node := c.ast.nodes[int(idx)]
 	expr, ok := node.(parser.Expression)
@@ -859,15 +964,36 @@ expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	case parser.IdentExpression:
 		return local_struct_type(&c.bc, lexer.Token(e).data)
 	case parser.FieldAccessExpression:
-		_, parent_type, ok2 := resolve_access_chain(c, e.object)
+		_, _, parent_type, ok2 := resolve_access_chain(c, e.object)
 		if !ok2 do return ""
 		layout, has := c.struct_layouts[parent_type]
 		if !has do return ""
-		_, _, field_st, found := find_field(layout, e.field.data)
+		_, _, field_st, _, found := find_field(layout, e.field.data)
 		if !found do return ""
 		return field_st
 	case parser.CallExpression:
 		return call_return_struct_type(c, e)
+	case parser.NewExpression:
+		return ""  // new T{} returns a pointer, not a flat struct
+	case parser.DerefExpression:
+		return expr_ptr_inner(c, e.operand)  // p^ produces a flat struct copy
+	}
+	return ""
+}
+
+// expr_ptr_inner returns the inner struct name when the expression produces a ^T pointer.
+expr_ptr_inner :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok do return ""
+	if ne, ok2 := expr.(parser.NewExpression); ok2 {
+		return ne.type_name.data
+	}
+	if id, ok2 := expr.(parser.IdentExpression); ok2 {
+		return local_ptr_inner(&c.bc, lexer.Token(id).data)
+	}
+	if ce, ok2 := expr.(parser.CallExpression); ok2 {
+		return call_return_ptr_inner(c, ce)
 	}
 	return ""
 }
@@ -895,68 +1021,207 @@ compile_struct_literal :: proc(c: ^Compiler, e: parser.StructLiteralExpression, 
 }
 
 // resolve_access_chain walks a chain of field accesses (e.g. r.origin.x) and
-// returns the absolute stack slot of the chain's base and the struct type at
-// that point, so the caller can apply one more field lookup on top of it.
-resolve_access_chain :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (slot: int, struct_type: string, ok: bool) {
+// returns the base stack slot, an accumulated heap_offset (-1 for flat struct
+// locals, >=0 for pointer locals), and the struct type at that point, so the
+// caller can apply one more field lookup on top of it.
+resolve_access_chain :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (slot: int, heap_offset: int, struct_type: string, ok: bool) {
+	node := c.ast.nodes[int(idx)]
+	expr, is_expr := node.(parser.Expression)
+	if !is_expr do return 0, -1, "", false
+	#partial switch e in expr {
+	case parser.IdentExpression:
+		name := lexer.Token(e).data
+		s, _, found := resolve_local(&c.bc, name)
+		if !found do return 0, -1, "", false
+		st := local_struct_type(&c.bc, name)
+		pi := local_ptr_inner(&c.bc, name)
+		if pi != "" {
+			return s, 0, pi, true  // pointer local: heap_offset=0
+		}
+		return s, -1, st, true    // flat struct local: heap_offset=-1
+	case parser.FieldAccessExpression:
+		base, h_off, parent_type, chain_ok := resolve_access_chain(c, e.object)
+		if !chain_ok do return 0, -1, "", false
+		layout, has := c.struct_layouts[parent_type]
+		if !has do return 0, -1, "", false
+		offset, _, field_st, _, found := find_field(layout, e.field.data)
+		if !found do return 0, -1, "", false
+		if h_off >= 0 {
+			// Through pointer: accumulate heap offset (stops at pointer-typed fields — handled by compile_ptr_to_container)
+			return base, h_off + offset, field_st, true
+		}
+		return base + offset, -1, field_st, true
+	}
+	return 0, -1, "", false
+}
+
+// compile_ptr_to_container emits bytecode that leaves the owning [^]Value pointer
+// on the stack for the access chain in `idx`. Returns (heap_base, struct_type, ok).
+// heap_base is the cumulative flat-struct offset within the heap object (used by
+// the caller to address individual fields via HEAP_GET/HEAP_SET).
+// For pointer-typed fields it emits HEAP_GET to hop through to the next pointer.
+compile_ptr_to_container :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: lexer.Span) -> (heap_base: int, struct_type: string, ok: bool) {
 	node := c.ast.nodes[int(idx)]
 	expr, is_expr := node.(parser.Expression)
 	if !is_expr do return 0, "", false
 	#partial switch e in expr {
 	case parser.IdentExpression:
 		name := lexer.Token(e).data
-		s, _, found := resolve_local(&c.bc, name)
+		slot, _, found := resolve_local(&c.bc, name)
 		if !found do return 0, "", false
-		return s, local_struct_type(&c.bc, name), true
+		pi := local_ptr_inner(&c.bc, name)
+		if pi == "" do return 0, "", false
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(slot), span)
+		return 0, pi, true
+
 	case parser.FieldAccessExpression:
-		base, parent_type, chain_ok := resolve_access_chain(c, e.object)
+		base, parent_type, chain_ok := compile_ptr_to_container(c, e.object, span)
 		if !chain_ok do return 0, "", false
 		layout, has := c.struct_layouts[parent_type]
 		if !has do return 0, "", false
-		offset, _, field_st, found := find_field(layout, e.field.data)
+		field_offset, _, field_st, field_pi, found := find_field(layout, e.field.data)
 		if !found do return 0, "", false
-		return base + offset, field_st, true
+		if field_st != "" {
+			// Flat struct field within the current heap object: accumulate offset.
+			return base + field_offset, field_st, true
+		}
+		if field_pi != "" {
+			// Pointer-typed field: emit HEAP_GET to load it, start a fresh chain.
+			emit(&c.bc, .HEAP_GET, span)
+			emit_byte(&c.bc, u8(base + field_offset), span)
+			return 0, field_pi, true
+		}
+		return 0, "", false
 	}
 	return 0, "", false
 }
 
 compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
-	base_slot, parent_type, ok := resolve_access_chain(c, e.object)
-	if !ok { compiler_error(c, "invalid field access", span); return }
+	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
-	layout, has_layout := c.struct_layouts[parent_type]
-	if !has_layout {
-		compiler_error(c, "field access on non-struct value", span)
+	if ok && parent_type != "" {
+		layout, has_layout := c.struct_layouts[parent_type]
+		if !has_layout {
+			compiler_error(c, "field access on non-struct value", span)
+			return
+		}
+		field_offset, field_slots, _, _, field_found := find_field(layout, e.field.data)
+		if !field_found {
+			compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
+			return
+		}
+		if heap_offset >= 0 {
+			for s in 0..<field_slots {
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(base_slot), span)
+				emit(&c.bc, .HEAP_GET, span)
+				emit_byte(&c.bc, u8(heap_offset + field_offset + s), span)
+			}
+		} else {
+			for s in 0..<field_slots {
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(base_slot + field_offset + s), span)
+			}
+		}
 		return
 	}
 
-	field_offset, field_slots, _, field_found := find_field(layout, e.field.data)
-	if !field_found {
-		compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
-		return
-	}
-
+	// Fallback: chain passes through a pointer-typed field (e.g. a.next.val).
+	heap_base, container_type, chain_ok := compile_ptr_to_container(c, e.object, span)
+	if !chain_ok { compiler_error(c, "invalid field access", span); return }
+	layout, has := c.struct_layouts[container_type]
+	if !has { compiler_error(c, "field access on non-struct value", span); return }
+	field_offset, field_slots, _, _, field_found := find_field(layout, e.field.data)
+	if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span); return }
+	// ptr is on stack; emit HEAP_GET for each slot (re-push ptr for multi-slot reads).
 	for s in 0..<field_slots {
-		emit(&c.bc, .GET_LOCAL, span)
-		emit_byte(&c.bc, u8(base_slot + field_offset + s), span)
+		if s > 0 {
+			// For multi-slot reads through a pointer hop we'd need the ptr again.
+			// Single-slot (scalars, pointers) is the common case; this handles it.
+			compiler_error(c, "multi-slot field read through pointer hop not yet supported", span)
+			return
+		}
+		emit(&c.bc, .HEAP_GET, span)
+		emit_byte(&c.bc, u8(heap_base + field_offset + s), span)
 	}
 }
 
 compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
-	base_slot, parent_type, ok := resolve_access_chain(c, e.object)
-	if !ok { compiler_error(c, "invalid field assignment target", span); return }
+	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
-	layout, has_layout := c.struct_layouts[parent_type]
-	if !has_layout {
-		compiler_error(c, "field assignment on non-struct value", span)
+	if ok && parent_type != "" {
+		layout, has_layout := c.struct_layouts[parent_type]
+		if !has_layout {
+			compiler_error(c, "field assignment on non-struct value", span)
+			return
+		}
+		field_offset, _, _, _, field_found := find_field(layout, e.field.data)
+		if !field_found {
+			compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
+			return
+		}
+		if heap_offset >= 0 {
+			emit(&c.bc, .GET_LOCAL, span)
+			emit_byte(&c.bc, u8(base_slot), span)
+			emit(&c.bc, .HEAP_SET, span)
+			emit_byte(&c.bc, u8(heap_offset + field_offset), span)
+		} else {
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(base_slot + field_offset), span)
+		}
 		return
 	}
 
-	field_offset, _, _, field_found := find_field(layout, e.field.data)
-	if !field_found {
-		compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
+	// Fallback: value is already on stack; emit ptr to container, then HEAP_SET.
+	heap_base, container_type, chain_ok := compile_ptr_to_container(c, e.object, span)
+	if !chain_ok { compiler_error(c, "invalid field assignment target", span); return }
+	layout, has := c.struct_layouts[container_type]
+	if !has { compiler_error(c, "field assignment on non-struct value", span); return }
+	field_offset, _, _, _, field_found := find_field(layout, e.field.data)
+	if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span); return }
+	emit(&c.bc, .HEAP_SET, span)
+	emit_byte(&c.bc, u8(heap_base + field_offset), span)
+}
+
+// compile_new_expr pushes all struct fields in layout order, then emits NEW N.
+// The VM allocates a heap slice of N Value slots, pops them, and pushes a ^Value pointer.
+compile_new_expr :: proc(c: ^Compiler, e: parser.NewExpression, span: lexer.Span) {
+	layout, ok := c.struct_layouts[e.type_name.data]
+	if !ok {
+		compiler_error(c, fmt.tprintf("undefined struct '%s'", e.type_name.data), span)
+		emit(&c.bc, .NIL, span)
 		return
 	}
+	field_map := make(map[string]parser.ExpressionIdx)
+	defer delete(field_map)
+	for field in e.fields {
+		field_map[field.name.data] = field.value
+	}
+	for name in layout.field_names {
+		val_idx, has_val := field_map[name]
+		if !has_val {
+			compiler_error(c, fmt.tprintf("missing field '%s' in new expression", name), span)
+			emit(&c.bc, .NIL, span)
+			continue
+		}
+		compile_expr(c, val_idx)
+	}
+	emit(&c.bc, .NEW, span)
+	emit_byte(&c.bc, u8(layout.total_slots), span)
+}
 
-	emit(&c.bc, .SET_LOCAL, span)
-	emit_byte(&c.bc, u8(base_slot + field_offset), span)
+// compile_deref_expr loads the pointer and emits HEAP_LOAD N to copy all slots.
+compile_deref_expr :: proc(c: ^Compiler, e: parser.DerefExpression, span: lexer.Span) {
+	// Determine how many heap slots to load from the pointer's inner type.
+	pi := expr_ptr_inner(c, e.operand)
+	n := 1
+	if pi != "" {
+		if layout, ok := c.struct_layouts[pi]; ok {
+			n = layout.total_slots
+		}
+	}
+	compile_expr(c, e.operand)  // pushes the ^Value pointer
+	emit(&c.bc, .HEAP_LOAD, span)
+	emit_byte(&c.bc, u8(n), span)
 }

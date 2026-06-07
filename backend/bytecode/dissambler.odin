@@ -10,6 +10,18 @@ disassemble_chunk :: proc(chunk: ^Chunk, name: string) {
     }
 }
 
+// disassemble_all disassembles a function and every nested function reachable
+// through its constant pool, recursively. This is the right call for --dump.
+disassemble_all :: proc(fn: ^Function) {
+    disassemble_chunk(&fn.chunk, fn.name)
+    for constant in fn.chunk.constants {
+        if nested, ok := constant.(^Function); ok {
+            fmt.println()
+            disassemble_all(nested)
+        }
+    }
+}
+
 disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     // print byte offset (address)
     fmt.printf("%04d ", offset)
@@ -22,7 +34,7 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     }
 
     op := Opcode(chunk.code[offset])
-    switch op {
+    #partial switch op {
     // simple instructions (no operands)
     case .ADD:          return simple_instruction("ADD", offset)
     case .SUB:          return simple_instruction("SUB", offset)
@@ -59,6 +71,10 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .SET_GLOBAL:   return const_instruction("SET_GLOBAL", chunk, offset)
     case .DEFINE_GLOBAL: return const_instruction("DEFINE_GLOBAL", chunk, offset)
     case .CALL:         return byte_instruction("CALL", chunk, offset)
+    case .NEW:          return byte_instruction("NEW",       chunk, offset)
+    case .HEAP_GET:     return byte_instruction("HEAP_GET",  chunk, offset)
+    case .HEAP_SET:     return byte_instruction("HEAP_SET",  chunk, offset)
+    case .HEAP_LOAD:    return byte_instruction("HEAP_LOAD", chunk, offset)
 
     // instructions with two byte operand
     case .CONST_LONG:   return const_long_instruction("CONST_LONG", chunk, offset)
@@ -66,6 +82,8 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .JUMP_IF_FALSE: return jump_instruction("JUMP_IF_FALSE", 1, chunk, offset)
     case .JUMP_IF_TRUE:  return jump_instruction("JUMP_IF_TRUE",  1, chunk, offset)
     case .LOOP:         return jump_instruction("LOOP", -1, chunk, offset)
+
+    case .NOP: return simple_instruction("NOP", offset)
 
     case:
         fmt.printf("UNKNOWN opcode %d\n", op)
@@ -124,5 +142,7 @@ print_value :: proc(val: Value) {
     case string:    fmt.printf("\"%s\"", v)
     case Nil:       fmt.printf("nil")
     case ^Function: fmt.printf("<fn %s>", v.name)
+    case [^]Value:
+        if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
     }
 }

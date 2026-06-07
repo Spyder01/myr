@@ -11,6 +11,7 @@ Value :: union {
 	string,
 	Nil,
 	^Function,
+	[^]Value, // heap pointer: base of a contiguous heap-allocated Value slice
 }
 
 Opcode :: enum u8 {
@@ -53,11 +54,24 @@ Opcode :: enum u8 {
 	LOOP,
 
 	CALL,
-	RETURN, 
+	RETURN,
+
+	NEW,       // 1-byte: N  — pop N values, heap-alloc slice, push ^Value base
+	HEAP_GET,  // 1-byte: offset — pop ^Value, push ptr[offset]
+	HEAP_SET,  // 1-byte: offset — pop ^Value (top), ptr[offset] = stack_top below it
+	HEAP_LOAD, // 1-byte: N  — pop ^Value, push ptr[0..N-1] (full deref)
 
 	POP,
 	PRINT,
 	INPUT,
+
+	// Superinstructions (peephole-fused, not yet wired in VM)
+	NOP,
+	ADD_LOCALS,
+	MUL_LOCALS,
+	LT_LOCAL_CONST,
+	LTE_LOCAL_CONST,
+	SUB_LOCAL_CONST,
 }
 
 
@@ -90,6 +104,7 @@ values_equal :: proc(a, b: Value) -> bool {
     case string:    if bv, ok := b.(string); ok do return av == bv
     case Nil:       _, ok := b.(Nil);            return ok
     case ^Function: return false
+    case [^]Value:  if bv, ok := b.([^]Value); ok do return av == bv
     }
     return false
 }

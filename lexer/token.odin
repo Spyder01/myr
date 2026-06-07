@@ -7,6 +7,7 @@ TokenType :: enum(u8) {
 	STRING,
 	TRUE,
 	FALSE,
+	NIL,
 
 	// Identifiers
 	IDENT,
@@ -30,6 +31,7 @@ TokenType :: enum(u8) {
 	LOOP,
 	BREAK,
 	CONTINUE,
+	NEW,
 
 	// Delimiters
 	LEFT_PAREN,

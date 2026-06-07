@@ -254,5 +254,14 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 		for field in e.fields {
 			nr_resolve_expr(nr, field.value)
 		}
+
+	case parser.NewExpression:
+		// type_name is a type reference — resolved by type checker
+		for field in e.fields {
+			nr_resolve_expr(nr, field.value)
+		}
+
+	case parser.DerefExpression:
+		nr_resolve_expr(nr, e.operand)
 	}
 }

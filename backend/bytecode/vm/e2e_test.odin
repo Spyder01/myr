@@ -944,3 +944,368 @@ test_e2e_struct_int_fields :: proc(t: ^testing.T) {
 	`)
 	testing.expect_value(t, val.(i64), i64(5))
 }
+
+// ---- pointers ----
+
+@(test)
+test_e2e_ptr_field_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 10, y = 20}
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_ptr_second_field_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 10, y = 20}
+			return p.y
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(20))
+}
+
+@(test)
+test_e2e_ptr_field_write :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 10, y = 20}
+			p.x = 99
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_ptr_compound_assign :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 10, y = 20}
+			p.x += 5
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(15))
+}
+
+@(test)
+test_e2e_ptr_as_fn_param :: proc(t: ^testing.T) {
+	// function takes ^Point and mutates it; caller sees the change
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function scale(p: ^Point, factor: i64) {
+			p.x *= factor
+			p.y *= factor
+		}
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 3, y = 4}
+			scale(p, 10)
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(30))
+}
+
+@(test)
+test_e2e_ptr_fn_return_annotated :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function make_point(x: i64, y: i64) -> ^Point {
+			return new Point{x = x, y = y}
+		}
+		function main() -> i64 {
+			let p: ^Point = make_point(7, 8)
+			return p.y
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(8))
+}
+
+@(test)
+test_e2e_ptr_fn_return_inferred :: proc(t: ^testing.T) {
+	// no type annotation on let — ptr_inner inferred from call return type
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function make_point(x: i64, y: i64) -> ^Point {
+			return new Point{x = x, y = y}
+		}
+		function main() -> i64 {
+			let p = make_point(7, 8)
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_ptr_explicit_deref :: proc(t: ^testing.T) {
+	// p^ copies the struct; returned field is from the copy
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function deref_copy(p: ^Point) -> Point { return p^ }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 42, y = 0}
+			let copy = deref_copy(p)
+			return copy.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_ptr_deref_isolation :: proc(t: ^testing.T) {
+	// mutating the deref'd copy must not affect the original pointer
+	val := result(`
+		struct Point { x: i64, y: i64 }
+		function deref_copy(p: ^Point) -> Point { return p^ }
+		function main() -> i64 {
+			let p: ^Point = new Point{x = 1, y = 2}
+			let copy = deref_copy(p)
+			copy.x = 999
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_ptr_nested_field_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: i64, y: i64 }
+		struct Rect  { origin: Vec2, size: Vec2 }
+		function make_rect(ox: i64, oy: i64, sw: i64, sh: i64) -> ^Rect {
+			return new Rect{origin = Vec2{x = ox, y = oy}, size = Vec2{x = sw, y = sh}}
+		}
+		function main() -> i64 {
+			let r = make_rect(1, 2, 10, 5)
+			return r.origin.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_ptr_nested_second_field :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: i64, y: i64 }
+		struct Rect  { origin: Vec2, size: Vec2 }
+		function make_rect(ox: i64, oy: i64, sw: i64, sh: i64) -> ^Rect {
+			return new Rect{origin = Vec2{x = ox, y = oy}, size = Vec2{x = sw, y = sh}}
+		}
+		function main() -> i64 {
+			let r = make_rect(1, 2, 10, 5)
+			return r.size.y
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+@(test)
+test_e2e_ptr_nested_field_write :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: i64, y: i64 }
+		struct Rect  { origin: Vec2, size: Vec2 }
+		function make_rect(ox: i64, oy: i64, sw: i64, sh: i64) -> ^Rect {
+			return new Rect{origin = Vec2{x = ox, y = oy}, size = Vec2{x = sw, y = sh}}
+		}
+		function main() -> i64 {
+			let r = make_rect(1, 2, 10, 5)
+			r.size.x = 42
+			return r.size.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_ptr_nested_compound_assign :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: i64, y: i64 }
+		struct Rect  { origin: Vec2, size: Vec2 }
+		function make_rect(ox: i64, oy: i64, sw: i64, sh: i64) -> ^Rect {
+			return new Rect{origin = Vec2{x = ox, y = oy}, size = Vec2{x = sw, y = sh}}
+		}
+		function area(r: ^Rect) -> i64 { return r.size.x * r.size.y }
+		function main() -> i64 {
+			let r = make_rect(1, 2, 10, 5)
+			r.size.x *= 3
+			r.size.y *= 3
+			return area(r)
+		}
+	`)
+	// (10*3) * (5*3) = 30 * 15 = 450
+	testing.expect_value(t, val.(i64), i64(450))
+}
+
+@(test)
+test_e2e_ptr_xor_not_deref :: proc(t: ^testing.T) {
+	// ^ in infix position is XOR, not deref
+	val := result(`
+		function main() -> i64 {
+			let a = 3
+			let b = 5
+			return a ^ b
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(6))
+}
+
+@(test)
+test_e2e_ptr_write_then_read_across_fn :: proc(t: ^testing.T) {
+	// write through pointer in one fn, read through same pointer in another
+	val := result(`
+		struct Counter { n: i64 }
+		function inc(c: ^Counter) { c.n += 1 }
+		function get(c: ^Counter) -> i64 { return c.n }
+		function main() -> i64 {
+			let c: ^Counter = new Counter{n = 0}
+			inc(c)
+			inc(c)
+			inc(c)
+			return get(c)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(3))
+}
+
+// ---- nil pointers ----
+
+@(test)
+test_e2e_ptr_nil_field_init :: proc(t: ^testing.T) {
+	// nil is assignable to a ^T field
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> i64 {
+			let n: ^Node = new Node{val = 42, next = nil}
+			return n.val
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_ptr_nil_eq :: proc(t: ^testing.T) {
+	// freshly allocated pointer is not nil
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> bool {
+			let n: ^Node = new Node{val = 1, next = nil}
+			return n == nil
+		}
+	`)
+	testing.expect_value(t, val.(bool), false)
+}
+
+@(test)
+test_e2e_ptr_nil_neq :: proc(t: ^testing.T) {
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> bool {
+			let n: ^Node = new Node{val = 1, next = nil}
+			return n != nil
+		}
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+@(test)
+test_e2e_ptr_nil_field_neq :: proc(t: ^testing.T) {
+	// the nil field itself compares equal to nil
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> bool {
+			let n: ^Node = new Node{val = 1, next = nil}
+			return n.next == nil
+		}
+	`)
+	testing.expect_value(t, val.(bool), true)
+}
+
+// ---- recursive (self-referential) struct ----
+
+@(test)
+test_e2e_recursive_struct_two_nodes :: proc(t: ^testing.T) {
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> i64 {
+			let b: ^Node = new Node{val = 2, next = nil}
+			let a: ^Node = new Node{val = 1, next = b}
+			return a.next.val
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(2))
+}
+
+@(test)
+test_e2e_recursive_struct_chain_sum :: proc(t: ^testing.T) {
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> i64 {
+			let c: ^Node = new Node{val = 3, next = nil}
+			let b: ^Node = new Node{val = 2, next = c}
+			let a: ^Node = new Node{val = 1, next = b}
+			let sum = 0
+			let cur = a
+			for cur != nil {
+				sum += cur.val
+				cur = cur.next
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(6))
+}
+
+@(test)
+test_e2e_recursive_struct_prepend_loop :: proc(t: ^testing.T) {
+	// build a list by prepending in a loop, verify sum
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function main() -> i64 {
+			let head: ^Node = new Node{val = 5, next = nil}
+			for let i = 4; i >= 1; i -= 1 {
+				head = new Node{val = i, next = head}
+			}
+			let sum = 0
+			let cur = head
+			for cur != nil {
+				sum += cur.val
+				cur = cur.next
+			}
+			return sum
+		}
+	`)
+	// 1+2+3+4+5 = 15
+	testing.expect_value(t, val.(i64), i64(15))
+}
+
+@(test)
+test_e2e_recursive_struct_fn_traverse :: proc(t: ^testing.T) {
+	val := result(`
+		struct Node { val: i64, next: ^Node }
+		function sum_list(n: ^Node) -> i64 {
+			let total = 0
+			for n != nil {
+				total += n.val
+				n = n.next
+			}
+			return total
+		}
+		function main() -> i64 {
+			let c: ^Node = new Node{val = 3, next = nil}
+			let b: ^Node = new Node{val = 2, next = c}
+			let a: ^Node = new Node{val = 1, next = b}
+			return sum_list(a)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(6))
+}

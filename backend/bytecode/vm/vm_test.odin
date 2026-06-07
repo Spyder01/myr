@@ -432,3 +432,194 @@ test_run_pop :: proc(t: ^testing.T) {
 	// after POP, only the first constant (1) remains
 	testing.expect_value(t, run_top(fn).(i64), i64(1))
 }
+
+// ---- NEW / HEAP_GET / HEAP_SET / HEAP_LOAD ----
+
+@(test)
+test_new_pushes_ptr :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(10), span)
+		bc.emit_constant(c, i64(20), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	val := run_top(fn)
+	_, ok := val.([^]Value)
+	testing.expect(t, ok, "NEW must push a [^]Value onto the stack")
+}
+
+@(test)
+test_heap_get_offset_0 :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(10), span)
+		bc.emit_constant(c, i64(20), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .HEAP_GET, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(10))
+}
+
+@(test)
+test_heap_get_offset_1 :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(10), span)
+		bc.emit_constant(c, i64(20), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .HEAP_GET, span)
+		bc.emit_byte(c, 1, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(20))
+}
+
+@(test)
+test_heap_load_top_slot :: proc(t: ^testing.T) {
+	// HEAP_LOAD 2: pops ptr, pushes slots[0], slots[1]; top is slots[1]
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(10), span)
+		bc.emit_constant(c, i64(20), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .HEAP_LOAD, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(20))
+}
+
+@(test)
+test_heap_load_first_slot :: proc(t: ^testing.T) {
+	// POP the top after HEAP_LOAD to expose slots[0]
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(10), span)
+		bc.emit_constant(c, i64(20), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .HEAP_LOAD, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(10))
+}
+
+@(test)
+test_heap_set_write :: proc(t: ^testing.T) {
+	// push 99, NEW 1{42}, HEAP_SET 0 → ptr[0]=99; HEAP_GET 0 → 99
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		// allocate: slot[0] = 42
+		bc.emit_constant(c, i64(42), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 1, span)
+		// ptr is at stack[0]; store ptr in local 0
+		bc.emit(c, .SET_LOCAL, span)
+		bc.emit_byte(c, 0, span)
+		// push new value, then ptr, then HEAP_SET
+		bc.emit_constant(c, i64(99), span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .HEAP_SET, span)
+		bc.emit_byte(c, 0, span)
+		// POP the leftover value (99)
+		bc.emit(c, .POP, span)
+		// GET_LOCAL ptr, HEAP_GET 0 → should be 99 now
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .HEAP_GET, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(99))
+}
+
+@(test)
+test_heap_set_leaves_value_on_stack :: proc(t: ^testing.T) {
+	// HEAP_SET must leave the value on the stack (like SET_LOCAL)
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(42), span)
+		bc.emit(c, .NEW, span)
+		bc.emit_byte(c, 1, span)
+		bc.emit(c, .SET_LOCAL, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit_constant(c, i64(77), span)  // value to set
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 0, span)            // ptr
+		bc.emit(c, .HEAP_SET, span)
+		bc.emit_byte(c, 0, span)
+		// after HEAP_SET the value (77) is still on stack
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(77))
+}
+
+@(test)
+test_heap_get_null_deref :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		nil_ptr: [^]bc.Value = nil
+		bc.emit_constant(c, nil_ptr, span)
+		bc.emit(c, .HEAP_GET, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
+}
+
+@(test)
+test_heap_set_null_deref :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span)
+		nil_ptr: [^]bc.Value = nil
+		bc.emit_constant(c, nil_ptr, span)
+		bc.emit(c, .HEAP_SET, span)
+		bc.emit_byte(c, 0, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
+}
+
+@(test)
+test_heap_load_null_deref :: proc(t: ^testing.T) {
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		nil_ptr: [^]bc.Value = nil
+		bc.emit_constant(c, nil_ptr, span)
+		bc.emit(c, .HEAP_LOAD, span)
+		bc.emit_byte(c, 2, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
+}

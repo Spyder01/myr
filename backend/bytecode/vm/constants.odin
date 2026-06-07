@@ -11,3 +11,4 @@ Value    :: bc.Value
 Nil      :: bc.Nil
 Function :: bc.Function
 Opcode   :: bc.Opcode
+HeapPtr  :: [^]bc.Value

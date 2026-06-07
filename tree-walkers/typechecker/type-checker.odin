@@ -55,19 +55,23 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 		tc.types[int(def)] = infer(tc, d.value)
 
 	case parser.StructDecl:
+		// Pre-register a stub so self-referential fields (e.g. next: ^Node) can resolve this struct.
+		st_id := TypeId(len(tc.type_table))
+		append(&tc.type_table, TypeInfo(StructType{name = d.name.data}))
+		tc.types[int(def)] = st_id
+
 		field_names := make([]string, len(d.fields))
 		field_types := make([]TypeId, len(d.fields))
 		for field, i in d.fields {
 			field_names[i] = field.name.data
 			field_types[i] = resolve_named_type(tc, field.type)
 		}
-		st_id := TypeId(len(tc.type_table))
-		append(&tc.type_table, TypeInfo(StructType{
+		// Patch the stub with the resolved field data.
+		tc.type_table[st_id] = TypeInfo(StructType{
 			name        = d.name.data,
 			field_names = field_names,
 			field_types = field_types,
-		}))
-		tc.types[int(def)] = st_id
+		})
 
 	case parser.EnumDecl, parser.ImportDecl:
 	}
@@ -185,6 +189,7 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		case .FLOAT:        return FLOAT_TYPE
 		case .TRUE, .FALSE: return BOOL_TYPE
 		case .STRING:       return STRING_TYPE
+		case .NIL:          return NIL_TYPE
 		}
 
 	case parser.IdentExpression:
@@ -239,6 +244,43 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 
 	case parser.StructLiteralExpression:
 		return infer_struct_literal(tc, idx, e)
+
+	case parser.NewExpression:
+		// new T{...} — same field checks as struct literal, returns ^T
+		inner_id := UNKNOWN_TYPE
+		for info, i in tc.type_table {
+			if st, ok2 := info.(StructType); ok2 && st.name == e.type_name.data {
+				inner_id = TypeId(i)
+				found_st := st
+				for lit_field in e.fields {
+					for j in 0..<len(found_st.field_names) {
+						if found_st.field_names[j] == lit_field.name.data {
+							check(tc, lit_field.value, found_st.field_types[j])
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+		if inner_id == UNKNOWN_TYPE {
+			tc_error_msg(tc, tc.ast.spans[int(idx)], fmt.tprintf("undefined struct '%s'", e.type_name.data))
+			return UNKNOWN_TYPE
+		}
+		return register_ptr_type(tc, inner_id)
+
+	case parser.DerefExpression:
+		// p^ — operand must be a pointer type; result is the inner type
+		ptr_type_id := infer(tc, e.operand)
+		if ptr_type_id == UNKNOWN_TYPE do return UNKNOWN_TYPE
+		info, ok2 := get_type_info(tc, ptr_type_id)
+		if !ok2 do return UNKNOWN_TYPE
+		pt, is_ptr := info.(PointerType)
+		if !is_ptr {
+			tc_error_msg(tc, tc.ast.spans[int(idx)], "deref of non-pointer value")
+			return UNKNOWN_TYPE
+		}
+		return pt.inner
 	}
 	return UNKNOWN_TYPE
 }
@@ -264,6 +306,17 @@ check :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, expected: TypeId) {
 
 	got := infer(tc, idx)
 	if got == UNKNOWN_TYPE do return
+
+	// nil literal is coercible to any pointer type.
+	if got == NIL_TYPE {
+		if info, ok2 := get_type_info(tc, expected); ok2 {
+			if _, is_ptr := info.(PointerType); is_ptr {
+				tc.types[int(idx)] = expected
+				return
+			}
+		}
+	}
+
 	if got != expected {
 		tc_error(tc, tc.ast.spans[int(idx)], expected, got)
 	}
@@ -300,7 +353,19 @@ infer_binary :: proc(tc: ^Typechecker, e: parser.BinaryExpression) -> TypeId {
 		return left
 
 	// Comparison: both sides same type, result bool.
-	case .EQ_EQ, .BANG_EQ, .LT, .LT_EQ, .GT, .GT_EQ:
+	// For == and !=, nil is comparable to any pointer type regardless of operand order.
+	case .EQ_EQ, .BANG_EQ:
+		left  := infer(tc, e.left)
+		right := infer(tc, e.right)
+		if left == NIL_TYPE && right != NIL_TYPE {
+			// nil == ptr  →  check ptr side against the concrete type
+			check(tc, e.left, right)
+		} else {
+			check(tc, e.right, left)
+		}
+		return BOOL_TYPE
+
+	case .LT, .LT_EQ, .GT, .GT_EQ:
 		left := infer(tc, e.left)
 		check(tc, e.right, left)
 		return BOOL_TYPE
@@ -382,14 +447,19 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 	if !ok do return UNKNOWN_TYPE
 
 	switch t in ty {
+	case parser.PointerType:
+		inner := resolve_named_type(tc, t.inner)
+		return register_ptr_type(tc, inner)
+
 	case parser.NamedType:
 		name := lexer.Token(t).data
 		switch name {
-		case "void":            return VOID_TYPE
-		case "bool":            return BOOL_TYPE
-		case "i64",  "int":    return INT_TYPE
-		case "f64",  "float":  return FLOAT_TYPE
-		case "str",  "string": return STRING_TYPE
+		case "void":                                          return VOID_TYPE
+		case "bool":                                          return BOOL_TYPE
+		case "i8", "i16", "i32", "i64", "int",
+		     "u8", "u16", "u32", "u64", "uint":              return INT_TYPE
+		case "f32", "f64", "float":                          return FLOAT_TYPE
+		case "str", "string":                                return STRING_TYPE
 		}
 		for info, i in tc.type_table {
 			if st, ok2 := info.(StructType); ok2 && st.name == name {
@@ -430,6 +500,18 @@ register_fn_type :: proc(tc: ^Typechecker, params: []TypeId, ret: TypeId) -> Typ
 	}
 	id := TypeId(len(tc.type_table))
 	append(&tc.type_table, TypeInfo(FnType{params = params, return_type = ret}))
+	return id
+}
+
+@private
+register_ptr_type :: proc(tc: ^Typechecker, inner: TypeId) -> TypeId {
+	for info, i in tc.type_table {
+		if pt, ok := info.(PointerType); ok && pt.inner == inner {
+			return TypeId(i)
+		}
+	}
+	id := TypeId(len(tc.type_table))
+	append(&tc.type_table, TypeInfo(PointerType{inner = inner}))
 	return id
 }
 
@@ -481,7 +563,18 @@ infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parse
 	if obj_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
 	info, ok := get_type_info(tc, obj_type)
 	if !ok do return UNKNOWN_TYPE
-	st, is_struct := info.(StructType)
+
+	// Auto-deref: ^T.field is the same as T.field.
+	struct_type_id := obj_type
+	st_info := info
+	if pt, is_ptr := info.(PointerType); is_ptr {
+		struct_type_id = pt.inner
+		inner_info, inner_ok := get_type_info(tc, struct_type_id)
+		if !inner_ok do return UNKNOWN_TYPE
+		st_info = inner_info
+	}
+
+	st, is_struct := st_info.(StructType)
 	if !is_struct {
 		tc_error_msg(tc, e.field.span, "field access on non-struct value")
 		return UNKNOWN_TYPE

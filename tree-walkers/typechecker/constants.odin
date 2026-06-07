@@ -10,5 +10,6 @@ BOOL_TYPE      :: TypeId(1)
 INT_TYPE       :: TypeId(2)
 FLOAT_TYPE     :: TypeId(3)
 STRING_TYPE    :: TypeId(4)
-NUM_PRIMITIVES :: 5
+NIL_TYPE       :: TypeId(5)
+NUM_PRIMITIVES :: 6
 

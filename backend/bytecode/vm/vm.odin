@@ -14,13 +14,14 @@ CallFrame :: struct {
 
 
 VM :: struct {
-	frames:      [FRAMES_MAX]CallFrame,
-	stack:       [STACK_MAX]Value,
-	globals:     map[string]Value,
-	strings: 		 StringPool,
-	stack_top:   u16,
-	frame_count: u8,
-	stdin:       io.Reader, // nil → use os.stdin
+	frames:       [FRAMES_MAX]CallFrame,
+	stack:        [STACK_MAX]Value,
+	globals:      map[string]Value,
+	strings:      StringPool,
+	heap_objects: [dynamic][]Value, // all heap allocations, freed on destroy_vm
+	stack_top:    u16,
+	frame_count:  u8,
+	stdin:        io.Reader, // nil → use os.stdin
 }
 
 VMError :: enum {
@@ -31,6 +32,7 @@ VMError :: enum {
 	WRONG_ARG_COUNT,
 	CALL_NON_FUNCTION,
 	DIVISION_BY_ZERO,
+	NULL_DEREF,
 }
 
 new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
@@ -40,13 +42,18 @@ new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
 	} else {
 		vm.globals = make(map[string]Value)
 	}
-	vm.strings = string_pool_new()
+	vm.strings      = string_pool_new()
+	vm.heap_objects = make([dynamic][]Value)
 	return vm
 }
 
 destroy_vm :: proc(vm: ^VM) {
 	delete(vm.globals)
 	string_pool_destroy(&vm.strings)
+	for obj in vm.heap_objects {
+		delete(obj)
+	}
+	delete(vm.heap_objects)
 }
 
 vm_push :: proc(vm: ^VM, val: Value) -> Maybe(VMError) {
@@ -97,7 +104,7 @@ read_constant_long :: proc(vm: ^VM) -> Value {
 vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
     for {
         op := Opcode(read_byte(vm))
-        switch op {
+        #partial switch op {
 
         case .CONST:
             val := read_constant(vm)
@@ -295,6 +302,51 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             arg_count := u16(read_byte(vm))
             if err := vm_call(vm, arg_count); err != nil do return err
 
+        case .NEW:
+            n := int(read_byte(vm))
+            slots := make([]Value, n)
+            for i := n - 1; i >= 0; i -= 1 {
+                v, err := vm_pop(vm)
+                if err != nil { delete(slots); return err }
+                slots[i] = v
+            }
+            append(&vm.heap_objects, slots)
+            ptr: [^]Value = raw_data(slots)
+            if err := vm_push(vm, ptr); err != nil { return err }
+
+        case .HEAP_GET:
+            offset := int(read_byte(vm))
+            pv, err := vm_pop(vm)
+            if err != nil do return err
+            ptr, ok := pv.([^]Value)
+            if !ok do return .TYPE_ERROR
+            if ptr == nil do return .NULL_DEREF
+            if err2 := vm_push(vm, ptr[offset]); err2 != nil do return err2
+
+        case .HEAP_SET:
+            // Stack before: [..., value, ptr]  ptr is on top
+            offset := int(read_byte(vm))
+            pv, err1 := vm_pop(vm)    // pop ptr
+            if err1 != nil do return err1
+            ptr, ok := pv.([^]Value)
+            if !ok do return .TYPE_ERROR
+            if ptr == nil do return .NULL_DEREF
+            val, err2 := vm_peek(vm)  // peek value (stays on stack, SET semantics)
+            if err2 != nil do return err2
+            ptr[offset] = val
+
+        case .HEAP_LOAD:
+            // Pop pointer, push N consecutive slots from heap.
+            n := int(read_byte(vm))
+            pv, err := vm_pop(vm)
+            if err != nil do return err
+            ptr, ok := pv.([^]Value)
+            if !ok do return .TYPE_ERROR
+            if ptr == nil do return .NULL_DEREF
+            for i in 0..<n {
+                if err2 := vm_push(vm, ptr[i]); err2 != nil do return err2
+            }
+
         case .RETURN:
             n := int(read_byte(vm))
             // save top-n return values in order (lowest first)
@@ -324,12 +376,13 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 
 is_falsy :: proc(val: Value) -> bool {
     switch v in val {
-    case bool:   return !v
-    case Nil:    return true
-    case i64:    return false
-    case f64:    return false
-    case string: return false
-    case ^Function: return false
+    case bool:      return !v
+    case Nil:       return true
+    case i64:       return false
+    case f64:       return false
+    case string:    return false
+    case ^Function:  return false
+    case [^]Value:   return v == nil
     }
     return true
 }
@@ -357,6 +410,8 @@ print_value :: proc(val: Value) {
     case string:    fmt.printf("%s", v)
     case Nil:       fmt.printf("nil")
     case ^Function: fmt.printf("<fn %s>", v.name)
+    case [^]Value:
+        if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
     }
 }
 

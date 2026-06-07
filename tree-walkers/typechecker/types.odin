@@ -13,6 +13,7 @@ PrimitiveType :: enum u8 {
 	INT,
 	FLOAT,
 	STRING,
+	NIL,
 }
 
 // Function type stored in the type table.
@@ -30,11 +31,17 @@ StructType :: struct {
 	field_types: []TypeId,
 }
 
+// Pointer type stored in the type table.
+PointerType :: struct {
+	inner: TypeId,
+}
+
 // TypeInfo is the entry stored in the type table.
 TypeInfo :: union {
 	PrimitiveType,
 	FnType,
 	StructType,
+	PointerType,
 }
 
 TypeCheckerError :: struct {
@@ -80,6 +87,7 @@ new_type_checker :: proc(ast: ^parser.AST, nrr: ^nr.NRResult) -> Typechecker {
 	append(&tc.type_table, TypeInfo(PrimitiveType.INT))
 	append(&tc.type_table, TypeInfo(PrimitiveType.FLOAT))
 	append(&tc.type_table, TypeInfo(PrimitiveType.STRING))
+	append(&tc.type_table, TypeInfo(PrimitiveType.NIL))
 
 	return tc
 }
@@ -96,11 +104,14 @@ type_id_name :: proc(id: TypeId, table: []TypeInfo) -> string {
 		case .INT:    return "i64"
 		case .FLOAT:  return "f64"
 		case .STRING: return "str"
+		case .NIL:    return "nil"
 		}
 	case FnType:
 		return "function"
 	case StructType:
 		return t.name
+	case PointerType:
+		return "pointer"
 	}
 	return "unknown"
 }

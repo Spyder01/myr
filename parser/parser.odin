@@ -194,6 +194,14 @@ parse_type :: proc(p: ^Parser) -> TypeIdx {
 	if peek(p) == .LEFT_PAREN {
 		return parse_fn_type(p)
 	}
+	if peek(p) == .CARET {
+		caret := advance(p)
+		inner := parse_type(p)
+		ptr := PointerType{inner = inner}
+		append_elem(&p.ast.nodes, Node(Type(ptr)))
+		append_elem(&p.ast.spans, caret.span)
+		return TypeIdx(len(p.ast.nodes) - 1)
+	}
 	tok := expect(p, .IDENT)
 	named := NamedType(tok)
 	append_elem(&p.ast.nodes, Node(Type(named)))
@@ -417,6 +425,21 @@ parse_expr :: proc(p: ^Parser, min_bp: int = 0) -> ExpressionIdx {
 			left = parse_index(p, left, op)
 		case .DOT:
 			left = parse_field_access(p, left, op)
+		case .CARET:
+			// Postfix dereference (p^) when next token cannot start an expression.
+			// Otherwise falls through to XOR binary expression.
+			if !can_start_expr(peek(p)) {
+				expr := DerefExpression{operand = left}
+				append_elem(&p.ast.nodes, Node(Expression(expr)))
+				append_elem(&p.ast.spans, op.span)
+				left = ExpressionIdx(len(p.ast.nodes) - 1)
+			} else {
+				right := parse_expr(p, right_bp)
+				expr  := BinaryExpression{left = left, right = right, operation = op}
+				append_elem(&p.ast.nodes, Node(Expression(expr)))
+				append_elem(&p.ast.spans, op.span)
+				left = ExpressionIdx(len(p.ast.nodes) - 1)
+			}
 		case:
 			right := parse_expr(p, right_bp)
 			expr  := BinaryExpression{left = left, right = right, operation = op}
@@ -434,7 +457,7 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 	tok := peek_token(p)
 
 	#partial switch tok.kind {
-	case .INT, .FLOAT, .STRING, .TRUE, .FALSE:
+	case .INT, .FLOAT, .STRING, .TRUE, .FALSE, .NIL:
 		advance(p)
 		expr := LiteralExpression(tok)
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
@@ -467,6 +490,11 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 
 	case .IF:
 		return parse_if(p)
+
+	case .NEW:
+		advance(p)
+		type_name := expect(p, .IDENT)
+		return parse_new_expr(p, type_name)
 	}
 
 	append_elem(&p.errors, ParserError{kind = .UNEXPECTED_TOKEN, span = tok.span})
@@ -492,6 +520,36 @@ parse_struct_literal :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionId
 	append_elem(&p.ast.nodes, Node(Expression(expr)))
 	append_elem(&p.ast.spans, type_name.span)
 	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_new_expr :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionIdx {
+	expect(p, .LEFT_BRACE)
+	fields := make([dynamic]StructLiteralField)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		name  := expect(p, .IDENT)
+		expect(p, .EQ)
+		value := parse_expr(p, 0)
+		append_elem(&fields, StructLiteralField{name = name, value = value})
+		if peek(p) != .RIGHT_BRACE {
+			expect(p, .COMMA)
+		}
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := NewExpression{type_name = type_name, fields = fields[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, type_name.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+can_start_expr :: proc(kind: lexer.TokenType) -> bool {
+	#partial switch kind {
+	case .INT, .FLOAT, .STRING, .TRUE, .FALSE, .NIL,
+	     .IDENT, .LEFT_PAREN, .MINUS, .BANG, .TILDE, .IF, .NEW:
+		return true
+	}
+	return false
 }
 
 @private

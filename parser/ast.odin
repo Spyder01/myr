@@ -70,6 +70,15 @@ StructLiteralExpression :: struct {
 	fields:    []StructLiteralField,
 }
 
+NewExpression :: struct {
+	type_name: lexer.Token,
+	fields:    []StructLiteralField,
+}
+
+DerefExpression :: struct {
+	operand: ExpressionIdx,
+}
+
 Expression :: union {
 	LiteralExpression,
 	IdentExpression,
@@ -82,6 +91,8 @@ Expression :: union {
 	MatchExpression,
 	BlockExpression,
 	StructLiteralExpression,
+	NewExpression,
+	DerefExpression,
 }
 
 LetStatement :: struct {
@@ -197,10 +208,15 @@ FnType :: struct {
 	return_type: Maybe(TypeIdx),
 }
 
+PointerType :: struct {
+	inner: TypeIdx,
+}
+
 Type :: union {
 	NamedType,
 	GenericType,
 	FnType,
+	PointerType,
 }
 
 Node :: union {
@@ -257,15 +273,18 @@ ast_destroy :: proc(ast: ^AST) {
 				if eb, ok := e.else_block.?; ok do delete(eb.stmts)
 			case StructLiteralExpression:
 				delete(e.fields)
+			case NewExpression:
+				delete(e.fields)
 			case BinaryExpression, UnaryExpression,
 			     FieldAccessExpression, IndexExpression,
-			     LiteralExpression, IdentExpression:
+			     LiteralExpression, IdentExpression,
+			     DerefExpression:
 			}
 		case Type:
 			switch ty in n {
-			case GenericType: delete(ty.args)
-			case FnType:      delete(ty.params)
-			case NamedType:
+			case GenericType:   delete(ty.args)
+			case FnType:        delete(ty.params)
+			case NamedType, PointerType:
 			}
 		}
 	}

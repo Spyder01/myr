@@ -169,7 +169,7 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	defer bc.function_free(fn)
 
 	if dump {
-		bc.disassemble_chunk(&fn.chunk, fn.name)
+		bc.disassemble_all(fn)
 		fmt.println()
 	}
 
