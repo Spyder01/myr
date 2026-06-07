@@ -18,20 +18,29 @@ LoopCtx :: struct {
 	break_count: u8,
 }
 
+StructLayout :: struct {
+	field_names:        []string,
+	field_offsets:      []int,
+	field_struct_types: []string, // "" for scalar fields, struct name for struct-typed fields
+	total_slots:        int,
+}
+
 Compiler :: struct {
-	bc:          ByteCodeCompiler,
-	ast:         ^parser.AST,
-	errors:      [MAX_ERROR_COUNT]CompilerError,
-	error_count: u8,
-	loop_ctx:    ^LoopCtx,
-	const_table: map[string]Value,
+	bc:             ByteCodeCompiler,
+	ast:            ^parser.AST,
+	errors:         [MAX_ERROR_COUNT]CompilerError,
+	error_count:    u8,
+	loop_ctx:       ^LoopCtx,
+	const_table:    map[string]Value,
+	struct_layouts: map[string]StructLayout,
 }
 
 new_compiler :: proc(ast: ^parser.AST) -> Compiler {
 	return Compiler{
-		bc          = new_bytecode_compiler("__main__", 0),
-		ast         = ast,
-		const_table = make(map[string]Value),
+		bc             = new_bytecode_compiler("__main__", 0),
+		ast            = ast,
+		const_table    = make(map[string]Value),
+		struct_layouts = make(map[string]StructLayout),
 	}
 }
 
@@ -42,6 +51,19 @@ compiler_destroy :: proc(c: ^Compiler) {
 
 compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
 	c := new_compiler(ast)
+
+	// Two-pass struct layout building: the first pass registers all struct names
+	// so the second pass can correctly resolve forward references (e.g. Monkey
+	// referencing Person which is declared after it).
+	for _ in 0 ..= 1 {
+		for node in ast.nodes {
+			if decl, ok := node.(parser.Declaration); ok {
+				if sd, ok2 := decl.(parser.StructDecl); ok2 {
+					c.struct_layouts[sd.name.data] = build_struct_layout(&c, sd)
+				}
+			}
+		}
+	}
 
 	for node, i in ast.nodes {
 		if _, is_decl := node.(parser.Declaration); is_decl {
@@ -62,6 +84,7 @@ compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
 	}
 
 	emit(&c.bc, .RETURN, {})
+	emit_byte(&c.bc, 1, {})
 
 	errors := c.errors[:c.error_count]
 	if c.error_count > 0 {
@@ -88,26 +111,49 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 		}
 	case parser.ImportDecl:
 		// skip for now
-	case parser.StructDecl, parser.EnumDecl:
-		// type declarations — no bytecode in Phase 1
+	case parser.StructDecl:
+		layout := build_struct_layout(c, d)
+		c.struct_layouts[d.name.data] = layout
+	case parser.EnumDecl:
 	}
 }
 
 compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span) {
+	// Compute total slot count for arity: a struct param occupies N slots.
+	total_param_slots := 0
+	for param in d.params {
+		struct_name := type_ann_struct_name(c, param.type)
+		slots := 1
+		if struct_name != "" {
+			if layout, ok := c.struct_layouts[struct_name]; ok {
+				slots = layout.total_slots
+			}
+		}
+		total_param_slots += slots
+	}
+
 	// create a child compiler for this function
-	fn_compiler := new_bytecode_compiler(d.name.data, u8(len(d.params)), &c.bc)
+	fn_compiler := new_bytecode_compiler(d.name.data, u8(total_param_slots), &c.bc)
 
 	// slot 0 is the function itself (allows recursion, matches VM frame layout)
 	add_local(&fn_compiler, d.name.data)
-	// parameters start at slot 1
+	// parameters start at slot 1; register each with its actual slot count
 	for param in d.params {
-		add_local(&fn_compiler, param.name.data)
+		struct_name := type_ann_struct_name(c, param.type)
+		slots := 1
+		if struct_name != "" {
+			if layout, ok := c.struct_layouts[struct_name]; ok {
+				slots = layout.total_slots
+			}
+		}
+		add_local(&fn_compiler, param.name.data, slots, struct_name)
 	}
 
 	// compile body
-	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table}
+	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table, struct_layouts = c.struct_layouts}
 	compile_block(&child, d.body)
 	emit(&child.bc, .RETURN, span)
+	emit_byte(&child.bc, 1, span)
 	c.errors      = child.errors
 	c.error_count = child.error_count
 
@@ -138,7 +184,10 @@ end_scope :: proc(c: ^Compiler) {
 	c.bc.scope_depth -= 1
 	for len(c.bc.locals) > 0 &&
 	    c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
-		emit(&c.bc, .POP, {})
+		local := c.bc.locals[len(c.bc.locals)-1]
+		for _ in 0..<local.slots {
+			emit(&c.bc, .POP, {})
+		}
 		pop(&c.bc.locals)
 	}
 }
@@ -162,21 +211,38 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			emit(&c.bc, .DEFINE_GLOBAL, span)
 			emit_byte(&c.bc, u8(name_idx), span)
 		} else {
-			add_local(&c.bc, s.name.data)
-			// value stays on stack as the local's slot
+			struct_type := expr_struct_type(c, s.value)
+			if struct_type == "" {
+				if ann_idx, has_ann := s.type.?; has_ann {
+					struct_type = type_ann_struct_name(c, ann_idx)
+				}
+			}
+			slots := 1
+			if struct_type != "" {
+				if layout, ok := c.struct_layouts[struct_type]; ok {
+					slots = layout.total_slots
+				}
+			}
+			add_local(&c.bc, s.name.data, slots, struct_type)
 		}
 
 	case parser.ReturnStatement:
 		if val, ok := s.value.?; ok {
 			compile_expr(c, val)
+			emit(&c.bc, .RETURN, span)
+			emit_byte(&c.bc, u8(expr_slot_count(c, val)), span)
 		} else {
 			emit(&c.bc, .NIL, span)
+			emit(&c.bc, .RETURN, span)
+			emit_byte(&c.bc, 1, span)
 		}
-		emit(&c.bc, .RETURN, span)
 
 	case parser.ExpressionStatement:
 		compile_expr(c, s.expr)
-		emit(&c.bc, .POP, span)
+		n := expr_slot_count(c, s.expr)
+		for _ in 0..<n {
+			emit(&c.bc, .POP, span)
+		}
 
 	case parser.ForStatement:
 		compile_for(c, s, span)
@@ -186,7 +252,10 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			compiler_error(c, "break outside of loop", span)
 			return
 		}
-		n := len(c.bc.locals) - c.loop_ctx.local_base
+		n := 0
+		for i in c.loop_ctx.local_base..<len(c.bc.locals) {
+			n += c.bc.locals[i].slots
+		}
 		for _ in 0..<n { emit(&c.bc, .POP, span) }
 		if c.loop_ctx.break_count >= MAX_BREAK_COUNT {
 			compiler_error(c, "too many break statements in one loop", span)
@@ -201,7 +270,10 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			compiler_error(c, "continue outside of loop", span)
 			return
 		}
-		n := len(c.bc.locals) - c.loop_ctx.local_base
+		n := 0
+		for i in c.loop_ctx.local_base..<len(c.bc.locals) {
+			n += c.bc.locals[i].slots
+		}
 		for _ in 0..<n { emit(&c.bc, .POP, span) }
 		emit_loop(&c.bc, c.loop_ctx.start, span)
 
@@ -265,7 +337,10 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 		c.bc.scope_depth -= 1
 		for len(c.bc.locals) > 0 &&
 		    c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
-			emit(&c.bc, .POP, span)
+			local := c.bc.locals[len(c.bc.locals)-1]
+			for _ in 0..<local.slots {
+				emit(&c.bc, .POP, span)
+			}
 			pop(&c.bc.locals)
 		}
 	}
@@ -292,10 +367,12 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 			return
 		}
 		// check locals first (inner → outer)
-		slot, found := resolve_local(&c.bc, name)
+		slot, slots, found := resolve_local(&c.bc, name)
 		if found {
-			emit(&c.bc, .GET_LOCAL, span)
-			emit_byte(&c.bc, u8(slot), span)
+			for s in 0..<slots {
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(slot + s), span)
+			}
 		} else {
 			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 			emit(&c.bc, .GET_GLOBAL, span)
@@ -369,11 +446,13 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 			}
 		}
 		compile_expr(c, e.callee)
+		total_arg_slots := 0
 		for arg in e.args {
 			compile_expr(c, arg)
+			total_arg_slots += expr_slot_count(c, arg)
 		}
 		emit(&c.bc, .CALL, span)
-		emit_byte(&c.bc, u8(len(e.args)), span)
+		emit_byte(&c.bc, u8(total_arg_slots), span)
 
 	case parser.IfExpression:
 		compile_if(c, e, span)
@@ -381,34 +460,18 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.BlockExpression:
 		compile_block(c, e)
 
-	case parser.FieldAccessExpression, parser.IndexExpression,
-	     parser.MatchExpression, parser.StructLiteralExpression:
+	case parser.FieldAccessExpression:
+		compile_field_access(c, e, span)
+
+	case parser.StructLiteralExpression:
+		compile_struct_literal(c, e, span)
+
+	case parser.IndexExpression, parser.MatchExpression:
 		compiler_error(c, "not yet implemented", span)
 	}
 }
 
 compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer.Span) {
-	lhs := c.ast.nodes[e.left]
-	ident, ok := lhs.(parser.Expression)
-	if !ok { compiler_error(c, "invalid assignment target", span); return }
-	id, ok2 := ident.(parser.IdentExpression)
-	if !ok2 { compiler_error(c, "invalid assignment target", span); return }
-
-	name := lexer.Token(id).data
-	slot, found := resolve_local(&c.bc, name)
-
-	// push current value
-	if found {
-		emit(&c.bc, .GET_LOCAL, span)
-		emit_byte(&c.bc, u8(slot), span)
-	} else {
-		name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
-		emit(&c.bc, .GET_GLOBAL, span)
-		emit_byte(&c.bc, u8(name_idx), span)
-	}
-
-	// push rhs and apply op
-	compile_expr(c, e.right)
 	op: Opcode
 	#partial switch e.operation.kind {
 	case .PLUS_EQ:    op = .ADD
@@ -417,35 +480,83 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 	case .SLASH_EQ:   op = .DIV
 	case .PERCENT_EQ: op = .MOD
 	}
-	emit(&c.bc, op, span)
 
-	// write back (SET peeks — result stays on stack)
-	if found {
+	lhs_node := c.ast.nodes[e.left]
+	lhs_expr, is_expr := lhs_node.(parser.Expression)
+	if !is_expr { compiler_error(c, "invalid compound assignment target", span); return }
+
+	#partial switch lhs in lhs_expr {
+	case parser.IdentExpression:
+		name := lexer.Token(lhs).data
+		slot, _, found := resolve_local(&c.bc, name)
+		if found {
+			emit(&c.bc, .GET_LOCAL, span)
+			emit_byte(&c.bc, u8(slot), span)
+		} else {
+			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+			emit(&c.bc, .GET_GLOBAL, span)
+			emit_byte(&c.bc, u8(name_idx), span)
+		}
+		compile_expr(c, e.right)
+		emit(&c.bc, op, span)
+		if found {
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(slot), span)
+		} else {
+			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
+			emit(&c.bc, .SET_GLOBAL, span)
+			emit_byte(&c.bc, u8(name_idx), span)
+		}
+
+	case parser.FieldAccessExpression:
+		base_slot, parent_type, chain_ok := resolve_access_chain(c, lhs.object)
+		if !chain_ok { compiler_error(c, "invalid compound assignment target", span); return }
+		layout, has_layout := c.struct_layouts[parent_type]
+		if !has_layout { compiler_error(c, "compound assignment on non-struct field", span); return }
+		field_offset, _, _, field_found := find_field(layout, lhs.field.data)
+		if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
+		abs_slot := base_slot + field_offset
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(abs_slot), span)
+		compile_expr(c, e.right)
+		emit(&c.bc, op, span)
 		emit(&c.bc, .SET_LOCAL, span)
-		emit_byte(&c.bc, u8(slot), span)
-	} else {
-		name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
-		emit(&c.bc, .SET_GLOBAL, span)
-		emit_byte(&c.bc, u8(name_idx), span)
+		emit_byte(&c.bc, u8(abs_slot), span)
+
+	case:
+		compiler_error(c, "invalid compound assignment target", span)
 	}
 }
 
 compile_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer.Span) {
 	compile_expr(c, e.right)
-	// figure out what the left side is
 	lhs := c.ast.nodes[e.left]
-	if ident, ok := lhs.(parser.Expression); ok {
-		if id, ok2 := ident.(parser.IdentExpression); ok2 {
+	if expr, ok := lhs.(parser.Expression); ok {
+		if id, ok2 := expr.(parser.IdentExpression); ok2 {
 			name := lexer.Token(id).data
-			slot, found := resolve_local(&c.bc, name)
+			slot, slots, found := resolve_local(&c.bc, name)
 			if found {
-				emit(&c.bc, .SET_LOCAL, span)
-				emit_byte(&c.bc, u8(slot), span)
+				if slots == 1 {
+					emit(&c.bc, .SET_LOCAL, span)
+					emit_byte(&c.bc, u8(slot), span)
+				} else {
+					// multi-slot struct: write each slot in reverse, leave nil as expression value
+					for s := slots - 1; s >= 0; s -= 1 {
+						emit(&c.bc, .SET_LOCAL, span)
+						emit_byte(&c.bc, u8(slot + s), span)
+						emit(&c.bc, .POP, span)
+					}
+					emit(&c.bc, .NIL, span)
+				}
 			} else {
 				name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 				emit(&c.bc, .SET_GLOBAL, span)
 				emit_byte(&c.bc, u8(name_idx), span)
 			}
+			return
+		}
+		if fa, ok3 := expr.(parser.FieldAccessExpression); ok3 {
+			compile_field_set(c, fa, span)
 			return
 		}
 	}
@@ -476,13 +587,20 @@ compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
 
 // ---- helpers ----
 
-resolve_local :: proc(bc: ^ByteCodeCompiler, name: string) -> (slot: int, found: bool) {
+resolve_local :: proc(bc: ^ByteCodeCompiler, name: string) -> (stack_slot: int, slots: int, found: bool) {
+	target := -1
 	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
 		if bc.locals[i].name == name {
-			return i, true
+			target = i
+			break
 		}
 	}
-	return 0, false
+	if target < 0 do return 0, 0, false
+	offset := 0
+	for i in 0..<target {
+		offset += bc.locals[i].slots
+	}
+	return offset, bc.locals[target].slots, true
 }
 
 op_to_opcode :: proc(kind: lexer.TokenType) -> Opcode {
@@ -631,4 +749,214 @@ compiler_error :: proc(c: ^Compiler, msg: string, span: lexer.Span) {
 		c.errors[c.error_count] = CompilerError{message = msg, span = span}
 		c.error_count += 1
 	}
+}
+
+// ---- struct helpers ----
+
+local_struct_type :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
+	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
+		if bc.locals[i].name == name {
+			return bc.locals[i].struct_type
+		}
+	}
+	return ""
+}
+
+type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
+	if int(type_idx) >= len(c.ast.nodes) do return 1
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok do return 1
+	named, ok2 := ty.(parser.NamedType)
+	if !ok2 do return 1
+	name := lexer.Token(named).data
+	if layout, ok3 := c.struct_layouts[name]; ok3 {
+		return layout.total_slots
+	}
+	return 1
+}
+
+type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
+	if int(type_idx) >= len(c.ast.nodes) do return ""
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok do return ""
+	named, ok2 := ty.(parser.NamedType)
+	if !ok2 do return ""
+	name := lexer.Token(named).data
+	if _, ok3 := c.struct_layouts[name]; ok3 {
+		return name
+	}
+	return ""
+}
+
+expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
+	st := expr_struct_type(c, idx)
+	if st == "" do return 1
+	if layout, ok := c.struct_layouts[st]; ok do return layout.total_slots
+	return 1
+}
+
+build_struct_layout :: proc(c: ^Compiler, d: parser.StructDecl) -> StructLayout {
+	field_names        := make([]string, len(d.fields))
+	field_offsets      := make([]int,    len(d.fields))
+	field_struct_types := make([]string, len(d.fields))
+	offset := 0
+	for field, i in d.fields {
+		field_names[i]        = field.name.data
+		field_offsets[i]      = offset
+		field_struct_types[i] = type_ann_struct_name(c, field.type)
+		offset += type_slot_count(c, field.type)
+	}
+	return StructLayout{
+		field_names        = field_names,
+		field_offsets      = field_offsets,
+		field_struct_types = field_struct_types,
+		total_slots        = offset,
+	}
+}
+
+find_field :: proc(layout: StructLayout, field_name: string) -> (offset: int, slots: int, struct_type: string, found: bool) {
+	for i in 0..<len(layout.field_names) {
+		if layout.field_names[i] == field_name {
+			next := layout.total_slots
+			if i + 1 < len(layout.field_offsets) {
+				next = layout.field_offsets[i + 1]
+			}
+			return layout.field_offsets[i], next - layout.field_offsets[i], layout.field_struct_types[i], true
+		}
+	}
+	return 0, 0, "", false
+}
+
+call_return_struct_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
+	callee_node := c.ast.nodes[e.callee]
+	expr, ok := callee_node.(parser.Expression)
+	if !ok do return ""
+	id, ok2 := expr.(parser.IdentExpression)
+	if !ok2 do return ""
+	fn_name := lexer.Token(id).data
+	for node in c.ast.nodes {
+		decl, ok3 := node.(parser.Declaration)
+		if !ok3 do continue
+		fn, ok4 := decl.(parser.FunctionDecl)
+		if !ok4 do continue
+		if fn.name.data != fn_name do continue
+		ret_idx, has_ret := fn.return_type.?
+		if !has_ret do return ""
+		return type_ann_struct_name(c, ret_idx)
+	}
+	return ""
+}
+
+expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok do return ""
+	#partial switch e in expr {
+	case parser.StructLiteralExpression:
+		return e.type_name.data
+	case parser.IdentExpression:
+		return local_struct_type(&c.bc, lexer.Token(e).data)
+	case parser.FieldAccessExpression:
+		_, parent_type, ok2 := resolve_access_chain(c, e.object)
+		if !ok2 do return ""
+		layout, has := c.struct_layouts[parent_type]
+		if !has do return ""
+		_, _, field_st, found := find_field(layout, e.field.data)
+		if !found do return ""
+		return field_st
+	case parser.CallExpression:
+		return call_return_struct_type(c, e)
+	}
+	return ""
+}
+
+compile_struct_literal :: proc(c: ^Compiler, e: parser.StructLiteralExpression, span: lexer.Span) {
+	layout, ok := c.struct_layouts[e.type_name.data]
+	if !ok {
+		compiler_error(c, fmt.tprintf("undefined struct '%s'", e.type_name.data), span)
+		return
+	}
+	field_map := make(map[string]parser.ExpressionIdx)
+	defer delete(field_map)
+	for field in e.fields {
+		field_map[field.name.data] = field.value
+	}
+	for name in layout.field_names {
+		val_idx, has_val := field_map[name]
+		if !has_val {
+			compiler_error(c, fmt.tprintf("missing field '%s' in struct literal", name), span)
+			emit(&c.bc, .NIL, span)
+			continue
+		}
+		compile_expr(c, val_idx)
+	}
+}
+
+// resolve_access_chain walks a chain of field accesses (e.g. r.origin.x) and
+// returns the absolute stack slot of the chain's base and the struct type at
+// that point, so the caller can apply one more field lookup on top of it.
+resolve_access_chain :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (slot: int, struct_type: string, ok: bool) {
+	node := c.ast.nodes[int(idx)]
+	expr, is_expr := node.(parser.Expression)
+	if !is_expr do return 0, "", false
+	#partial switch e in expr {
+	case parser.IdentExpression:
+		name := lexer.Token(e).data
+		s, _, found := resolve_local(&c.bc, name)
+		if !found do return 0, "", false
+		return s, local_struct_type(&c.bc, name), true
+	case parser.FieldAccessExpression:
+		base, parent_type, chain_ok := resolve_access_chain(c, e.object)
+		if !chain_ok do return 0, "", false
+		layout, has := c.struct_layouts[parent_type]
+		if !has do return 0, "", false
+		offset, _, field_st, found := find_field(layout, e.field.data)
+		if !found do return 0, "", false
+		return base + offset, field_st, true
+	}
+	return 0, "", false
+}
+
+compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
+	base_slot, parent_type, ok := resolve_access_chain(c, e.object)
+	if !ok { compiler_error(c, "invalid field access", span); return }
+
+	layout, has_layout := c.struct_layouts[parent_type]
+	if !has_layout {
+		compiler_error(c, "field access on non-struct value", span)
+		return
+	}
+
+	field_offset, field_slots, _, field_found := find_field(layout, e.field.data)
+	if !field_found {
+		compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
+		return
+	}
+
+	for s in 0..<field_slots {
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(base_slot + field_offset + s), span)
+	}
+}
+
+compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
+	base_slot, parent_type, ok := resolve_access_chain(c, e.object)
+	if !ok { compiler_error(c, "invalid field assignment target", span); return }
+
+	layout, has_layout := c.struct_layouts[parent_type]
+	if !has_layout {
+		compiler_error(c, "field assignment on non-struct value", span)
+		return
+	}
+
+	field_offset, _, _, field_found := find_field(layout, e.field.data)
+	if !field_found {
+		compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span)
+		return
+	}
+
+	emit(&c.bc, .SET_LOCAL, span)
+	emit_byte(&c.bc, u8(base_slot + field_offset), span)
 }

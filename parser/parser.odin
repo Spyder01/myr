@@ -443,6 +443,9 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 
 	case .IDENT:
 		advance(p)
+		if peek(p) == .LEFT_BRACE && !p.no_struct_lit {
+			return parse_struct_literal(p, tok)
+		}
 		expr := IdentExpression(tok)
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
 		append_elem(&p.ast.spans, tok.span)

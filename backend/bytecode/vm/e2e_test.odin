@@ -775,3 +775,172 @@ test_e2e_shift_comparison :: proc(t: ^testing.T) {
 	val := result("function main() { return 8 >> 1 > 3 }")
 	testing.expect_value(t, val.(bool), true)
 }
+
+// ---- structs ----
+
+@(test)
+test_e2e_struct_field_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 3.0, y = 4.0}
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(3))
+}
+
+@(test)
+test_e2e_struct_second_field_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 3.0, y = 4.0}
+			return p.y
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(4))
+}
+
+@(test)
+test_e2e_struct_field_write :: proc(t: ^testing.T) {
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 1.0, y = 2.0}
+			p.x = 99.0
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(99))
+}
+
+@(test)
+test_e2e_struct_value_semantics :: proc(t: ^testing.T) {
+	// let q = p copies — mutating q must not affect p
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 1.0, y = 2.0}
+			let q = p
+			q.x = 99.0
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(1))
+}
+
+@(test)
+test_e2e_struct_reassign :: proc(t: ^testing.T) {
+	// overwriting an existing struct local
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 1.0, y = 2.0}
+			let q = Point{x = 10.0, y = 20.0}
+			p = q
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(10))
+}
+
+@(test)
+test_e2e_struct_scalar_neighbour :: proc(t: ^testing.T) {
+	// a scalar local after a struct must land at the correct slot
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let p = Point{x = 1.0, y = 2.0}
+			let n = 42
+			return n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_struct_in_loop :: proc(t: ^testing.T) {
+	// struct created and destroyed each iteration — scope cleanup must be correct
+	val := result(`
+		struct Point { x: float, y: float }
+		function main() {
+			let sum = 0.0
+			for let i = 0; i < 3; i = i + 1 {
+				let p = Point{x = 1.0, y = 2.0}
+				sum = sum + p.x
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(3))
+}
+
+@(test)
+test_e2e_struct_nested_read :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: float, y: float }
+		struct Rect { origin: Vec2, size: Vec2 }
+		function main() {
+			let r = Rect{origin = Vec2{x = 1.0, y = 2.0}, size = Vec2{x = 10.0, y = 20.0}}
+			return r.origin.y
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(2))
+}
+
+@(test)
+test_e2e_struct_nested_second_field :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: float, y: float }
+		struct Rect { origin: Vec2, size: Vec2 }
+		function main() {
+			let r = Rect{origin = Vec2{x = 1.0, y = 2.0}, size = Vec2{x = 10.0, y = 20.0}}
+			return r.size.y
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(20))
+}
+
+@(test)
+test_e2e_struct_nested_write :: proc(t: ^testing.T) {
+	val := result(`
+		struct Vec2 { x: float, y: float }
+		struct Rect { origin: Vec2, size: Vec2 }
+		function main() {
+			let r = Rect{origin = Vec2{x = 1.0, y = 2.0}, size = Vec2{x = 10.0, y = 20.0}}
+			r.size.x = 42.0
+			return r.size.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(42))
+}
+
+@(test)
+test_e2e_struct_nested_value_semantics :: proc(t: ^testing.T) {
+	// let q = r is a full copy — mutating q.origin.x must not affect r.origin.x
+	val := result(`
+		struct Vec2 { x: float, y: float }
+		struct Rect { origin: Vec2, size: Vec2 }
+		function main() {
+			let r = Rect{origin = Vec2{x = 5.0, y = 6.0}, size = Vec2{x = 10.0, y = 20.0}}
+			let q = r
+			q.origin.x = 0.0
+			return r.origin.x
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(5))
+}
+
+@(test)
+test_e2e_struct_int_fields :: proc(t: ^testing.T) {
+	val := result(`
+		struct Counter { value: int, step: int }
+		function main() {
+			let c = Counter{value = 0, step = 5}
+			c.value = c.value + c.step
+			return c.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}

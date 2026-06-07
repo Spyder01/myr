@@ -54,8 +54,22 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 	case parser.ConstDecl:
 		tc.types[int(def)] = infer(tc, d.value)
 
-	case parser.StructDecl, parser.EnumDecl, parser.ImportDecl:
-		// struct/enum types added in a later pass
+	case parser.StructDecl:
+		field_names := make([]string, len(d.fields))
+		field_types := make([]TypeId, len(d.fields))
+		for field, i in d.fields {
+			field_names[i] = field.name.data
+			field_types[i] = resolve_named_type(tc, field.type)
+		}
+		st_id := TypeId(len(tc.type_table))
+		append(&tc.type_table, TypeInfo(StructType{
+			name        = d.name.data,
+			field_names = field_names,
+			field_types = field_types,
+		}))
+		tc.types[int(def)] = st_id
+
+	case parser.EnumDecl, parser.ImportDecl:
 	}
 }
 
@@ -215,7 +229,7 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		return then_type
 
 	case parser.FieldAccessExpression:
-		return UNKNOWN_TYPE
+		return infer_field_access(tc, idx, e)
 
 	case parser.IndexExpression:
 		return UNKNOWN_TYPE
@@ -224,7 +238,7 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		return UNKNOWN_TYPE
 
 	case parser.StructLiteralExpression:
-		return UNKNOWN_TYPE
+		return infer_struct_literal(tc, idx, e)
 	}
 	return UNKNOWN_TYPE
 }
@@ -369,12 +383,18 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 
 	switch t in ty {
 	case parser.NamedType:
-		switch lexer.Token(t).data {
+		name := lexer.Token(t).data
+		switch name {
 		case "void":            return VOID_TYPE
 		case "bool":            return BOOL_TYPE
 		case "i64",  "int":    return INT_TYPE
 		case "f64",  "float":  return FLOAT_TYPE
 		case "str",  "string": return STRING_TYPE
+		}
+		for info, i in tc.type_table {
+			if st, ok2 := info.(StructType); ok2 && st.name == name {
+				return TypeId(i)
+			}
 		}
 		return UNKNOWN_TYPE
 
@@ -422,6 +442,59 @@ get_type_info :: proc(tc: ^Typechecker, id: TypeId) -> (TypeInfo, bool) {
 }
 
 // ---- error reporting ----
+
+@private
+infer_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.StructLiteralExpression) -> TypeId {
+	struct_type_id := UNKNOWN_TYPE
+	found_st: StructType
+	for info, i in tc.type_table {
+		if st, ok := info.(StructType); ok && st.name == e.type_name.data {
+			struct_type_id = TypeId(i)
+			found_st = st
+			break
+		}
+	}
+	if struct_type_id == UNKNOWN_TYPE {
+		tc_error_msg(tc, tc.ast.spans[int(idx)], fmt.tprintf("undefined struct '%s'", e.type_name.data))
+		return UNKNOWN_TYPE
+	}
+	for lit_field in e.fields {
+		field_found := false
+		for j in 0..<len(found_st.field_names) {
+			if found_st.field_names[j] == lit_field.name.data {
+				check(tc, lit_field.value, found_st.field_types[j])
+				field_found = true
+				break
+			}
+		}
+		if !field_found {
+			tc_error_msg(tc, tc.ast.spans[int(idx)],
+				fmt.tprintf("unknown field '%s' on struct '%s'", lit_field.name.data, e.type_name.data))
+		}
+	}
+	return struct_type_id
+}
+
+@private
+infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.FieldAccessExpression) -> TypeId {
+	obj_type := infer(tc, e.object)
+	if obj_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
+	info, ok := get_type_info(tc, obj_type)
+	if !ok do return UNKNOWN_TYPE
+	st, is_struct := info.(StructType)
+	if !is_struct {
+		tc_error_msg(tc, e.field.span, "field access on non-struct value")
+		return UNKNOWN_TYPE
+	}
+	for j in 0..<len(st.field_names) {
+		if st.field_names[j] == e.field.data {
+			return st.field_types[j]
+		}
+	}
+	tc_error_msg(tc, e.field.span,
+		fmt.tprintf("no field '%s' on struct '%s'", e.field.data, st.name))
+	return UNKNOWN_TYPE
+}
 
 @private
 tc_error :: proc(tc: ^Typechecker, span: lexer.Span, expected, found: TypeId) {

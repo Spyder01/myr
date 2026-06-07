@@ -296,20 +296,28 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
             if err := vm_call(vm, arg_count); err != nil do return err
 
         case .RETURN:
-            result, err := vm_pop(vm)
-            if err != nil do return err
+            n := int(read_byte(vm))
+            // save top-n return values in order (lowest first)
+            tmp: [256]Value
+            for i := n - 1; i >= 0; i -= 1 {
+                v, pop_err := vm_pop(vm)
+                if pop_err != nil do return pop_err
+                tmp[i] = v
+            }
 
             vm.frame_count -= 1
             if vm.frame_count == 0 {
-                vm.stack[0] = result
-                vm.stack_top = 1
+                for i in 0..<n { vm.stack[i] = tmp[i] }
+                vm.stack_top = u16(n)
                 return nil
             }
 
             frame := &vm.frames[vm.frame_count]
             vm.stack_top = frame.slots
 
-            if err := vm_push(vm, result); err != nil do return err
+            for i in 0..<n {
+                if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
+            }
         }
     }
 }

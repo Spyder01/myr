@@ -276,3 +276,100 @@ test_fn_with_params_type_registered :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, found, "expected FnType(i64,i64)->i64 in the type table")
 }
+
+// ---- structs ----
+
+@(test)
+test_struct_decl_no_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect_value(t, s.result.error_count, u16(0))
+}
+
+@(test)
+test_struct_literal_no_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect_value(t, s.result.error_count, u16(0))
+}
+
+@(test)
+test_struct_field_access_no_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} let n = p.x }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect_value(t, s.result.error_count, u16(0))
+}
+
+@(test)
+test_struct_field_wrong_type_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = true, y = 2.0} }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect(t, s.result.error_count > 0, "expected type error for bool in float field")
+}
+
+@(test)
+test_struct_unknown_field_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, z = 2.0} }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect(t, s.result.error_count > 0, "expected error for unknown field 'z'")
+}
+
+@(test)
+test_struct_field_access_type_inferred :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} let n: float = p.x }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect_value(t, s.result.error_count, u16(0))
+}
+
+@(test)
+test_struct_field_access_wrong_type_errors :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} let n: int = p.x }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	testing.expect(t, s.result.error_count > 0, "expected type error: float assigned to int")
+}
+
+@(test)
+test_struct_registered_in_type_table :: proc(t: ^testing.T) {
+	s, ok := tc_run(`
+		struct Point { x: float, y: float }
+		function main() { }
+	`)
+	if !ok { testing.fail(t); return }
+	defer tc_destroy(&s)
+	found := false
+	for info in s.result.type_table {
+		if st, is_st := info.(StructType); is_st && st.name == "Point" {
+			found = true
+			break
+		}
+	}
+	testing.expect(t, found, "expected StructType 'Point' in type table")
+}

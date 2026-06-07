@@ -35,8 +35,8 @@ test_compile_produces_function :: proc(t: ^testing.T) {
 test_compile_empty_function_has_return :: proc(t: ^testing.T) {
 	fn, _ := compile_source("function main() { }")
 	defer if fn != nil do function_free(fn)
-	// top-level chunk should end with RETURN
-	last := fn.chunk.code[len(fn.chunk.code) - 1]
+	// top-level chunk should end with RETURN <slot_count>
+	last := fn.chunk.code[len(fn.chunk.code) - 2]
 	testing.expect_value(t, Opcode(last), Opcode.RETURN)
 }
 
@@ -112,4 +112,66 @@ test_compile_function_count :: proc(t: ^testing.T) {
 		if _, ok := c.(^Function); ok do count += 1
 	}
 	testing.expect_value(t, count, 3)
+}
+
+// ---- structs ----
+
+@(test)
+test_compile_struct_decl_no_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		struct Point { x: float, y: float }
+		function main() { }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect_value(t, len(errs), 0)
+}
+
+@(test)
+test_compile_struct_literal_no_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect_value(t, len(errs), 0)
+}
+
+@(test)
+test_compile_struct_field_access_no_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} return p.x }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect_value(t, len(errs), 0)
+}
+
+@(test)
+test_compile_struct_field_write_no_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		struct Point { x: float, y: float }
+		function main() { let p = Point{x = 1.0, y = 2.0} p.x = 99.0 }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect_value(t, len(errs), 0)
+}
+
+@(test)
+test_compile_struct_chained_access_no_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		struct Vec2 { x: float, y: float }
+		struct Rect { origin: Vec2, size: Vec2 }
+		function main() { let r = Rect{origin = Vec2{x = 1.0, y = 2.0}, size = Vec2{x = 3.0, y = 4.0}} return r.origin.x }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect_value(t, len(errs), 0)
+}
+
+@(test)
+test_compile_struct_unknown_type_errors :: proc(t: ^testing.T) {
+	fn, errs := compile_source(`
+		function main() { let p = NoSuchStruct{x = 1.0} }
+	`)
+	defer if fn != nil do function_free(fn)
+	testing.expect(t, len(errs) > 0, "expected error for undefined struct")
 }

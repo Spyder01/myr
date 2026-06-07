@@ -10,8 +10,10 @@ ByteCodeCompilerError :: enum u8 {
 }
 
 Local :: struct {
-    name:  string,
-    depth: u8,
+    name:        string,
+    depth:       u8,
+    slots:       int,    // 1 for scalars, N for structs
+    struct_type: string, // "" for scalars, struct name for struct locals
 }
 
 ByteCodeCompiler :: struct {
@@ -50,9 +52,9 @@ current_chunk :: proc(bc: ^ByteCodeCompiler) -> ^Chunk {
     return &bc.function.chunk
 }
 
-add_local :: proc(compiler: ^ByteCodeCompiler, name: string) -> Maybe(ByteCodeCompilerError) {
+add_local :: proc(compiler: ^ByteCodeCompiler, name: string, slots: int = 1, struct_type: string = "") -> Maybe(ByteCodeCompilerError) {
     if len(compiler.locals) >= MAX_LOCAL_VARIABLE_COUNT do return .TOO_MANY_LOCAL_VARIABLES
-    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth})
+    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth, slots = slots, struct_type = struct_type})
     return nil
 }
 

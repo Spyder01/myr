@@ -34,7 +34,7 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .TRUE:         return simple_instruction("TRUE", offset)
     case .FALSE:        return simple_instruction("FALSE", offset)
     case .POP:          return simple_instruction("POP", offset)
-    case .RETURN:       return simple_instruction("RETURN", offset)
+    case .RETURN:       return byte_instruction("RETURN", chunk, offset)
     case .PRINT:        return simple_instruction("PRINT", offset)
     case .INPUT:        return simple_instruction("INPUT", offset)
     case .EQ:           return simple_instruction("EQ", offset)

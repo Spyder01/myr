@@ -130,7 +130,7 @@ test_disassemble_all_simple_opcodes :: proc(t: ^testing.T) {
 		.ADD, .SUB, .MUL, .DIV, .MOD, .NEGATE,
 		.EQ, .NEQ, .LT, .LTE, .GT, .GTE, .NOT,
 		.NIL, .TRUE, .FALSE,
-		.POP, .RETURN, .PRINT,
+		.POP, .PRINT,
 	}
 
 	for op in simple_ops {
@@ -164,6 +164,15 @@ test_disassemble_get_set_local :: proc(t: ^testing.T) {
 	emit_byte(&bc, 1, dummy_span())
 	testing.expect_value(t, disassemble_instruction(current_chunk(&bc), 0), 2)
 	testing.expect_value(t, disassemble_instruction(current_chunk(&bc), 2), 4)
+}
+
+@(test)
+test_disassemble_return :: proc(t: ^testing.T) {
+	bc := new_bytecode_compiler("test", 0)
+	defer { fn := compiler_end(&bc); function_free(fn) }
+	emit(&bc, .RETURN, dummy_span())
+	emit_byte(&bc, 1, dummy_span())
+	testing.expect_value(t, disassemble_instruction(current_chunk(&bc), 0), 2)
 }
 
 @(test)

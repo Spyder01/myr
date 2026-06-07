@@ -22,10 +22,19 @@ FnType :: struct {
 	return_type: TypeId,
 }
 
+// Struct type stored in the type table.
+// field_names and field_types are owned; caller must delete when destroying.
+StructType :: struct {
+	name:        string,
+	field_names: []string,
+	field_types: []TypeId,
+}
+
 // TypeInfo is the entry stored in the type table.
 TypeInfo :: union {
 	PrimitiveType,
 	FnType,
+	StructType,
 }
 
 TypeCheckerError :: struct {
@@ -90,14 +99,17 @@ type_id_name :: proc(id: TypeId, table: []TypeInfo) -> string {
 		}
 	case FnType:
 		return "function"
+	case StructType:
+		return t.name
 	}
 	return "unknown"
 }
 
 tc_result_destroy :: proc(r: ^TypecheckResult) {
 	for info in r.type_table {
-		if fn, ok := info.(FnType); ok {
-			delete(fn.params)
+		#partial switch t in info {
+		case FnType:     delete(t.params)
+		case StructType: delete(t.field_names); delete(t.field_types)
 		}
 	}
 	delete(r.type_table)
