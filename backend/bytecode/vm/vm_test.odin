@@ -2,6 +2,7 @@
 package vm
 
 import "core:testing"
+import "core:strings"
 import bc "../../bytecode"
 import "../../../lexer"
 
@@ -290,6 +291,114 @@ test_run_undefined_global :: proc(t: ^testing.T) {
 	})
 	defer bc.function_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.UNDEFINED_VARIABLE))
+}
+
+// ---- string pool unit tests ----
+
+@(test)
+test_pool_intern_returns_same_pointer :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	a := string_pool_intern(&pool, "hello")
+	b := string_pool_intern(&pool, "hello")
+	testing.expect(t, raw_data(a) == raw_data(b), "same content must return same pointer")
+}
+
+@(test)
+test_pool_intern_different_content :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	a := string_pool_intern(&pool, "foo")
+	b := string_pool_intern(&pool, "bar")
+	testing.expect(t, raw_data(a) != raw_data(b), "different content must have different pointers")
+}
+
+@(test)
+test_pool_intern_deduplicates :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	string_pool_intern(&pool, "myr")
+	string_pool_intern(&pool, "myr")
+	string_pool_intern(&pool, "myr")
+	testing.expect_value(t, len(pool.entries), 1)
+}
+
+@(test)
+test_pool_intern_long_string_not_pooled :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	// build a string longer than MAX_INTERN_LEN
+	long := "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+	a := string_pool_intern(&pool, long)
+	b := string_pool_intern(&pool, long)
+	defer delete(a)
+	defer delete(b)
+	testing.expect(t, len(pool.entries) == 0, "long strings must not be added to pool")
+	testing.expect(t, raw_data(a) != raw_data(b), "long strings get independent clones")
+}
+
+@(test)
+test_pool_intern_empty_string :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	a := string_pool_intern(&pool, "")
+	b := string_pool_intern(&pool, "")
+	testing.expect(t, raw_data(a) == raw_data(b))
+	testing.expect_value(t, len(pool.entries), 1)
+}
+
+@(test)
+test_pool_intern_independent_of_source :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	// intern from two different source buffers with same content
+	buf1 := "hello world"
+	buf2 := "hello world"
+	a := string_pool_intern(&pool, buf1)
+	b := string_pool_intern(&pool, buf2)
+	testing.expect(t, raw_data(a) == raw_data(b), "content equality must win over source pointer")
+}
+
+// ---- vm string interning integration ----
+
+@(test)
+test_vm_string_constant_interned :: proc(t: ^testing.T) {
+	vm := new_vm()
+	defer destroy_vm(&vm)
+	// intern the same string twice through the pool directly
+	s1 := string_pool_intern(&vm.strings, "hello")
+	s2 := string_pool_intern(&vm.strings, "hello")
+	testing.expect(t, raw_data(s1) == raw_data(s2))
+}
+
+@(test)
+test_vm_string_eq_uses_pointer :: proc(t: ^testing.T) {
+	// vm_values_equal for interned strings must be pointer equality
+	vm := new_vm()
+	defer destroy_vm(&vm)
+	a := Value(string_pool_intern(&vm.strings, "myr"))
+	b := Value(string_pool_intern(&vm.strings, "myr"))
+	testing.expect(t, vm_values_equal(a, b))
+}
+
+@(test)
+test_vm_string_neq_different :: proc(t: ^testing.T) {
+	vm := new_vm()
+	defer destroy_vm(&vm)
+	a := Value(string_pool_intern(&vm.strings, "foo"))
+	b := Value(string_pool_intern(&vm.strings, "bar"))
+	testing.expect(t, !vm_values_equal(a, b))
+}
+
+@(test)
+test_vm_concat_result_interned :: proc(t: ^testing.T) {
+	pool := string_pool_new()
+	defer string_pool_destroy(&pool)
+	tmp  := strings.concatenate({"hel", "lo"})
+	s    := string_pool_intern(&pool, tmp)
+	s2   := string_pool_intern(&pool, "hello")
+	if raw_data(tmp) != raw_data(s) { delete(tmp) }
+	testing.expect(t, raw_data(s) == raw_data(s2), "concat result and literal must share pointer")
 }
 
 // ---- pop ----

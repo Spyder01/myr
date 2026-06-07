@@ -296,7 +296,9 @@ parse_for :: proc(p: ^Parser) -> StatementIdx {
 		condition := parse_expr(p)
 		p.no_struct_lit = false
 		expect(p, .SEMICOLON)
+		p.no_struct_lit = true
 		post := parse_expr_stmt(p)
+		p.no_struct_lit = false
 		body := parse_block(p)
 		stmt := ForStatement{
 			init      = init,
@@ -441,9 +443,6 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 
 	case .IDENT:
 		advance(p)
-		if !p.no_struct_lit && peek(p) == .LEFT_BRACE {
-			return parse_struct_literal(p, tok)
-		}
 		expr := IdentExpression(tok)
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
 		append_elem(&p.ast.spans, tok.span)

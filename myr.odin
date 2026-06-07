@@ -6,6 +6,8 @@ import "core:strings"
 import bc "backend/bytecode"
 import "backend/bytecode/vm"
 import "parser"
+import nr "tree-walkers/nameresolution"
+import tc "tree-walkers/typechecker"
 
 VERSION :: "0.1.0"
 
@@ -122,6 +124,39 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 		os.exit(1)
 	}
 	delete(p.errors)
+
+	// Name resolution
+	nrr := nr.resolve_program(&ast)
+	if nrr.error_count > 0 {
+		for i in 0..<int(nrr.error_count) {
+			e := nrr.errors[i]
+			line, col := parser.offset_to_line_col(source, e.span.start)
+			fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
+		}
+		nr.nr_result_destroy(&nrr)
+		os.exit(1)
+	}
+	defer nr.nr_result_destroy(&nrr)
+
+	// Type checking
+	tcr := tc.typecheck(&ast, &nrr)
+	if tcr.error_count > 0 {
+		for i in 0..<int(tcr.error_count) {
+			e := tcr.errors[i]
+			line, col := parser.offset_to_line_col(source, e.span.start)
+			if e.message != "" {
+				fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
+			} else {
+				exp := tc.type_id_name(e.expected, tcr.type_table[:])
+				got := tc.type_id_name(e.found, tcr.type_table[:])
+				fmt.eprintfln("%s:%d:%d: error: type mismatch: expected '%s', got '%s'",
+					file, line, col, exp, got)
+			}
+		}
+		tc.tc_result_destroy(&tcr)
+		os.exit(1)
+	}
+	defer tc.tc_result_destroy(&tcr)
 
 	fn, comp_errors := bc.compile(&ast)
 	if len(comp_errors) > 0 {

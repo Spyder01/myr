@@ -1,0 +1,3 @@
+package myr
+
+Compiler :: struct {}

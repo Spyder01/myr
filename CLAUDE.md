@@ -84,3 +84,9 @@ These are **resolved** — don't revisit without explicit user instruction.
 
 ### C Interop
 - Structs are C-ABI compatible by default — no marshaling needed at FFI boundaries.
+
+### VM Instance Model
+- The `VM` struct must have **no global state** — every piece of state lives inside the `VM` struct itself.
+- Multiple `VM` instances must be safe to run concurrently on separate OS threads without any locking.
+- Compiled bytecode (`Function` structs) is immutable after compilation and may be shared across VM instances read-only.
+- Values do not cross VM boundaries by reference — they are deep-copied (primitives trivially, strings by bytes, structs by fields).
