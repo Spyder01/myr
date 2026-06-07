@@ -24,7 +24,7 @@ odin run . -- run main.myr
 ```
 myr run   <file>          parse, compile and execute
 myr check <file>          compile only — report errors, don't run
-myr dump  <file>          show bytecode disassembly
+myr dump  <file>          show bytecode disassembly (all functions)
 myr version               print version
 myr help  [command]       usage info
 myr <file.myr>            shorthand for myr run <file.myr>
@@ -44,15 +44,29 @@ function main() {
 }
 ```
 
-### Variables and loops
+### Variables and constants
+
+```myr
+const MAX = 100
+
+function main() {
+    let x = 10
+    let y = MAX - x
+    print(y)
+}
+```
+
+### Compound assignment
 
 ```myr
 function main() {
-    let i = 0
-    for i < 10 {
-        print(i)
-        i = i + 1
+    let sum = 0
+    let i = 1
+    for i <= 10 {
+        sum += i
+        i += 1
     }
+    print(sum)   // 55
 }
 ```
 
@@ -71,7 +85,7 @@ function fizzbuzz(n: int) {
         } else {
             print(i)
         }
-        i = i + 1
+        i += 1
     }
 }
 ```
@@ -88,7 +102,7 @@ for {
 }
 
 // C-style
-for let i = 0; i < n; i = i + 1 { }
+for let i = 0; i < n; i += 1 { }
 ```
 
 ### Recursion
@@ -98,6 +112,148 @@ function fib(n: int) -> int {
     if n <= 1 { return n }
     return fib(n - 1) + fib(n - 2)
 }
+```
+
+### Structs
+
+Structs are value types — assignment copies all fields.
+
+```myr
+struct Point { x: float, y: float }
+
+function main() {
+    let p = Point{x = 3.0, y = 4.0}
+    let q = p      // full copy
+    q.x = 99.0
+    print(p.x)     // 3.0 — unaffected
+}
+```
+
+Structs can be nested:
+
+```myr
+struct Vec2 { x: float, y: float }
+struct Rect { origin: Vec2, size: Vec2 }
+
+function area(r: Rect) -> float {
+    return r.size.x * r.size.y
+}
+
+function main() {
+    let r = Rect{origin = Vec2{x = 0.0, y = 0.0}, size = Vec2{x = 10.0, y = 5.0}}
+    print(area(r))   // 50.0
+}
+```
+
+### Pointers
+
+Use `^T` for a heap-allocated pointer to a struct. `new T{...}` allocates and returns a `^T`. Field access auto-derefs — no explicit `->` needed.
+
+```myr
+struct Point { x: int, y: int }
+
+function move(p: ^Point, dx: int, dy: int) {
+    p.x += dx
+    p.y += dy
+}
+
+function main() {
+    let p: ^Point = new Point{x = 0, y = 0}
+    move(p, 3, 4)
+    print(p.x)   // 3
+    print(p.y)   // 4
+}
+```
+
+Use `nil` to represent a null pointer, and compare with `== nil` / `!= nil`:
+
+```myr
+struct Node { val: int, next: ^Node }
+
+function main() {
+    let n: ^Node = new Node{val = 42, next = nil}
+    if n.next == nil {
+        print("no next")
+    }
+}
+```
+
+Use `p^` to explicitly copy the pointed-at value onto the stack:
+
+```myr
+struct Point { x: int, y: int }
+
+function main() {
+    let p: ^Point = new Point{x = 10, y = 20}
+    let copy = p^        // copy of the struct; mutations don't affect *p
+    copy.x = 999
+    print(p.x)           // 10 — unchanged
+    print(copy.x)        // 999
+}
+```
+
+### Recursive structs
+
+Struct fields can reference the struct's own type via a pointer:
+
+```myr
+struct Node { val: int, next: ^Node }
+
+function sum_list(n: ^Node) -> int {
+    let total = 0
+    for n != nil {
+        total += n.val
+        n = n.next
+    }
+    return total
+}
+
+function main() {
+    let c: ^Node = new Node{val = 3, next = nil}
+    let b: ^Node = new Node{val = 2, next = c}
+    let a: ^Node = new Node{val = 1, next = b}
+    print(sum_list(a))   // 6
+}
+```
+
+### First-class functions
+
+Functions are values — store them in variables, pass them as arguments, return them from other functions.
+
+```myr
+function double(x: int) -> int { return x * 2 }
+function square(x: int) -> int { return x * x }
+
+function apply(f: (int) -> int, x: int) -> int {
+    return f(x)
+}
+
+function main() {
+    print(apply(double, 5))   // 10
+    print(apply(square, 5))   // 25
+
+    let f = double
+    print(f(7))               // 14
+}
+```
+
+### Operators
+
+```myr
+// Arithmetic
+a + b   a - b   a * b   a / b   a % b
+
+// Comparison
+a == b   a != b   a < b   a <= b   a > b   a >= b
+
+// Logical
+a && b   a || b   !a
+
+// Bitwise (integers)
+a & b   a | b   a ^ b   ~a   a << n   a >> n
+
+// Compound assignment
+a += b   a -= b   a *= b   a /= b   a %= b
 ```
 
 ## Building from source
@@ -115,12 +271,12 @@ odin test ./lexer     # run tests for one package
 Phase 1 — bytecode compiler + VM. The pipeline is:
 
 ```
-source → lex → parse → compile → VM
+source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, lexical scoping, closures.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, type checker.
 
-Not yet: structs, enums, algebraic types, pattern matching, type checker, generics.
+Not yet: enums, algebraic types, pattern matching, generics.
 
 ## Examples
 
