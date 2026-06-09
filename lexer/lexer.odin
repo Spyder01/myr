@@ -207,7 +207,10 @@ next_token :: proc(l: ^Lexer) -> Token {
 	case byte(Symbols.SLASH):       return make_token(l, match(l, byte(Symbols.EQ)) ? .SLASH_EQ   : .SLASH)
 	case byte(Symbols.PLUS):        return make_token(l, match(l, byte(Symbols.EQ))       ? .PLUS_EQ     : .PLUS)
 	case byte(Symbols.MINUS):       return make_token(l, match(l, byte(Symbols.GT))       ? .ARROW       : match(l, byte(Symbols.EQ)) ? .MINUS_EQ : .MINUS)
-	case byte(Symbols.EQ):          return make_token(l, match(l, byte(Symbols.EQ))       ? .EQ_EQ       : .EQ)
+	case byte(Symbols.EQ):
+		if match(l, byte(Symbols.EQ)) do return make_token(l, .EQ_EQ)
+		if match(l, byte(Symbols.GT)) do return make_token(l, .FAT_ARROW)
+		return make_token(l, .EQ)
 	case byte(Symbols.BANG):        return make_token(l, match(l, byte(Symbols.EQ))       ? .BANG_EQ     : .BANG)
 	case byte(Symbols.COLON):       return make_token(l, match(l, byte(Symbols.COLON))    ? .COLON_COLON : .COLON)
 	case byte(Symbols.AMPERSAND):   return make_token(l, match(l, byte(Symbols.AMPERSAND))? .AND         : .AMPERSAND)

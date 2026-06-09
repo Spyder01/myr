@@ -46,6 +46,7 @@ TokenType :: enum(u8) {
 	COLON_COLON,
 	SEMICOLON,
 	ARROW,
+	FAT_ARROW,
 	ELLIPSIS,
 
 	// Arithmetic

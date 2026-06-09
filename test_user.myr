@@ -1,0 +1,34 @@
+struct Monkey {
+    num: int,
+    num2: int,
+    person: Person
+}
+
+struct Person {
+    name: string,
+    age: int,
+}
+
+enum Meaning {
+    Life {nothing: int},
+    Man {has_nothing: bool}
+}
+
+function math() {
+}
+
+function main() {
+    let person = Person{name="Suhan", age=24}
+    let monkey = Monkey{num=1, num2=2, person=Person{name="SUhan", age=10}}
+    print(monkey.person.name)
+    print_name(person)
+    let meaning = Meaning.Man{has_nothing=true}
+    match meaning {
+        Meaning.Life {nothing} => {print(nothing)}
+        Meaning.Man {has_nothing} => {print(has_nothing)}
+    }
+}
+
+function print_name(p: Person) {
+    print(p.name)
+}

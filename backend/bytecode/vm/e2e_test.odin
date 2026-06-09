@@ -5,6 +5,8 @@ import "core:testing"
 import "core:strings"
 import bc "../../bytecode"
 import "../../../parser"
+import nr "../../../tree-walkers/nameresolution"
+import tc "../../../tree-walkers/typechecker"
 
 // ---- helpers ----
 
@@ -14,7 +16,16 @@ run_source :: proc(source: string, stdin_data: string = "") -> (Value, Maybe(VME
 	defer parser.ast_destroy(&ast)
 	delete(p.errors)
 
-	fn, errs := bc.compile(&ast)
+	nrr := nr.resolve_program(&ast)
+	defer nr.nr_result_destroy(&nrr)
+
+	tcr: tc.TypecheckResult
+	if nrr.error_count == 0 {
+		tcr = tc.typecheck(&ast, &nrr)
+	}
+	defer if tcr.types != nil { tc.tc_result_destroy(&tcr) }
+
+	fn, errs := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	if len(errs) > 0 || fn == nil do return Nil{}, nil
 	defer bc.function_free(fn)
 
@@ -38,6 +49,24 @@ result :: proc(source: string) -> Value {
 result_with_stdin :: proc(source: string, stdin_data: string) -> Value {
 	val, _ := run_source(source, stdin_data)
 	return val
+}
+
+// typecheck_error_count runs parse → name resolution → type check and returns
+// the number of type errors. Used to verify that invalid programs are rejected.
+typecheck_error_count :: proc(source: string) -> int {
+	p   := parser.new_parser(source)
+	ast := parser.parse_program(&p)
+	defer parser.ast_destroy(&ast)
+	if len(p.errors) > 0 { delete(p.errors); return 1 }
+	delete(p.errors)
+
+	nrr := nr.resolve_program(&ast)
+	defer nr.nr_result_destroy(&nrr)
+	if nrr.error_count > 0 do return int(nrr.error_count)
+
+	tcr := tc.typecheck(&ast, &nrr)
+	defer tc.tc_result_destroy(&tcr)
+	return int(tcr.error_count)
 }
 
 // ---- arithmetic ----
@@ -1308,4 +1337,576 @@ test_e2e_recursive_struct_fn_traverse :: proc(t: ^testing.T) {
 		}
 	`)
 	testing.expect_value(t, val.(i64), i64(6))
+}
+
+// ---- enums ----
+
+@(test)
+test_e2e_enum_unit_variant :: proc(t: ^testing.T) {
+	val := result(`
+		enum Color { Red {}, Green {}, Blue {} }
+		function main() -> i64 {
+			let c = Color.Red {}
+			return 1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_enum_variant_with_fields :: proc(t: ^testing.T) {
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> float {
+			let s = Shape.Circle { radius = 3.0 }
+			return 1.0
+		}
+	`)
+	testing.expect_value(t, val.(f64), f64(1.0))
+}
+
+@(test)
+test_e2e_enum_passed_to_function :: proc(t: ^testing.T) {
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function describe(s: Shape) -> i64 { return 42 }
+		function main() -> i64 {
+			let s = Shape.Rect { w = 10.0, h = 5.0 }
+			return describe(s)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_enum_returned_from_function :: proc(t: ^testing.T) {
+	val := result(`
+		enum Shape { Circle { radius: float } }
+		function make_circle(r: float) -> Shape { return Shape.Circle { radius = r } }
+		function main() -> i64 {
+			let s = make_circle(5.0)
+			return 99
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_enum_multiple_variants_same_enum :: proc(t: ^testing.T) {
+	val := result(`
+		enum Msg { Ok { code: i64 }, Err { code: i64 } }
+		function main() -> i64 {
+			let a = Msg.Ok  { code = 1 }
+			let b = Msg.Err { code = 2 }
+			return 7
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+// ---- enums: additional runtime tests ----
+
+@(test)
+test_e2e_enum_int_field :: proc(t: ^testing.T) {
+	val := result(`
+		enum Msg { Ok { code: i64 }, Err { code: i64 } }
+		function main() -> i64 {
+			let m = Msg.Ok { code = 42 }
+			return 1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_enum_string_field :: proc(t: ^testing.T) {
+	val := result(`
+		enum Event { Click { label: str } }
+		function main() -> i64 {
+			let e = Event.Click { label = "submit" }
+			return 1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_enum_annotated_let :: proc(t: ^testing.T) {
+	// explicit type annotation on the let binding
+	val := result(`
+		enum Shape { Circle { radius: float } }
+		function main() -> i64 {
+			let s: Shape = Shape.Circle { radius = 3.14 }
+			return 1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_enum_in_loop :: proc(t: ^testing.T) {
+	// construct enum values inside a loop; each iteration allocates a new value
+	val := result(`
+		enum Counter { Step { n: i64 } }
+		function main() -> i64 {
+			let sum = 0
+			for let i = 1; i <= 5; i += 1 {
+				let s = Counter.Step { n = i }
+				sum += i
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(15))
+}
+
+@(test)
+test_e2e_enum_as_expression_stmt :: proc(t: ^testing.T) {
+	// enum literal used as an expression statement — value must be popped correctly
+	val := result(`
+		enum Shape { Circle { radius: float } }
+		function main() -> i64 {
+			Shape.Circle { radius = 1.0 }
+			Shape.Circle { radius = 2.0 }
+			return 7
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_enum_two_enums :: proc(t: ^testing.T) {
+	// two independent enum types coexist
+	val := result(`
+		enum Color  { Red {}, Blue {} }
+		enum Shape  { Circle { r: float }, Rect { w: float, h: float } }
+		function main() -> i64 {
+			let c = Color.Red {}
+			let s = Shape.Rect { w = 4.0, h = 3.0 }
+			return 1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@(test)
+test_e2e_enum_variant_forwarded_through_call :: proc(t: ^testing.T) {
+	// construct in callee, return to caller, use in another call
+	val := result(`
+		enum Wrap { Val { x: i64 } }
+		function make(n: i64) -> Wrap { return Wrap.Val { x = n } }
+		function consume(w: Wrap)     -> i64  { return 99 }
+		function main() -> i64 {
+			return consume(make(5))
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+// ---- enums: stack-layout runtime correctness ----
+// run_source returns the TOP stack slot. When main returns an N-slot enum value,
+// __main__'s RETURN 1 keeps only the top slot, which is the last field (or nil
+// for padding). These tests exploit that to verify actual field values survive
+// construction, function calls, copies, and reassignment.
+
+@(test)
+test_e2e_enum_field_survives_return :: proc(t: ^testing.T) {
+	// Single-variant 1-field enum: slots = [disc=0, x]. Stack top after __main__ RETURN 1 = x.
+	val := result(`
+		enum Val { Only { x: i64 } }
+		function main() -> Val { return Val.Only { x = 55 } }
+	`)
+	testing.expect_value(t, val.(i64), i64(55))
+}
+
+@(test)
+test_e2e_enum_two_field_variant_top_slot :: proc(t: ^testing.T) {
+	// Two-field variant is the widest — no padding. Rect { w, h } → slots [disc=1, w, h].
+	// Stack top = h after __main__ RETURN 1.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> Shape { return Shape.Rect { w = 7.0, h = 99.0 } }
+	`)
+	testing.expect_value(t, val.(f64), f64(99.0))
+}
+
+@(test)
+test_e2e_enum_scalar_after_enum_local :: proc(t: ^testing.T) {
+	// Scalar local declared after a 3-slot enum must land at the correct stack slot.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 5.0 }
+			let n = 42
+			return n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_enum_scalar_param_after_enum_param :: proc(t: ^testing.T) {
+	// Second (scalar) parameter must be readable at its correct slot when the first
+	// parameter is a multi-slot enum.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function tag(s: Shape, n: i64) -> i64 { return n }
+		function main() -> i64 {
+			return tag(Shape.Circle { radius = 5.0 }, 77)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(77))
+}
+
+@(test)
+test_e2e_enum_copy_scalar_after :: proc(t: ^testing.T) {
+	// let b = a copies all slots of the enum; a scalar declared after both must not
+	// be corrupted.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> i64 {
+			let a = Shape.Circle { radius = 5.0 }
+			let b = a
+			let n = 99
+			return n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_enum_expression_stmt_pops_all :: proc(t: ^testing.T) {
+	// An enum literal used as an expression statement must pop all of its slots.
+	// If only 1 slot is popped instead of 3, the next local lands at the wrong position.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> i64 {
+			Shape.Circle { radius = 1.0 }
+			let n = 55
+			return n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(55))
+}
+
+@(test)
+test_e2e_enum_reassign_scalar_after :: proc(t: ^testing.T) {
+	// Overwriting an enum local must not corrupt a scalar neighbour declared after it.
+	val := result(`
+		enum Shape { Circle { radius: float }, Rect { w: float, h: float } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 1.0 }
+			let n = 33
+			s = Shape.Rect { w = 2.0, h = 4.0 }
+			return n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(33))
+}
+
+@(test)
+test_e2e_enum_identity_function :: proc(t: ^testing.T) {
+	// Enum passed to identity function and returned; field value must survive
+	// the full call + return round trip.
+	val := result(`
+		enum Val { Only { x: i64 } }
+		function identity(v: Val) -> Val { return v }
+		function main() -> Val { return identity(Val.Only { x = 88 }) }
+	`)
+	testing.expect_value(t, val.(i64), i64(88))
+}
+
+// ---- match expression ----
+
+@(test)
+test_e2e_match_first_arm :: proc(t: ^testing.T) {
+	// Subject matches the first arm; binding is readable in body.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 42 }
+			match s {
+				Shape.Circle { radius } => { return radius }
+				Shape.Rect { w, h } => { return 0 }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@(test)
+test_e2e_match_second_arm :: proc(t: ^testing.T) {
+	// Subject matches the second arm; second field is returned.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Rect { w = 10, h = 20 }
+			match s {
+				Shape.Circle { radius } => { return 0 }
+				Shape.Rect { w, h } => { return h }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(20))
+}
+
+@(test)
+test_e2e_match_two_bindings :: proc(t: ^testing.T) {
+	// Both field bindings are accessible and can be used together.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Rect { w = 3, h = 7 }
+			match s {
+				Shape.Circle { radius } => { return 0 }
+				Shape.Rect { w, h } => { return w + h }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_match_after_reassign :: proc(t: ^testing.T) {
+	// Reassigning the enum variable before match: correct arm fires on new value.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 5 }
+			s = Shape.Rect { w = 3, h = 9 }
+			match s {
+				Shape.Circle { radius } => { return 0 }
+				Shape.Rect { w, h } => { return h }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(9))
+}
+
+@(test)
+test_e2e_match_as_stmt_scalar_after :: proc(t: ^testing.T) {
+	// match used as a statement; scalar local declared after it must land correctly.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 5 }
+			match s {
+				Shape.Circle { radius } => { return radius }
+				Shape.Rect { w, h } => { return 0 }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+@(test)
+test_e2e_match_via_function_param :: proc(t: ^testing.T) {
+	// match inside a function that receives the enum as a parameter.
+	val := result(`
+		enum Msg { Ok { code: i64 }, Err { code: i64 } }
+		function handle(m: Msg) -> i64 {
+			match m {
+				Msg.Ok { code } => { return code }
+				Msg.Err { code } => { return 0 - code }
+			}
+			return 0
+		}
+		function main() -> i64 {
+			return handle(Msg.Ok { code = 77 })
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(77))
+}
+
+// ---- match: wildcard arm ----
+
+@(test)
+test_e2e_match_wildcard_catches_unmatched :: proc(t: ^testing.T) {
+	// Wildcard arm fires when no enum arm matches.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Rect { w = 3, h = 7 }
+			match s {
+				Shape.Circle { radius } => { return radius }
+				_ => { return 99 }
+			}
+			return 0
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_match_wildcard_not_reached_when_arm_matches :: proc(t: ^testing.T) {
+	// Wildcard is skipped when an earlier arm already matched.
+	val := result(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() -> i64 {
+			let s = Shape.Circle { radius = 5 }
+			match s {
+				Shape.Circle { radius } => { return radius }
+				_ => { return 99 }
+			}
+			return 0
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+// ---- match: scalar subject ----
+
+@(test)
+test_e2e_match_scalar_first_arm :: proc(t: ^testing.T) {
+	// Scalar match: first literal arm fires.
+	val := result(`
+		function main() -> i64 {
+			let x: i64 = 0
+			match x {
+				0 => { return 100 }
+				1 => { return 200 }
+				_ => { return 0 }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(100))
+}
+
+@(test)
+test_e2e_match_scalar_second_arm :: proc(t: ^testing.T) {
+	// Scalar match: second literal arm fires.
+	val := result(`
+		function main() -> i64 {
+			let x: i64 = 1
+			match x {
+				0 => { return 100 }
+				1 => { return 200 }
+				_ => { return 0 }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(200))
+}
+
+@(test)
+test_e2e_match_scalar_wildcard :: proc(t: ^testing.T) {
+	// Scalar match: wildcard fires when no literal matches.
+	val := result(`
+		function main() -> i64 {
+			let x: i64 = 42
+			match x {
+				0 => { return 100 }
+				1 => { return 200 }
+				_ => { return 777 }
+			}
+			return -1
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(777))
+}
+
+// ---- match: exhaustiveness ----
+
+@(test)
+test_e2e_match_non_exhaustive_rejected :: proc(t: ^testing.T) {
+	// Missing Rect arm — type checker should report an error.
+	n := typecheck_error_count(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() {
+			let s = Shape.Circle { radius = 1 }
+			match s {
+				Shape.Circle { radius } => { }
+			}
+		}
+	`)
+	testing.expect(t, n > 0, "expected exhaustiveness error: Rect not covered")
+}
+
+@(test)
+test_e2e_match_wildcard_makes_exhaustive :: proc(t: ^testing.T) {
+	// Wildcard arm satisfies exhaustiveness even if enum arms are missing.
+	n := typecheck_error_count(`
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function main() {
+			let s = Shape.Circle { radius = 1 }
+			match s {
+				Shape.Circle { radius } => { }
+				_ => { }
+			}
+		}
+	`)
+	testing.expect(t, n == 0, "wildcard should satisfy exhaustiveness check")
+}
+
+// ---- match: expression result ----
+
+@(test)
+test_e2e_match_as_expression :: proc(t: ^testing.T) {
+	// match used as an expression assigned to a let binding.
+	val := result(`
+		function main() -> i64 {
+			let x: i64 = 7
+			let y = match x {
+				7 => 42
+				_ => 0
+			}
+			return y
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+// ---- enums: type-error rejection ----
+
+@(test)
+test_e2e_enum_type_error_wrong_field_type :: proc(t: ^testing.T) {
+	n := typecheck_error_count(`
+		enum Shape { Circle { radius: float } }
+		function main() { let s = Shape.Circle { radius = "oops" } }
+	`)
+	testing.expect(t, n > 0, "expected type error: string where float required")
+}
+
+@(test)
+test_e2e_enum_type_error_unknown_variant :: proc(t: ^testing.T) {
+	n := typecheck_error_count(`
+		enum Shape { Circle { radius: float } }
+		function main() { let s = Shape.Triangle { radius = 1.0 } }
+	`)
+	testing.expect(t, n > 0, "expected type error: unknown variant 'Triangle'")
+}
+
+@(test)
+test_e2e_enum_type_error_unknown_field :: proc(t: ^testing.T) {
+	n := typecheck_error_count(`
+		enum Shape { Circle { radius: float } }
+		function main() { let s = Shape.Circle { bogus = 1.0 } }
+	`)
+	testing.expect(t, n > 0, "expected type error: unknown field 'bogus'")
+}
+
+@(test)
+test_e2e_enum_type_error_undefined_enum :: proc(t: ^testing.T) {
+	n := typecheck_error_count(`
+		function main() { let s = NoSuchEnum.Variant { x = 1 } }
+	`)
+	testing.expect(t, n > 0, "expected type error: undefined enum")
+}
+
+@(test)
+test_e2e_enum_wrong_arg_type :: proc(t: ^testing.T) {
+	// passing a Shape where i64 is expected
+	n := typecheck_error_count(`
+		enum Shape { Circle { r: float } }
+		function add(a: i64, b: i64) -> i64 { return a + b }
+		function main() { add(Shape.Circle { r = 1.0 }, 2) }
+	`)
+	testing.expect(t, n > 0, "expected type error: enum where i64 required")
 }

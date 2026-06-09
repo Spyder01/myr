@@ -79,6 +79,13 @@ DerefExpression :: struct {
 	operand: ExpressionIdx,
 }
 
+// EnumLiteralExpression represents EnumName.VariantName { field = value, ... }
+EnumLiteralExpression :: struct {
+	enum_name:    lexer.Token,
+	variant_name: lexer.Token,
+	fields:       []StructLiteralField,
+}
+
 Expression :: union {
 	LiteralExpression,
 	IdentExpression,
@@ -93,6 +100,7 @@ Expression :: union {
 	StructLiteralExpression,
 	NewExpression,
 	DerefExpression,
+	EnumLiteralExpression,
 }
 
 LetStatement :: struct {
@@ -274,6 +282,8 @@ ast_destroy :: proc(ast: ^AST) {
 			case StructLiteralExpression:
 				delete(e.fields)
 			case NewExpression:
+				delete(e.fields)
+			case EnumLiteralExpression:
 				delete(e.fields)
 			case BinaryExpression, UnaryExpression,
 			     FieldAccessExpression, IndexExpression,

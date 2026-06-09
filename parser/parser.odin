@@ -243,7 +243,22 @@ parse_block :: proc(p: ^Parser) -> BlockExpression {
 		append_elem(&stmts, idx)
 	}
 	expect(p, .RIGHT_BRACE)
-	return BlockExpression{stmts = stmts[:]}
+
+	// Tail expression: if the last statement is a bare expression (no semicolon
+	// terminator in the language, so we check statement kind), promote it to the
+	// block result so the block produces a value without an explicit return.
+	result: Maybe(ExpressionIdx) = nil
+	if len(stmts) > 0 {
+		last := stmts[len(stmts)-1]
+		if last_node, ok := p.ast.nodes[int(last)].(Statement); ok {
+			if es, ok2 := last_node.(ExpressionStatement); ok2 {
+				result = es.expr
+				pop(&stmts)
+			}
+		}
+	}
+
+	return BlockExpression{stmts = stmts[:], result = result}
 }
 
 @private
@@ -488,6 +503,13 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 		expect(p, .RIGHT_PAREN)
 		return inner
 
+	case .LEFT_BRACE:
+		tok := peek_token(p)
+		block := parse_block(p)
+		append_elem(&p.ast.nodes, Node(Expression(block)))
+		append_elem(&p.ast.spans, tok.span)
+		return ExpressionIdx(len(p.ast.nodes) - 1)
+
 	case .IF:
 		return parse_if(p)
 
@@ -495,6 +517,9 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 		advance(p)
 		type_name := expect(p, .IDENT)
 		return parse_new_expr(p, type_name)
+
+	case .MATCH:
+		return parse_match(p)
 	}
 
 	append_elem(&p.errors, ParserError{kind = .UNEXPECTED_TOKEN, span = tok.span})
@@ -546,10 +571,82 @@ parse_new_expr :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionIdx {
 can_start_expr :: proc(kind: lexer.TokenType) -> bool {
 	#partial switch kind {
 	case .INT, .FLOAT, .STRING, .TRUE, .FALSE, .NIL,
-	     .IDENT, .LEFT_PAREN, .MINUS, .BANG, .TILDE, .IF, .NEW:
+	     .IDENT, .LEFT_PAREN, .MINUS, .BANG, .TILDE, .IF, .NEW, .MATCH, .LEFT_BRACE:
 		return true
 	}
 	return false
+}
+
+@private
+parse_match :: proc(p: ^Parser) -> ExpressionIdx {
+	tok := expect(p, .MATCH)
+	p.no_struct_lit = true
+	subject := parse_expr(p, 0)
+	p.no_struct_lit = false
+	expect(p, .LEFT_BRACE)
+	arms := make([dynamic]MatchArm)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		pattern := parse_match_pattern(p)
+		expect(p, .FAT_ARROW)
+		body := parse_expr(p, 0)
+		append_elem(&arms, MatchArm{pattern = pattern, body = body})
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := MatchExpression{subject = subject, arms = arms[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, tok.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_match_pattern :: proc(p: ^Parser) -> ExpressionIdx {
+	tok := peek_token(p)
+
+	// Wildcard: _
+	if tok.kind == .UNDERSCORE {
+		advance(p)
+		expr := IdentExpression(tok)
+		append_elem(&p.ast.nodes, Node(Expression(expr)))
+		append_elem(&p.ast.spans, tok.span)
+		return ExpressionIdx(len(p.ast.nodes) - 1)
+	}
+
+	// Literal pattern: 0, 1, true, false, etc.
+	#partial switch tok.kind {
+	case .INT, .FLOAT, .STRING, .TRUE, .FALSE:
+		advance(p)
+		expr := LiteralExpression(tok)
+		append_elem(&p.ast.nodes, Node(Expression(expr)))
+		append_elem(&p.ast.spans, tok.span)
+		return ExpressionIdx(len(p.ast.nodes) - 1)
+	}
+
+	// Enum pattern: EnumName.VariantName { field, ... }
+	enum_name    := expect(p, .IDENT)
+	expect(p, .DOT)
+	variant_name := expect(p, .IDENT)
+	expect(p, .LEFT_BRACE)
+	fields := make([dynamic]StructLiteralField)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		field_tok := expect(p, .IDENT)
+		ident_expr := IdentExpression(field_tok)
+		append_elem(&p.ast.nodes, Node(Expression(ident_expr)))
+		append_elem(&p.ast.spans, field_tok.span)
+		ident_idx := ExpressionIdx(len(p.ast.nodes) - 1)
+		append_elem(&fields, StructLiteralField{name = field_tok, value = ident_idx})
+		if peek(p) != .RIGHT_BRACE {
+			expect(p, .COMMA)
+		}
+	}
+	expect(p, .RIGHT_BRACE)
+	pattern := EnumLiteralExpression{
+		enum_name    = enum_name,
+		variant_name = variant_name,
+		fields       = fields[:],
+	}
+	append_elem(&p.ast.nodes, Node(Expression(pattern)))
+	append_elem(&p.ast.spans, enum_name.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
 }
 
 @private
@@ -614,9 +711,39 @@ parse_index :: proc(p: ^Parser, object: ExpressionIdx, op: lexer.Token) -> Expre
 @private
 parse_field_access :: proc(p: ^Parser, object: ExpressionIdx, op: lexer.Token) -> ExpressionIdx {
 	field := expect(p, .IDENT)
+	// Enum literal: EnumName.VariantName { field = value, ... }
+	// Detected when the object is a plain identifier followed immediately by a brace.
+	if peek(p) == .LEFT_BRACE && !p.no_struct_lit {
+		obj_node := p.ast.nodes[int(object)]
+		if obj_expr, ok := obj_node.(Expression); ok {
+			if id, ok2 := obj_expr.(IdentExpression); ok2 {
+				return parse_enum_literal(p, lexer.Token(id), field)
+			}
+		}
+	}
 	expr  := FieldAccessExpression{object = object, field = field}
 	append_elem(&p.ast.nodes, Node(Expression(expr)))
 	append_elem(&p.ast.spans, op.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_enum_literal :: proc(p: ^Parser, enum_name: lexer.Token, variant_name: lexer.Token) -> ExpressionIdx {
+	expect(p, .LEFT_BRACE)
+	fields := make([dynamic]StructLiteralField)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		name  := expect(p, .IDENT)
+		expect(p, .EQ)
+		value := parse_expr(p, 0)
+		append_elem(&fields, StructLiteralField{name = name, value = value})
+		if peek(p) != .RIGHT_BRACE {
+			expect(p, .COMMA)
+		}
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := EnumLiteralExpression{enum_name = enum_name, variant_name = variant_name, fields = fields[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, enum_name.span)
 	return ExpressionIdx(len(p.ast.nodes) - 1)
 }
 

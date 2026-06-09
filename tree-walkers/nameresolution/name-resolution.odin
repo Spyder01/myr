@@ -242,8 +242,22 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 	case parser.MatchExpression:
 		nr_resolve_expr(nr, e.subject)
 		for arm in e.arms {
-			nr_resolve_expr(nr, arm.pattern)
+			nr_enter_scope(nr)
+			pattern_node := nr.ast.nodes[int(arm.pattern)]
+			if pexpr, ok := pattern_node.(parser.Expression); ok {
+				if enum_pat, is_enum := pexpr.(parser.EnumLiteralExpression); is_enum {
+					for field in enum_pat.fields {
+						fval_node := nr.ast.nodes[int(field.value)]
+						if fexpr, fok := fval_node.(parser.Expression); fok {
+							if ident, is_ident := fexpr.(parser.IdentExpression); is_ident {
+								nr_define(nr, lexer.Token(ident).data, DefIdx(field.value))
+							}
+						}
+					}
+				}
+			}
 			nr_resolve_expr(nr, arm.body)
+			nr_exit_scope(nr)
 		}
 
 	case parser.BlockExpression:
@@ -257,6 +271,12 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 
 	case parser.NewExpression:
 		// type_name is a type reference — resolved by type checker
+		for field in e.fields {
+			nr_resolve_expr(nr, field.value)
+		}
+
+	case parser.EnumLiteralExpression:
+		// enum_name and variant_name are type references — resolved by type checker
 		for field in e.fields {
 			nr_resolve_expr(nr, field.value)
 		}

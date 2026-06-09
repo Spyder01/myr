@@ -216,6 +216,142 @@ function main() {
 }
 ```
 
+### Enums
+
+Enums group a fixed set of named variants. Each variant carries named fields (no positional payloads).
+
+```myr
+enum Shape {
+    Circle { radius: float },
+    Rect   { w: float, h: float },
+}
+```
+
+Construct a variant with `EnumName.VariantName { field = value, ... }`. Unit variants (no fields) use empty braces.
+
+```myr
+enum Direction { North {}, South {}, East {}, West {} }
+
+function main() {
+    let s = Shape.Circle { radius = 5.0 }
+    let r = Shape.Rect   { w = 10.0, h = 4.0 }
+    let d = Direction.North {}
+}
+```
+
+Enum values can be passed to and returned from functions:
+
+```myr
+function largest(a: Shape, b: Shape) -> Shape {
+    return a
+}
+```
+
+### Match
+
+#### Enum variants
+
+`match` dispatches on an enum variant and destructures its named fields into the arm body. Only list the fields you need — unused fields can be omitted.
+
+```myr
+enum Shape {
+    Circle { radius: int },
+    Rect   { w: int, h: int },
+}
+
+function area(s: Shape) -> int {
+    match s {
+        Shape.Circle { radius } => { return radius * radius }
+        Shape.Rect   { w, h }  => { return w * h }
+    }
+    return 0
+}
+```
+
+#### Scalar literals
+
+`match` works on integers, floats, booleans, and strings:
+
+```myr
+function day_name(d: int) -> string {
+    match d {
+        1 => { return "Monday" }
+        2 => { return "Tuesday" }
+        3 => { return "Wednesday" }
+        _ => { return "other" }
+    }
+    return ""
+}
+```
+
+```myr
+function is_yes(s: string) -> bool {
+    match s {
+        "yes" => { return true }
+        "y"   => { return true }
+        _     => { return false }
+    }
+    return false
+}
+```
+
+```myr
+function describe_bool(b: bool) -> string {
+    match b {
+        true  => { return "yes" }
+        false => { return "no" }
+    }
+    return ""
+}
+```
+
+#### Wildcard arm
+
+`_` matches anything not caught by earlier arms:
+
+```myr
+function is_circle(s: Shape) -> bool {
+    match s {
+        Shape.Circle { radius } => { return true }
+        _ => { return false }
+    }
+    return false
+}
+```
+
+#### Match as expression
+
+`match` is an expression — the last expression in each arm body is the result value. All arms must produce the same type.
+
+```myr
+function area(s: Shape) -> int {
+    return match s {
+        Shape.Circle { radius } => { radius * radius }
+        Shape.Rect   { w, h }  => { w * h }
+    }
+}
+```
+
+Works for scalars too, and can be assigned to a variable:
+
+```myr
+function label(n: int) -> string {
+    return match n {
+        0 => { "zero" }
+        1 => { "one" }
+        _ => { "many" }
+    }
+}
+
+function main() {
+    let s = Shape.Circle { radius = 5 }
+    let a = match s {
+        Shape.Circle { radius } => { radius * radius }
+        Shape.Rect   { w, h }  => { w * h }
+    }
+    print(a)
+}
+
 ### First-class functions
 
 Functions are values — store them in variables, pass them as arguments, return them from other functions.
@@ -274,9 +410,9 @@ Phase 1 — bytecode compiler + VM. The pipeline is:
 source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, type checker.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), type checker.
 
-Not yet: enums, algebraic types, pattern matching, generics.
+Not yet: generic types, closures.
 
 ## Examples
 

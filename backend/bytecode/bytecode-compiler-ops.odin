@@ -12,9 +12,10 @@ ByteCodeCompilerError :: enum u8 {
 Local :: struct {
     name:        string,
     depth:       u8,
-    slots:       int,    // 1 for scalars/pointers, N for flat structs
-    struct_type: string, // "" for scalars/pointers, struct name for flat struct locals
+    slots:       int,    // 1 for scalars/pointers, N for flat structs/enums
+    struct_type: string, // "" for scalars/pointers/enums, struct name for flat struct locals
     ptr_inner:   string, // "" unless this is a ^T pointer local; stores "T"
+    enum_type:   string, // "" unless this is a flat enum local; stores enum name
 }
 
 ByteCodeCompiler :: struct {
@@ -53,9 +54,9 @@ current_chunk :: proc(bc: ^ByteCodeCompiler) -> ^Chunk {
     return &bc.function.chunk
 }
 
-add_local :: proc(compiler: ^ByteCodeCompiler, name: string, slots: int = 1, struct_type: string = "", ptr_inner: string = "") -> Maybe(ByteCodeCompilerError) {
+add_local :: proc(compiler: ^ByteCodeCompiler, name: string, slots: int = 1, struct_type: string = "", ptr_inner: string = "", enum_type: string = "") -> Maybe(ByteCodeCompilerError) {
     if len(compiler.locals) >= MAX_LOCAL_VARIABLE_COUNT do return .TOO_MANY_LOCAL_VARIABLES
-    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth, slots = slots, struct_type = struct_type, ptr_inner = ptr_inner})
+    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth, slots = slots, struct_type = struct_type, ptr_inner = ptr_inner, enum_type = enum_type})
     return nil
 }
 

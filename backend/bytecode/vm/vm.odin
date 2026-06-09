@@ -12,16 +12,15 @@ CallFrame :: struct {
 	slots:    u16,
 }
 
-
 VM :: struct {
 	frames:       [FRAMES_MAX]CallFrame,
 	stack:        [STACK_MAX]Value,
 	globals:      map[string]Value,
 	strings:      StringPool,
-	heap_objects: [dynamic][]Value, // all heap allocations, freed on destroy_vm
+	heap_objects: [dynamic][]Value,
 	stack_top:    u16,
 	frame_count:  u8,
-	stdin:        io.Reader, // nil → use os.stdin
+	stdin:        io.Reader,
 }
 
 VMError :: enum {
@@ -50,472 +49,449 @@ new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
 destroy_vm :: proc(vm: ^VM) {
 	delete(vm.globals)
 	string_pool_destroy(&vm.strings)
-	for obj in vm.heap_objects {
-		delete(obj)
-	}
+	for obj in vm.heap_objects { delete(obj) }
 	delete(vm.heap_objects)
 }
 
 vm_push :: proc(vm: ^VM, val: Value) -> Maybe(VMError) {
-    if vm.stack_top >= STACK_MAX do return .STACK_OVERFLOW
-    vm.stack[vm.stack_top] = val
-    vm.stack_top += 1
-    return nil
+	if vm.stack_top >= STACK_MAX do return .STACK_OVERFLOW
+	vm.stack[vm.stack_top] = val
+	vm.stack_top += 1
+	return nil
 }
 
 vm_pop :: proc(vm: ^VM) -> (Value, Maybe(VMError)) {
-    if vm.stack_top == 0 do return Nil{}, .STACK_UNDERFLOW
-    vm.stack_top -= 1
-    return vm.stack[vm.stack_top], nil
+	if vm.stack_top == 0 do return Nil{}, .STACK_UNDERFLOW
+	vm.stack_top -= 1
+	return vm.stack[vm.stack_top], nil
 }
 
 vm_peek :: proc(vm: ^VM, dist: u16 = 0) -> (Value, Maybe(VMError)) {
-    if vm.stack_top == 0 || dist >= vm.stack_top do return Nil{}, .STACK_UNDERFLOW
-    return vm.stack[vm.stack_top - 1 - dist], nil
+	if vm.stack_top == 0 || dist >= vm.stack_top do return Nil{}, .STACK_UNDERFLOW
+	return vm.stack[vm.stack_top - 1 - dist], nil
 }
 
 current_frame :: proc(vm: ^VM) -> ^CallFrame {
-    return &vm.frames[vm.frame_count - 1]
+	return &vm.frames[vm.frame_count - 1]
 }
 
 read_byte :: proc(vm: ^VM) -> u8 {
-    frame := current_frame(vm)
-    b := frame.function.chunk.code[frame.ip]
-    frame.ip += 1
-    return b
+	frame := current_frame(vm)
+	b := frame.function.chunk.code[frame.ip]
+	frame.ip += 1
+	return b
 }
 
 read_short :: proc(vm: ^VM) -> u16 {
-    hi := u16(read_byte(vm)) << 8
-    lo := u16(read_byte(vm))
-    return hi | lo
+	hi := u16(read_byte(vm)) << 8
+	lo := u16(read_byte(vm))
+	return hi | lo
 }
 
 read_constant :: proc(vm: ^VM) -> Value {
-    idx := read_byte(vm)
-    return current_frame(vm).function.chunk.constants[idx]
+	idx := read_byte(vm)
+	return current_frame(vm).function.chunk.constants[idx]
 }
 
 read_constant_long :: proc(vm: ^VM) -> Value {
-    idx := read_short(vm)
-    return current_frame(vm).function.chunk.constants[idx]
+	idx := read_short(vm)
+	return current_frame(vm).function.chunk.constants[idx]
 }
 
 vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
-    for {
-        op := Opcode(read_byte(vm))
-        #partial switch op {
+	for {
+		op := Opcode(read_byte(vm))
+		#partial switch op {
 
-        case .CONST:
-            val := read_constant(vm)
-            if s, ok := val.(string); ok {
-                val = string_pool_intern(&vm.strings, s)
-            }
-            if err := vm_push(vm, val); err != nil do return err
+		case .CONST:
+			val := read_constant(vm)
+			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
+			if err := vm_push(vm, val); err != nil do return err
 
-        case .CONST_LONG:
-            val := read_constant_long(vm)
-            if s, ok := val.(string); ok {
-                val = string_pool_intern(&vm.strings, s)
-            }
-            if err := vm_push(vm, val); err != nil do return err
+		case .CONST_LONG:
+			val := read_constant_long(vm)
+			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
+			if err := vm_push(vm, val); err != nil do return err
 
-        case .NIL:
-            if err := vm_push(vm, Nil{}); err != nil do return err
+		case .NIL:
+			if err := vm_push(vm, Nil{}); err != nil do return err
 
-        case .TRUE:
-            if err := vm_push(vm, true); err != nil do return err
+		case .TRUE:
+			if err := vm_push(vm, true); err != nil do return err
 
-        case .FALSE:
-            if err := vm_push(vm, false); err != nil do return err
+		case .FALSE:
+			if err := vm_push(vm, false); err != nil do return err
 
-        case .ADD:
-            b, err1 := vm_pop(vm)
-            if err1 != nil do return err1
-            a, err2 := vm_pop(vm)
-            if err2 != nil do return err2
+		case .ADD:
+			b, err1 := vm_pop(vm); if err1 != nil do return err1
+			a, err2 := vm_pop(vm); if err2 != nil do return err2
+			#partial switch av in a {
+			case i64:
+				bv, ok := b.(i64); if !ok do return .TYPE_ERROR
+				if err := vm_push(vm, av + bv); err != nil do return err
+			case f64:
+				bv, ok := b.(f64); if !ok do return .TYPE_ERROR
+				if err := vm_push(vm, av + bv); err != nil do return err
+			case string:
+				bv, ok := b.(string); if !ok do return .TYPE_ERROR
+				tmp := strings.concatenate({av, bv})
+				interned := string_pool_intern(&vm.strings, tmp)
+				if raw_data(tmp) != raw_data(interned) { delete(tmp) }
+				if err := vm_push(vm, interned); err != nil do return err
+			case: return .TYPE_ERROR
+			}
 
-					  
-            #partial switch av in a {
-            case i64:
-                bv, ok := b.(i64)
-                if !ok do return .TYPE_ERROR
-                if err := vm_push(vm, av + bv); err != nil do return err
-            case f64:
-                bv, ok := b.(f64)
-                if !ok do return .TYPE_ERROR
-                if err := vm_push(vm, av + bv); err != nil do return err
-            case string:
-                bv, ok := b.(string)
-                if !ok do return .TYPE_ERROR
-                tmp := strings.concatenate({av, bv})
-                interned := string_pool_intern(&vm.strings, tmp)
-                if raw_data(tmp) != raw_data(interned) { delete(tmp) }
-                if err := vm_push(vm, interned); err != nil do return err
-            case: return .TYPE_ERROR
-            }
+		case .SUB:  if err := vm_binary_op(vm, .SUB);  err != nil do return err
+		case .MUL:  if err := vm_binary_op(vm, .MUL);  err != nil do return err
+		case .DIV:  if err := vm_binary_op(vm, .DIV);  err != nil do return err
+		case .MOD:  if err := vm_binary_op(vm, .MOD);  err != nil do return err
+		case .SHL:  if err := vm_binary_op(vm, .SHL);  err != nil do return err
+		case .SHR:  if err := vm_binary_op(vm, .SHR);  err != nil do return err
+		case .BAND: if err := vm_binary_op(vm, .BAND); err != nil do return err
+		case .BOR:  if err := vm_binary_op(vm, .BOR);  err != nil do return err
+		case .BXOR: if err := vm_binary_op(vm, .BXOR); err != nil do return err
 
-        case .SUB:
-            if err := vm_binary_op(vm, .SUB); err != nil do return err
+		case .BNOT:
+			a, err := vm_pop(vm); if err != nil do return err
+			av, ok := a.(i64); if !ok do return .TYPE_ERROR
+			if err2 := vm_push(vm, ~av); err2 != nil do return err2
 
-        case .MUL:
-            if err := vm_binary_op(vm, .MUL); err != nil do return err
+		case .NEGATE:
+			a, err := vm_pop(vm); if err != nil do return err
+			#partial switch av in a {
+			case i64: if err2 := vm_push(vm, -av); err2 != nil do return err2
+			case f64: if err2 := vm_push(vm, -av); err2 != nil do return err2
+			case:     return .TYPE_ERROR
+			}
 
-        case .DIV:
-            if err := vm_binary_op(vm, .DIV); err != nil do return err
+		case .EQ:
+			b, _ := vm_pop(vm); a, _ := vm_pop(vm)
+			if err := vm_push(vm, vm_values_equal(a, b)); err != nil do return err
 
-        case .MOD:
-            if err := vm_binary_op(vm, .MOD); err != nil do return err
+		case .NEQ:
+			b, _ := vm_pop(vm); a, _ := vm_pop(vm)
+			if err := vm_push(vm, !vm_values_equal(a, b)); err != nil do return err
 
-        case .SHL:
-            if err := vm_binary_op(vm, .SHL); err != nil do return err
+		case .LT:  if err := vm_compare(vm, .LT);  err != nil do return err
+		case .LTE: if err := vm_compare(vm, .LTE); err != nil do return err
+		case .GT:  if err := vm_compare(vm, .GT);  err != nil do return err
+		case .GTE: if err := vm_compare(vm, .GTE); err != nil do return err
 
-        case .SHR:
-            if err := vm_binary_op(vm, .SHR); err != nil do return err
+		case .NOT:
+			a, err := vm_pop(vm); if err != nil do return err
+			if err2 := vm_push(vm, is_falsy(a)); err2 != nil do return err2
 
-        case .BAND:
-            if err := vm_binary_op(vm, .BAND); err != nil do return err
+		case .POP:
+			_, err := vm_pop(vm); if err != nil do return err
 
-        case .BOR:
-            if err := vm_binary_op(vm, .BOR); err != nil do return err
+		case .PRINT:
+			a, err := vm_pop(vm); if err != nil do return err
+			print_value(a); fmt.println()
 
-        case .BXOR:
-            if err := vm_binary_op(vm, .BXOR); err != nil do return err
+		case .INPUT:
+			prompt, err := vm_pop(vm); if err != nil do return err
+			if s, ok := prompt.(string); ok && len(s) > 0 { fmt.printf("%s", s) }
+			tmp := read_line(vm.stdin)
+			interned := string_pool_intern(&vm.strings, tmp)
+			if raw_data(tmp) != raw_data(interned) { delete(tmp) }
+			vm_push(vm, interned)
 
-        case .BNOT:
-            a, err := vm_pop(vm)
-            if err != nil do return err
-            av, ok := a.(i64)
-            if !ok do return .TYPE_ERROR
-            if err2 := vm_push(vm, ~av); err2 != nil do return err2
+		case .DEFINE_GLOBAL:
+			name := read_constant(vm).(string)
+			top, _ := vm_peek(vm)
+			vm.globals[name] = top
+			vm_pop(vm)
 
-        case .NEGATE:
-            a, err := vm_pop(vm)
-            if err != nil do return err
-            #partial switch av in a {
-            case i64: if err := vm_push(vm, -av); err != nil do return err
-            case f64: if err := vm_push(vm, -av); err != nil do return err
-            case:     return .TYPE_ERROR
-            }
+		case .GET_GLOBAL:
+			name := read_constant(vm).(string)
+			val, ok := vm.globals[name]
+			if !ok do return .UNDEFINED_VARIABLE
+			if err := vm_push(vm, val); err != nil do return err
 
-        case .EQ:
-            b, _ := vm_pop(vm)
-            a, _ := vm_pop(vm)
-            if err := vm_push(vm, vm_values_equal(a, b)); err != nil do return err
+		case .SET_GLOBAL:
+			name := read_constant(vm).(string)
+			if !(name in vm.globals) do return .UNDEFINED_VARIABLE
+			top, _ := vm_peek(vm)
+			vm.globals[name] = top
 
-        case .NEQ:
-            b, _ := vm_pop(vm)
-            a, _ := vm_pop(vm)
-            if err := vm_push(vm, !vm_values_equal(a, b)); err != nil do return err
+		case .GET_LOCAL:
+			slot := u16(read_byte(vm))
+			frame := current_frame(vm)
+			if err := vm_push(vm, vm.stack[frame.slots + slot]); err != nil do return err
 
-        case .LT:
-            if err := vm_compare(vm, .LT); err != nil do return err
+		case .SET_LOCAL:
+			slot := u16(read_byte(vm))
+			frame := current_frame(vm)
+			top, _ := vm_peek(vm)
+			vm.stack[frame.slots + slot] = top
 
-        case .LTE:
-            if err := vm_compare(vm, .LTE); err != nil do return err
+		case .JUMP:
+			offset := read_short(vm)
+			current_frame(vm).ip += int(offset)
 
-        case .GT:
-            if err := vm_compare(vm, .GT); err != nil do return err
+		case .JUMP_IF_FALSE:
+			offset := read_short(vm)
+			top, _ := vm_peek(vm)
+			if is_falsy(top) { current_frame(vm).ip += int(offset) }
 
-        case .GTE:
-            if err := vm_compare(vm, .GTE); err != nil do return err
+		case .JUMP_IF_TRUE:
+			offset := read_short(vm)
+			top, _ := vm_peek(vm)
+			if !is_falsy(top) { current_frame(vm).ip += int(offset) }
 
-        case .NOT:
-            a, err := vm_pop(vm)
-            if err != nil do return err
-            if err := vm_push(vm, is_falsy(a)); err != nil do return err
+		case .LOOP:
+			offset := read_short(vm)
+			current_frame(vm).ip -= int(offset)
 
-        case .POP:
-            _, err := vm_pop(vm)
-            if err != nil do return err
+		case .CALL:
+			arg_count := u16(read_byte(vm))
+			if err := vm_call(vm, arg_count); err != nil do return err
 
-        case .PRINT:
-            a, err := vm_pop(vm)
-            if err != nil do return err
-            print_value(a)
-            fmt.println()
+		case .NEW:
+			n := int(read_byte(vm))
+			slots := make([]Value, n)
+			for i := n - 1; i >= 0; i -= 1 {
+				v, err := vm_pop(vm)
+				if err != nil { delete(slots); return err }
+				slots[i] = v
+			}
+			append(&vm.heap_objects, slots)
+			ptr: [^]Value = raw_data(slots)
+			if err := vm_push(vm, ptr); err != nil do return err
 
-        case .INPUT:
-            prompt, err := vm_pop(vm)
-            if err != nil do return err
-            if s, ok := prompt.(string); ok && len(s) > 0 {
-                fmt.printf("%s", s)
-            }
-            tmp := read_line(vm.stdin)
-            interned := string_pool_intern(&vm.strings, tmp)
-            if raw_data(tmp) != raw_data(interned) { delete(tmp) }
-            vm_push(vm, interned)
+		case .HEAP_GET:
+			offset := int(read_byte(vm))
+			pv, err := vm_pop(vm); if err != nil do return err
+			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			if ptr == nil do return .NULL_DEREF
+			if err2 := vm_push(vm, ptr[offset]); err2 != nil do return err2
 
-        case .DEFINE_GLOBAL:
-            name := read_constant(vm).(string)
-            top, _ := vm_peek(vm)
-            vm.globals[name] = top
-            vm_pop(vm)
+		case .HEAP_SET:
+			offset := int(read_byte(vm))
+			pv, err1 := vm_pop(vm); if err1 != nil do return err1
+			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			if ptr == nil do return .NULL_DEREF
+			val, err2 := vm_peek(vm); if err2 != nil do return err2
+			ptr[offset] = val
 
-        case .GET_GLOBAL:
-            name := read_constant(vm).(string)
-            val, ok := vm.globals[name]
-            if !ok do return .UNDEFINED_VARIABLE
-            if err := vm_push(vm, val); err != nil do return err
+		case .HEAP_LOAD:
+			n := int(read_byte(vm))
+			pv, err := vm_pop(vm); if err != nil do return err
+			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			if ptr == nil do return .NULL_DEREF
+			for i in 0..<n {
+				if err2 := vm_push(vm, ptr[i]); err2 != nil do return err2
+			}
 
-        case .SET_GLOBAL:
-            name := read_constant(vm).(string)
-            if !(name in vm.globals) do return .UNDEFINED_VARIABLE
-            top, _ := vm_peek(vm)
-            vm.globals[name] = top
+		case .NOP:
+			// nothing
 
-        case .GET_LOCAL:
-            slot := u16(read_byte(vm))
-            frame := current_frame(vm)
-            if err := vm_push(vm, vm.stack[frame.slots + slot]); err != nil do return err
+		case .ADD_LOCALS:
+			a := u16(read_byte(vm))
+			b := u16(read_byte(vm))
+			frame := current_frame(vm)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if err := vm_push(vm, av + bv); err != nil do return err
 
-        case .SET_LOCAL:
-            slot := u16(read_byte(vm))
-            frame := current_frame(vm)
-            top, _ := vm_peek(vm)
-            vm.stack[frame.slots + slot] = top
+		case .MUL_LOCALS:
+			a := u16(read_byte(vm))
+			b := u16(read_byte(vm))
+			frame := current_frame(vm)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if err := vm_push(vm, av * bv); err != nil do return err
 
-        // --- control flow ---
-        case .JUMP:
-            offset := read_short(vm)
-            current_frame(vm).ip += int(offset)
+		case .LT_LOCAL_CONST:
+			slot := u16(read_byte(vm))
+			hi   := u16(read_byte(vm))
+			lo   := u16(read_byte(vm))
+			frame := current_frame(vm)
+			av, ok1 := vm.stack[frame.slots + slot].(i64)
+			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if err := vm_push(vm, av < bv); err != nil do return err
 
-        case .JUMP_IF_FALSE:
-            offset := read_short(vm)
-            top, _ := vm_peek(vm)
-            if is_falsy(top) {
-                current_frame(vm).ip += int(offset)
-            }
+		case .LTE_LOCAL_CONST:
+			slot := u16(read_byte(vm))
+			hi   := u16(read_byte(vm))
+			lo   := u16(read_byte(vm))
+			frame := current_frame(vm)
+			av, ok1 := vm.stack[frame.slots + slot].(i64)
+			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if err := vm_push(vm, av <= bv); err != nil do return err
 
-        case .JUMP_IF_TRUE:
-            offset := read_short(vm)
-            top, _ := vm_peek(vm)
-            if !is_falsy(top) {
-                current_frame(vm).ip += int(offset)
-            }
+		case .SUB_LOCAL_CONST:
+			slot := u16(read_byte(vm))
+			hi   := u16(read_byte(vm))
+			lo   := u16(read_byte(vm))
+			frame := current_frame(vm)
+			av, ok1 := vm.stack[frame.slots + slot].(i64)
+			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if err := vm_push(vm, av - bv); err != nil do return err
 
-        case .LOOP:
-            offset := read_short(vm)
-            current_frame(vm).ip -= int(offset)
-
-        case .CALL:
-            arg_count := u16(read_byte(vm))
-            if err := vm_call(vm, arg_count); err != nil do return err
-
-        case .NEW:
-            n := int(read_byte(vm))
-            slots := make([]Value, n)
-            for i := n - 1; i >= 0; i -= 1 {
-                v, err := vm_pop(vm)
-                if err != nil { delete(slots); return err }
-                slots[i] = v
-            }
-            append(&vm.heap_objects, slots)
-            ptr: [^]Value = raw_data(slots)
-            if err := vm_push(vm, ptr); err != nil { return err }
-
-        case .HEAP_GET:
-            offset := int(read_byte(vm))
-            pv, err := vm_pop(vm)
-            if err != nil do return err
-            ptr, ok := pv.([^]Value)
-            if !ok do return .TYPE_ERROR
-            if ptr == nil do return .NULL_DEREF
-            if err2 := vm_push(vm, ptr[offset]); err2 != nil do return err2
-
-        case .HEAP_SET:
-            // Stack before: [..., value, ptr]  ptr is on top
-            offset := int(read_byte(vm))
-            pv, err1 := vm_pop(vm)    // pop ptr
-            if err1 != nil do return err1
-            ptr, ok := pv.([^]Value)
-            if !ok do return .TYPE_ERROR
-            if ptr == nil do return .NULL_DEREF
-            val, err2 := vm_peek(vm)  // peek value (stays on stack, SET semantics)
-            if err2 != nil do return err2
-            ptr[offset] = val
-
-        case .HEAP_LOAD:
-            // Pop pointer, push N consecutive slots from heap.
-            n := int(read_byte(vm))
-            pv, err := vm_pop(vm)
-            if err != nil do return err
-            ptr, ok := pv.([^]Value)
-            if !ok do return .TYPE_ERROR
-            if ptr == nil do return .NULL_DEREF
-            for i in 0..<n {
-                if err2 := vm_push(vm, ptr[i]); err2 != nil do return err2
-            }
-
-        case .RETURN:
-            n := int(read_byte(vm))
-            // save top-n return values in order (lowest first)
-            tmp: [256]Value
-            for i := n - 1; i >= 0; i -= 1 {
-                v, pop_err := vm_pop(vm)
-                if pop_err != nil do return pop_err
-                tmp[i] = v
-            }
-
-            vm.frame_count -= 1
-            if vm.frame_count == 0 {
-                for i in 0..<n { vm.stack[i] = tmp[i] }
-                vm.stack_top = u16(n)
-                return nil
-            }
-
-            frame := &vm.frames[vm.frame_count]
-            vm.stack_top = frame.slots
-
-            for i in 0..<n {
-                if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
-            }
-        }
-    }
-}
-
-is_falsy :: proc(val: Value) -> bool {
-    switch v in val {
-    case bool:      return !v
-    case Nil:       return true
-    case i64:       return false
-    case f64:       return false
-    case string:    return false
-    case ^Function:  return false
-    case [^]Value:   return v == nil
-    }
-    return true
-}
-
-read_line :: proc(src: io.Reader) -> string {
-    r := src if src.data != nil else io.Reader(os.to_reader(os.stdin))
-    b := strings.builder_make()
-    buf := [1]byte{}
-    for {
-        n, err := io.read(r, buf[:])
-        if n > 0 {
-            if buf[0] == '\n' { break }
-            if buf[0] != '\r' { strings.write_byte(&b, buf[0]) }
-        }
-        if err != nil { break }
-    }
-    return strings.to_string(b)
-}
-
-print_value :: proc(val: Value) {
-    switch v in val {
-    case i64:       fmt.printf("%d", v)
-    case f64:       fmt.printf("%g", v)
-    case bool:      fmt.printf("%t", v)
-    case string:    fmt.printf("%s", v)
-    case Nil:       fmt.printf("nil")
-    case ^Function: fmt.printf("<fn %s>", v.name)
-    case [^]Value:
-        if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
-    }
-}
-
-// String comparison uses pointer equality — valid because all VM strings are interned.
-vm_values_equal :: proc(a, b: Value) -> bool {
-    if as, ok := a.(string); ok {
-        if bs, ok2 := b.(string); ok2 {
-            return raw_data(as) == raw_data(bs)
-        }
-        return false
-    }
-    return bc.values_equal(a, b)
-}
-
-vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
-    b, err1 := vm_pop(vm)
-    if err1 != nil do return err1
-    a, err2 := vm_pop(vm)
-    if err2 != nil do return err2
-    #partial switch av in a {
-    case i64:
-        bv, ok := b.(i64)
-        if !ok do return .TYPE_ERROR
-        #partial switch op {
-        case .SUB: return vm_push(vm, av - bv)
-        case .MUL: return vm_push(vm, av * bv)
-        case .DIV:
-            if bv == 0 do return .DIVISION_BY_ZERO
-            return vm_push(vm, av / bv)
-        case .MOD:
-            if bv == 0 do return .DIVISION_BY_ZERO
-            return vm_push(vm, av % bv)
-        case .SHL:  return vm_push(vm, av << uint(bv))
-        case .SHR:  return vm_push(vm, av >> uint(bv))
-        case .BAND: return vm_push(vm, av & bv)
-        case .BOR:  return vm_push(vm, av | bv)
-        case .BXOR: return vm_push(vm, av ~ bv)
-        }
-    case f64:
-        bv, ok := b.(f64)
-        if !ok do return .TYPE_ERROR
-        #partial switch op {
-        case .SUB: return vm_push(vm, av - bv)
-        case .MUL: return vm_push(vm, av * bv)
-        case .DIV:
-            if bv == 0 do return .DIVISION_BY_ZERO
-            return vm_push(vm, av / bv)
-        case .MOD: return .TYPE_ERROR
-        }
-    case: return .TYPE_ERROR
-    }
-    return nil
-}
-
-vm_compare :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
-    b, _ := vm_pop(vm)
-    a, _ := vm_pop(vm)
-    #partial switch av in a {
-    case i64:
-        bv, ok := b.(i64)
-        if !ok do return .TYPE_ERROR
-        #partial switch op {
-        case .LT:  return vm_push(vm, av < bv)
-        case .LTE: return vm_push(vm, av <= bv)
-        case .GT:  return vm_push(vm, av > bv)
-        case .GTE: return vm_push(vm, av >= bv)
-        }
-    case f64:
-        bv, ok := b.(f64)
-        if !ok do return .TYPE_ERROR
-        #partial switch op {
-        case .LT:  return vm_push(vm, av < bv)
-        case .LTE: return vm_push(vm, av <= bv)
-        case .GT:  return vm_push(vm, av > bv)
-        case .GTE: return vm_push(vm, av >= bv)
-        }
-    case: return .TYPE_ERROR
-    }
-    return nil
-}
-
-vm_call :: proc(vm: ^VM, arg_count: u16) -> Maybe(VMError) {
-    callee := vm.stack[vm.stack_top - 1 - arg_count]
-    fn, ok := callee.(^Function)
-    if !ok do return .CALL_NON_FUNCTION
-    if arg_count != u16(fn.arity) do return .WRONG_ARG_COUNT
-    if vm.frame_count >= FRAMES_MAX do return .STACK_OVERFLOW
-
-    frame := &vm.frames[vm.frame_count]
-    vm.frame_count += 1
-    frame.function = fn
-    frame.ip       = 0
-    frame.slots    = vm.stack_top - arg_count - 1
-    return nil
+		case .RETURN:
+			n := int(read_byte(vm))
+			tmp: [256]Value
+			for i := n - 1; i >= 0; i -= 1 {
+				v, pop_err := vm_pop(vm)
+				if pop_err != nil do return pop_err
+				tmp[i] = v
+			}
+			vm.frame_count -= 1
+			if vm.frame_count == 0 {
+				for i in 0..<n { vm.stack[i] = tmp[i] }
+				vm.stack_top = u16(n)
+				return nil
+			}
+			frame := &vm.frames[vm.frame_count]
+			vm.stack_top = frame.slots
+			for i in 0..<n {
+				if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
+			}
+		}
+	}
 }
 
 vm_interpret :: proc(vm: ^VM, fn: ^Function) -> Maybe(VMError) {
-    vm_push(vm, Value(fn))
+	vm_push(vm, Value(fn))
 
-    frame := &vm.frames[0]
-    vm.frame_count = 1
-    frame.function = fn
-    frame.ip       = 0
-    frame.slots    = 0
+	frame := &vm.frames[0]
+	vm.frame_count = 1
+	frame.function = fn
+	frame.ip       = 0
+	frame.slots    = 0
 
-    return vm_run(vm)
+	return vm_run(vm)
+}
+
+is_falsy :: proc(val: Value) -> bool {
+	switch v in val {
+	case bool:      return !v
+	case Nil:       return true
+	case i64:       return false
+	case f64:       return false
+	case string:    return false
+	case ^Function: return false
+	case [^]Value:  return v == nil
+	}
+	return true
+}
+
+read_line :: proc(src: io.Reader) -> string {
+	r := src if src.data != nil else io.Reader(os.to_reader(os.stdin))
+	b := strings.builder_make()
+	buf := [1]byte{}
+	for {
+		n, err := io.read(r, buf[:])
+		if n > 0 {
+			if buf[0] == '\n' { break }
+			if buf[0] != '\r' { strings.write_byte(&b, buf[0]) }
+		}
+		if err != nil { break }
+	}
+	return strings.to_string(b)
+}
+
+print_value :: proc(val: Value) {
+	switch v in val {
+	case i64:      fmt.printf("%d", v)
+	case f64:      fmt.printf("%g", v)
+	case bool:     fmt.printf("%t", v)
+	case string:   fmt.printf("%s", v)
+	case Nil:      fmt.printf("nil")
+	case ^Function: fmt.printf("<fn %s>", v.name)
+	case [^]Value:
+		if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
+	}
+}
+
+vm_values_equal :: proc(a, b: Value) -> bool {
+	if as, ok := a.(string); ok {
+		if bs, ok2 := b.(string); ok2 {
+			return raw_data(as) == raw_data(bs)
+		}
+		return false
+	}
+	return bc.values_equal(a, b)
+}
+
+vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+	b, err1 := vm_pop(vm); if err1 != nil do return err1
+	a, err2 := vm_pop(vm); if err2 != nil do return err2
+	#partial switch av in a {
+	case i64:
+		bv, ok := b.(i64); if !ok do return .TYPE_ERROR
+		#partial switch op {
+		case .SUB: return vm_push(vm, av - bv)
+		case .MUL: return vm_push(vm, av * bv)
+		case .DIV:
+			if bv == 0 do return .DIVISION_BY_ZERO
+			return vm_push(vm, av / bv)
+		case .MOD:
+			if bv == 0 do return .DIVISION_BY_ZERO
+			return vm_push(vm, av % bv)
+		case .SHL:  return vm_push(vm, av << uint(bv))
+		case .SHR:  return vm_push(vm, av >> uint(bv))
+		case .BAND: return vm_push(vm, av & bv)
+		case .BOR:  return vm_push(vm, av | bv)
+		case .BXOR: return vm_push(vm, av ~ bv)
+		}
+	case f64:
+		bv, ok := b.(f64); if !ok do return .TYPE_ERROR
+		#partial switch op {
+		case .SUB: return vm_push(vm, av - bv)
+		case .MUL: return vm_push(vm, av * bv)
+		case .DIV:
+			if bv == 0 do return .DIVISION_BY_ZERO
+			return vm_push(vm, av / bv)
+		case .MOD: return .TYPE_ERROR
+		}
+	case: return .TYPE_ERROR
+	}
+	return nil
+}
+
+vm_compare :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+	b, _ := vm_pop(vm)
+	a, _ := vm_pop(vm)
+	#partial switch av in a {
+	case i64:
+		bv, ok := b.(i64); if !ok do return .TYPE_ERROR
+		#partial switch op {
+		case .LT:  return vm_push(vm, av < bv)
+		case .LTE: return vm_push(vm, av <= bv)
+		case .GT:  return vm_push(vm, av > bv)
+		case .GTE: return vm_push(vm, av >= bv)
+		}
+	case f64:
+		bv, ok := b.(f64); if !ok do return .TYPE_ERROR
+		#partial switch op {
+		case .LT:  return vm_push(vm, av < bv)
+		case .LTE: return vm_push(vm, av <= bv)
+		case .GT:  return vm_push(vm, av > bv)
+		case .GTE: return vm_push(vm, av >= bv)
+		}
+	case: return .TYPE_ERROR
+	}
+	return nil
+}
+
+vm_call :: proc(vm: ^VM, arg_count: u16) -> Maybe(VMError) {
+	callee := vm.stack[vm.stack_top - 1 - arg_count]
+	fn, ok := callee.(^Function)
+	if !ok do return .CALL_NON_FUNCTION
+	if arg_count != u16(fn.arity) do return .WRONG_ARG_COUNT
+	if vm.frame_count >= FRAMES_MAX do return .STACK_OVERFLOW
+
+	frame := &vm.frames[vm.frame_count]
+	vm.frame_count += 1
+	frame.function = fn
+	frame.ip       = 0
+	frame.slots    = vm.stack_top - arg_count - 1
+	return nil
 }

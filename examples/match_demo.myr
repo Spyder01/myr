@@ -1,0 +1,20 @@
+enum Shape {
+    Circle { radius: i64 },
+    Rect   { w: i64, h: i64 },
+}
+
+function describe(s: Shape) -> i64 {
+    match s {
+        Shape.Circle { radius } => { return radius }
+        Shape.Rect   { w, h }  => { return w + h }
+    }
+    return 0
+}
+
+function main() {
+    let circle = Shape.Circle { radius = 7 }
+    let rect   = Shape.Rect   { w = 10, h = 4 }
+
+    print(describe(circle))
+    print(describe(rect))
+}

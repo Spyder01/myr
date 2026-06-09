@@ -73,7 +73,33 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 			field_types = field_types,
 		})
 
-	case parser.EnumDecl, parser.ImportDecl:
+	case parser.EnumDecl:
+		variants := make([]EnumVariantInfo, len(d.variants))
+		for variant, vi in d.variants {
+			start := int(variant.field_start)
+			end := len(d.fields)
+			if vi + 1 < len(d.variants) {
+				end = int(d.variants[vi + 1].field_start)
+			}
+			variant_fields := d.fields[start:end]
+			n := len(variant_fields)
+			fnames := make([]string, n)
+			ftypes := make([]TypeId, n)
+			for field, i in variant_fields {
+				fnames[i] = field.name.data
+				ftypes[i] = resolve_named_type(tc, field.type)
+			}
+			variants[vi] = EnumVariantInfo{
+				name        = variant.name.data,
+				field_names = fnames,
+				field_types = ftypes,
+			}
+		}
+		et_id := TypeId(len(tc.type_table))
+		append(&tc.type_table, TypeInfo(EnumType{name = d.name.data, variants = variants}))
+		tc.types[int(def)] = et_id
+
+	case parser.ImportDecl:
 	}
 }
 
@@ -240,7 +266,58 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		return UNKNOWN_TYPE
 
 	case parser.MatchExpression:
-		return UNKNOWN_TYPE
+		subj_type := infer(tc, e.subject)
+		// Check for a wildcard arm first — a wildcard makes the match trivially exhaustive.
+		has_wildcard := false
+		for arm in e.arms {
+			pat_node := tc.ast.nodes[int(arm.pattern)]
+			if pat_expr, ok2 := pat_node.(parser.Expression); ok2 {
+				if ident, ok3 := pat_expr.(parser.IdentExpression); ok3 {
+					if lexer.Token(ident).data == "_" {
+						has_wildcard = true
+						break
+					}
+				}
+			}
+		}
+		if !has_wildcard && subj_type != UNKNOWN_TYPE && int(subj_type) < len(tc.type_table) {
+			if et, ok2 := tc.type_table[int(subj_type)].(EnumType); ok2 {
+				for variant in et.variants {
+					arm_covers := false
+					for arm in e.arms {
+						pat_node := tc.ast.nodes[int(arm.pattern)]
+						if pat_expr, ok3 := pat_node.(parser.Expression); ok3 {
+							if ep, ok4 := pat_expr.(parser.EnumLiteralExpression); ok4 {
+								if ep.variant_name.data == variant.name {
+									arm_covers = true
+									break
+								}
+							}
+						}
+					}
+					if !arm_covers {
+						tc_error_msg(tc, tc.ast.spans[int(idx)],
+							fmt.tprintf("non-exhaustive match: variant '%s' not covered", variant.name))
+					}
+				}
+			}
+		}
+
+		// Infer result type: collect arm body types, skip VOID_TYPE (statement arms),
+		// unify the rest. Mismatched arm types are a type error.
+		result_type := UNKNOWN_TYPE
+		for arm in e.arms {
+			arm_type := infer(tc, arm.body)
+			if arm_type == VOID_TYPE || arm_type == UNKNOWN_TYPE {
+				continue
+			}
+			if result_type == UNKNOWN_TYPE {
+				result_type = arm_type
+			} else if result_type != arm_type {
+				tc_error(tc, tc.ast.spans[int(arm.body)], result_type, arm_type)
+			}
+		}
+		return result_type
 
 	case parser.StructLiteralExpression:
 		return infer_struct_literal(tc, idx, e)
@@ -281,6 +358,9 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 			return UNKNOWN_TYPE
 		}
 		return pt.inner
+
+	case parser.EnumLiteralExpression:
+		return infer_enum_literal(tc, idx, e)
 	}
 	return UNKNOWN_TYPE
 }
@@ -465,6 +545,9 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 			if st, ok2 := info.(StructType); ok2 && st.name == name {
 				return TypeId(i)
 			}
+			if et, ok2 := info.(EnumType); ok2 && et.name == name {
+				return TypeId(i)
+			}
 		}
 		return UNKNOWN_TYPE
 
@@ -587,6 +670,52 @@ infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parse
 	tc_error_msg(tc, e.field.span,
 		fmt.tprintf("no field '%s' on struct '%s'", e.field.data, st.name))
 	return UNKNOWN_TYPE
+}
+
+@private
+infer_enum_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.EnumLiteralExpression) -> TypeId {
+	enum_type_id := UNKNOWN_TYPE
+	found_et: EnumType
+	for info, i in tc.type_table {
+		if et, ok := info.(EnumType); ok && et.name == e.enum_name.data {
+			enum_type_id = TypeId(i)
+			found_et = et
+			break
+		}
+	}
+	if enum_type_id == UNKNOWN_TYPE {
+		tc_error_msg(tc, tc.ast.spans[int(idx)], fmt.tprintf("undefined enum '%s'", e.enum_name.data))
+		return UNKNOWN_TYPE
+	}
+	found_variant: EnumVariantInfo
+	variant_found := false
+	for v in found_et.variants {
+		if v.name == e.variant_name.data {
+			found_variant = v
+			variant_found = true
+			break
+		}
+	}
+	if !variant_found {
+		tc_error_msg(tc, tc.ast.spans[int(idx)],
+			fmt.tprintf("unknown variant '%s' on enum '%s'", e.variant_name.data, e.enum_name.data))
+		return UNKNOWN_TYPE
+	}
+	for lit_field in e.fields {
+		field_found := false
+		for j in 0..<len(found_variant.field_names) {
+			if found_variant.field_names[j] == lit_field.name.data {
+				check(tc, lit_field.value, found_variant.field_types[j])
+				field_found = true
+				break
+			}
+		}
+		if !field_found {
+			tc_error_msg(tc, tc.ast.spans[int(idx)],
+				fmt.tprintf("unknown field '%s' on variant '%s'", lit_field.name.data, e.variant_name.data))
+		}
+	}
+	return enum_type_id
 }
 
 @private

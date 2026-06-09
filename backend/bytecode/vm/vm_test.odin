@@ -623,3 +623,350 @@ test_heap_load_null_deref :: proc(t: ^testing.T) {
 	defer bc.function_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
 }
+
+// ---- enum stack layout (opcode-level) ----
+// Stack-allocated enum layout: slot 0 = i64 discriminant, slots 1..N = fields, NIL padding.
+// Example: enum Shape { Circle{radius:float}, Rect{w:float, h:float} }
+//   Circle → [disc=0, radius, nil]  (total_slots=3)
+//   Rect   → [disc=1, w, h]         (total_slots=3)
+// In opcode tests the function value occupies local slot 0 (stack[0]).
+// Pushing enum values directly produces the flat inline representation.
+
+@(test)
+test_enum_stack_circle_discriminant :: proc(t: ^testing.T) {
+	// Push Circle: [disc=0, radius=5.0, pad=nil]. Read discriminant at slot 1.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(0), span)   // discriminant = 0 (Circle)
+		bc.emit_constant(c, f64(5.0), span) // radius field
+		bc.emit(c, .NIL, span)              // NIL padding
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 1, span)            // slot 1 = discriminant
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(0))
+}
+
+@(test)
+test_enum_stack_circle_field_value :: proc(t: ^testing.T) {
+	// Push Circle: [disc=0, radius=5.0, pad=nil]. Read radius at slot 2.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(0), span)
+		bc.emit_constant(c, f64(5.0), span)
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 2, span)            // slot 2 = radius
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(f64), f64(5.0))
+}
+
+@(test)
+test_enum_stack_circle_padding_is_nil :: proc(t: ^testing.T) {
+	// Push Circle: [disc=0, radius=5.0, pad=nil]. Padding slot must be Nil.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(0), span)
+		bc.emit_constant(c, f64(5.0), span)
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 3, span)            // slot 3 = padding
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	_, is_nil := run_top(fn).(Nil)
+	testing.expect(t, is_nil, "padding slot must be nil")
+}
+
+@(test)
+test_enum_stack_rect_discriminant :: proc(t: ^testing.T) {
+	// Push Rect: [disc=1, w=10.0, h=4.0]. Read discriminant at slot 1.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span)    // discriminant = 1 (Rect)
+		bc.emit_constant(c, f64(10.0), span) // w field
+		bc.emit_constant(c, f64(4.0), span)  // h field
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 1, span)
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(1))
+}
+
+@(test)
+test_enum_stack_rect_first_field :: proc(t: ^testing.T) {
+	// Push Rect: [disc=1, w=10.0, h=4.0]. Read w at slot 2.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span)
+		bc.emit_constant(c, f64(10.0), span)
+		bc.emit_constant(c, f64(4.0), span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 2, span)             // slot 2 = w
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(f64), f64(10.0))
+}
+
+@(test)
+test_enum_stack_rect_second_field :: proc(t: ^testing.T) {
+	// Push Rect: [disc=1, w=10.0, h=4.0]. Read h at slot 3.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span)
+		bc.emit_constant(c, f64(10.0), span)
+		bc.emit_constant(c, f64(4.0), span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 3, span)             // slot 3 = h
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(f64), f64(4.0))
+}
+
+@(test)
+test_enum_stack_two_variants_distinct_discriminants :: proc(t: ^testing.T) {
+	// Circle at slots 1,2,3 (disc=0) and Rect at slots 4,5,6 (disc=1).
+	// Verify Rect discriminant at slot 4 is distinct from Circle's at slot 1.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(0), span)   // Circle: disc=0
+		bc.emit_constant(c, f64(5.0), span) // radius
+		bc.emit(c, .NIL, span)              // padding
+		bc.emit_constant(c, i64(1), span)   // Rect: disc=1
+		bc.emit_constant(c, f64(10.0), span)
+		bc.emit_constant(c, f64(4.0), span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 4, span)            // Rect discriminant at slot 4
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(1))
+}
+
+@(test)
+test_enum_stack_reassign_updates_discriminant :: proc(t: ^testing.T) {
+	// Store Circle at slots 1,2,3, then overwrite in-place with Rect via SET_LOCAL.
+	// Discriminant at slot 1 must become 1 (Rect) after the reassignment.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		// initial Circle: [0, 5.0, nil]
+		bc.emit_constant(c, i64(0), span)
+		bc.emit_constant(c, f64(5.0), span)
+		bc.emit(c, .NIL, span)
+		// push new Rect values above existing slots, then write them in reverse
+		bc.emit_constant(c, i64(1), span)    // new disc
+		bc.emit_constant(c, f64(10.0), span) // new w
+		bc.emit_constant(c, f64(4.0), span)  // new h
+		bc.emit(c, .SET_LOCAL, span); bc.emit_byte(c, 3, span); bc.emit(c, .POP, span)
+		bc.emit(c, .SET_LOCAL, span); bc.emit_byte(c, 2, span); bc.emit(c, .POP, span)
+		bc.emit(c, .SET_LOCAL, span); bc.emit_byte(c, 1, span); bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span)
+		bc.emit_byte(c, 1, span)             // discriminant must now be 1
+		bc.emit(c, .RETURN, span)
+		bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(1))
+}
+
+// ---- match expression (opcode-level) ----
+// These tests emit the bytecode pattern that compile_match generates and verify
+// the VM executes it correctly. They are independent of the compiler so they run
+// fast without the full-pipeline memory pressure.
+//
+// 2-slot enum used in tests 1, 2, 4 (disc + 1 field):
+//   Ok { code: i64 } → disc=0   Err { code: i64 } → disc=1   total_slots=2
+//
+// Stack layout (frame.slots=0, so GET_LOCAL N == vm.stack[N]):
+//   slot 0: fn value     (pushed by vm_interpret)
+//   slot 1: disc         (enum variable)
+//   slot 2: code         (enum variable field)
+//   slot 3: copy_disc    (subject copy, subj_slot=3)
+//   slot 4: copy_code
+//   slot 5: binding      (pushed inside the matching arm)
+//
+// 3-slot enum used in test 3: Rect { w, h } disc=1 total_slots=3
+//   slot 0:fn  1:disc  2:w  3:h  4:copy_disc(subj_slot=4)  5:copy_w  6:copy_h
+//   slot 7: binding w    slot 8: binding h
+
+@(test)
+test_vm_match_first_arm_fires :: proc(t: ^testing.T) {
+	// Subject = Ok { code=77 }. Arm 0 (disc=0) fires; binding at slot 5 is readable.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		// enum variable
+		bc.emit_constant(c, i64(0), span)              // disc=0 → slot 1
+		bc.emit_constant(c, i64(77), span)             // code   → slot 2
+		// subject copy
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 1, span) // copy disc → slot 3
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 2, span) // copy code → slot 4
+
+		// arm 0: Ok (disc=0)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(0), span)
+		bc.emit(c, .EQ, span)
+		arm0_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)                         // pop true
+
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span) // push binding → slot 5
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span) // read binding
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+
+		bc.patch_jump(c, arm0_skip)
+		bc.emit(c, .POP, span)                         // pop false
+
+		// arm 1: Err (disc=1) — not reached; present for structural completeness
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(1), span)
+		bc.emit(c, .EQ, span)
+		arm1_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+		bc.patch_jump(c, arm1_skip)
+		bc.emit(c, .POP, span)
+
+		bc.emit(c, .POP, span); bc.emit(c, .POP, span) // pop copy
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(77))
+}
+
+@(test)
+test_vm_match_second_arm_fires :: proc(t: ^testing.T) {
+	// Subject = Err { code=42 }. Arm 0 misses; arm 1 (disc=1) fires.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span)              // disc=1 → slot 1
+		bc.emit_constant(c, i64(42), span)             // code   → slot 2
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 1, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 2, span)
+
+		// arm 0: Ok (disc=0) — misses
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(0), span)
+		bc.emit(c, .EQ, span)
+		arm0_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+		bc.patch_jump(c, arm0_skip)
+		bc.emit(c, .POP, span)
+
+		// arm 1: Err (disc=1) — fires
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(1), span)
+		bc.emit(c, .EQ, span)
+		arm1_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span) // push binding → slot 5
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span) // read binding
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+		bc.patch_jump(c, arm1_skip)
+		bc.emit(c, .POP, span)
+
+		bc.emit(c, .POP, span); bc.emit(c, .POP, span)
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(42))
+}
+
+@(test)
+test_vm_match_two_field_bindings :: proc(t: ^testing.T) {
+	// 3-slot enum: Rect { w: i64, h: i64 } (disc=1, total_slots=3).
+	// Subject = Rect { w=3, h=7 }. Body computes w+h=10.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(1), span) // disc=1 → slot 1
+		bc.emit_constant(c, i64(3), span) // w=3    → slot 2
+		bc.emit_constant(c, i64(7), span) // h=7    → slot 3
+		// subject copy (subj_slot=4)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 1, span) // copy disc → slot 4
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 2, span) // copy w    → slot 5
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span) // copy h    → slot 6
+
+		// arm: Rect (disc=1)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span)
+		bc.emit_constant(c, i64(1), span)
+		bc.emit(c, .EQ, span)
+		skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span) // push binding w → slot 7
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 6, span) // push binding h → slot 8
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 7, span) // read w
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 8, span) // read h
+		bc.emit(c, .ADD, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+
+		bc.patch_jump(c, skip)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .POP, span); bc.emit(c, .POP, span); bc.emit(c, .POP, span) // pop 3-slot copy
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	testing.expect_value(t, run_top(fn).(i64), i64(10))
+}
+
+@(test)
+test_vm_match_no_arm_produces_nil :: proc(t: ^testing.T) {
+	// Subject disc=99 matches neither arm. Match falls through to NIL.
+	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+		span := dummy_span()
+		bc.emit_constant(c, i64(99), span) // disc=99 → slot 1
+		bc.emit_constant(c, i64(0), span)  // dummy   → slot 2
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 1, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 2, span)
+
+		// arm 0: disc=0 — misses
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(0), span)
+		bc.emit(c, .EQ, span)
+		arm0_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+		bc.patch_jump(c, arm0_skip)
+		bc.emit(c, .POP, span)
+
+		// arm 1: disc=1 — misses
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 3, span)
+		bc.emit_constant(c, i64(1), span)
+		bc.emit(c, .EQ, span)
+		arm1_skip, _ := bc.emit_jump(c, .JUMP_IF_FALSE, span)
+		bc.emit(c, .POP, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 4, span)
+		bc.emit(c, .GET_LOCAL, span); bc.emit_byte(c, 5, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+		bc.patch_jump(c, arm1_skip)
+		bc.emit(c, .POP, span)
+
+		bc.emit(c, .POP, span); bc.emit(c, .POP, span) // pop copy
+		bc.emit(c, .NIL, span)
+		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
+	})
+	defer bc.function_free(fn)
+	_, is_nil := run_top(fn).(Nil)
+	testing.expect(t, is_nil, "unmatched match must produce nil")
+}

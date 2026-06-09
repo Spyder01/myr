@@ -2,6 +2,7 @@ package bytecode
 
 import "../../parser"
 import "../../lexer"
+import tc "../../tree-walkers/typechecker"
 import "core:strconv"
 import "core:fmt"
 import "core:strings"
@@ -26,6 +27,18 @@ StructLayout :: struct {
 	total_slots:        int,
 }
 
+EnumVariantLayout :: struct {
+	discriminant:  int,
+	field_names:   []string,
+	field_offsets: []int, // 0-based within the variant (does not include the discriminant slot)
+	total_slots:   int,   // number of field slots for this variant only (not including discriminant)
+}
+
+EnumLayout :: struct {
+	total_slots: int,              // 1 (discriminant) + max(variant.total_slots) across all variants
+	variants:    map[string]EnumVariantLayout,
+}
+
 Compiler :: struct {
 	bc:             ByteCodeCompiler,
 	ast:            ^parser.AST,
@@ -34,14 +47,20 @@ Compiler :: struct {
 	loop_ctx:       ^LoopCtx,
 	const_table:    map[string]Value,
 	struct_layouts: map[string]StructLayout,
+	enum_layouts:   map[string]EnumLayout,
+	tc_types:       []tc.TypeId,   // nil when type checker output is unavailable
+	tc_type_table:  []tc.TypeInfo, // nil when type checker output is unavailable
 }
 
-new_compiler :: proc(ast: ^parser.AST) -> Compiler {
+new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
 	return Compiler{
 		bc             = new_bytecode_compiler("__main__", 0),
 		ast            = ast,
 		const_table    = make(map[string]Value),
 		struct_layouts = make(map[string]StructLayout),
+		enum_layouts   = make(map[string]EnumLayout),
+		tc_types       = tc_types,
+		tc_type_table  = tc_type_table,
 	}
 }
 
@@ -50,8 +69,8 @@ compiler_destroy :: proc(c: ^Compiler) {
 	delete(c.const_table)
 }
 
-compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
-	c := new_compiler(ast)
+compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Function, []CompilerError) {
+	c := new_compiler(ast, tc_types, tc_type_table)
 
 	// Two-pass struct layout building: the first pass registers all struct names
 	// so the second pass can correctly resolve forward references (e.g. Monkey
@@ -62,6 +81,15 @@ compile :: proc(ast: ^parser.AST) -> (^Function, []CompilerError) {
 				if sd, ok2 := decl.(parser.StructDecl); ok2 {
 					c.struct_layouts[sd.name.data] = build_struct_layout(&c, sd)
 				}
+			}
+		}
+	}
+
+	// Build enum layouts (single pass; enum fields are scalar types only in Phase 1).
+	for node in ast.nodes {
+		if decl, ok := node.(parser.Declaration); ok {
+			if ed, ok2 := decl.(parser.EnumDecl); ok2 {
+				c.enum_layouts[ed.name.data] = build_enum_layout(&c, ed)
 			}
 		}
 	}
@@ -116,17 +144,24 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 		layout := build_struct_layout(c, d)
 		c.struct_layouts[d.name.data] = layout
 	case parser.EnumDecl:
+		layout := build_enum_layout(c, d)
+		c.enum_layouts[d.name.data] = layout
 	}
 }
 
 compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span) {
-	// Compute total slot count for arity: a struct param occupies N slots.
+	// Compute total slot count for arity: struct and enum params occupy N slots each.
 	total_param_slots := 0
 	for param in d.params {
 		struct_name := type_ann_struct_name(c, param.type)
+		enum_name   := type_ann_enum_name(c, param.type)
 		slots := 1
 		if struct_name != "" {
 			if layout, ok := c.struct_layouts[struct_name]; ok {
+				slots = layout.total_slots
+			}
+		} else if enum_name != "" {
+			if layout, ok := c.enum_layouts[enum_name]; ok {
 				slots = layout.total_slots
 			}
 		}
@@ -141,19 +176,24 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 	// parameters start at slot 1; register each with its actual slot count
 	for param in d.params {
 		struct_name := type_ann_struct_name(c, param.type)
+		enum_name   := type_ann_enum_name(c, param.type)
 		ptr_inner   := type_ann_ptr_inner(c, param.type)
 		slots := 1
 		if struct_name != "" {
 			if layout, ok := c.struct_layouts[struct_name]; ok {
 				slots = layout.total_slots
 			}
+		} else if enum_name != "" {
+			if layout, ok := c.enum_layouts[enum_name]; ok {
+				slots = layout.total_slots
+			}
 		}
-		add_local(&fn_compiler, param.name.data, slots, struct_name, ptr_inner)
+		add_local(&fn_compiler, param.name.data, slots, struct_name, ptr_inner, enum_name)
 	}
 
 	// compile body
-	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table, struct_layouts = c.struct_layouts}
-	compile_block(&child, d.body)
+	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table, struct_layouts = c.struct_layouts, enum_layouts = c.enum_layouts, tc_types = c.tc_types, tc_type_table = c.tc_type_table}
+	compile_fn_body(&child, d.body)
 	emit(&child.bc, .RETURN, span)
 	emit_byte(&child.bc, 1, span)
 	c.errors      = child.errors
@@ -171,7 +211,52 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 
 // ---- blocks ----
 
+// compile_block is for inner blocks (arm bodies, if-else branches, loop bodies).
+//
+// When the block has a tail expression, we pre-reserve a single stack slot at the
+// OUTER scope depth (before the block's scope opens) to hold the result.  This
+// keeps the slot below all block-local variables so end_scope can POP block locals
+// without touching it.  The tail expression is compiled while block locals are still
+// live (so it can reference them), then SET_LOCAL'd into the reserved slot.
+// The caller is responsible for consuming the result value (e.g. compile_for pops it
+// after each iteration; compile_if already handles it via its NIL-guard).
 compile_block :: proc(c: ^Compiler, block: parser.BlockExpression) {
+	// Pre-reserve result slot at outer depth if the block produces a value.
+	result_slot := -1
+	if _, has_result := block.result.?; has_result {
+		result_slot = 0
+		for local in c.bc.locals { result_slot += local.slots }
+		emit(&c.bc, .NIL, {})
+		append(&c.bc.locals, Local{
+			name  = "__block_result__",
+			depth = c.bc.scope_depth,  // outer depth — end_scope for THIS block skips it
+			slots = 1,
+		})
+	}
+
+	c.bc.scope_depth += 1
+	for stmt in block.stmts {
+		compile_stmt(c, stmt)
+	}
+
+	if result, ok := block.result.?; ok {
+		compile_expr(c, result)                    // block locals still live here
+		emit(&c.bc, .SET_LOCAL, {})
+		emit_byte(&c.bc, u8(result_slot), {})
+		emit(&c.bc, .POP, {})                      // remove extra copy from top
+	}
+
+	end_scope(c)                                   // pops block-local vars only
+
+	if result_slot >= 0 {
+		pop(&c.bc.locals)                          // remove __block_result__ sentinel
+	}
+}
+
+// compile_fn_body is for function bodies only. RETURN resets the frame's stack_top,
+// so end_scope's POPs are not needed — omitting them lets the result expression
+// freely reference any variable defined in the function body's stmts.
+compile_fn_body :: proc(c: ^Compiler, block: parser.BlockExpression) {
 	c.bc.scope_depth += 1
 	for stmt in block.stmts {
 		compile_stmt(c, stmt)
@@ -179,7 +264,11 @@ compile_block :: proc(c: ^Compiler, block: parser.BlockExpression) {
 	if result, ok := block.result.?; ok {
 		compile_expr(c, result)
 	}
-	end_scope(c)
+	// Update scope tracking without emitting POPs — RETURN handles frame cleanup.
+	c.bc.scope_depth -= 1
+	for len(c.bc.locals) > 0 && c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
+		pop(&c.bc.locals)
+	}
 }
 
 end_scope :: proc(c: ^Compiler) {
@@ -215,10 +304,12 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 		} else {
 			struct_type := expr_struct_type(c, s.value)
 			ptr_inner   := expr_ptr_inner(c, s.value)
-			if struct_type == "" && ptr_inner == "" {
+			enum_type   := expr_enum_type(c, s.value)
+			if struct_type == "" && ptr_inner == "" && enum_type == "" {
 				if ann_idx, has_ann := s.type.?; has_ann {
 					struct_type = type_ann_struct_name(c, ann_idx)
 					ptr_inner   = type_ann_ptr_inner(c, ann_idx)
+					enum_type   = type_ann_enum_name(c, ann_idx)
 				}
 			}
 			slots := 1
@@ -226,8 +317,12 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 				if layout, ok := c.struct_layouts[struct_type]; ok {
 					slots = layout.total_slots
 				}
+			} else if enum_type != "" {
+				if layout, ok := c.enum_layouts[enum_type]; ok {
+					slots = layout.total_slots
+				}
 			}
-			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner)
+			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner, enum_type)
 		}
 
 	case parser.ReturnStatement:
@@ -317,6 +412,13 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 	}
 
 	compile_block(c, s.body)
+	// Discard the loop body's result value (if any) before the back-edge.
+	// parse_block promotes the last ExpressionStatement to block.result, but
+	// loop bodies run for side effects only — their result is never used.
+	if result_expr, has_result := s.body.result.?; has_result {
+		n := expr_slot_count(c, result_expr)
+		for _ in 0..<n { emit(&c.bc, .POP, span) }
+	}
 
 	if post, ok := s.post.?; ok {
 		compile_stmt(c, post)
@@ -480,8 +582,14 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.DerefExpression:
 		compile_deref_expr(c, e, span)
 
-	case parser.IndexExpression, parser.MatchExpression:
+	case parser.EnumLiteralExpression:
+		compile_enum_literal(c, e, span)
+
+	case parser.IndexExpression:
 		compiler_error(c, "not yet implemented", span)
+
+	case parser.MatchExpression:
+		compile_match(c, e, span)
 	}
 }
 
@@ -617,20 +725,201 @@ compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
 	emit(&c.bc, .POP, span)   // pop condition (true path)
 
 	compile_block(c, e.then_block)
-	emit(&c.bc, .NIL, span)   // if always produces a value
+	if _, has_result := e.then_block.result.?; !has_result {
+		emit(&c.bc, .NIL, span)
+	}
 
 	if else_block, ok := e.else_block.?; ok {
 		else_jump, _ := emit_jump(&c.bc, .JUMP, span)
 		patch_jump(&c.bc, then_jump)
 		emit(&c.bc, .POP, span)   // pop condition (false path)
 		compile_block(c, else_block)
-		emit(&c.bc, .NIL, span)   // else always produces a value
+		if _, has_result := else_block.result.?; !has_result {
+			emit(&c.bc, .NIL, span)
+		}
 		patch_jump(&c.bc, else_jump)
 	} else {
 		patch_jump(&c.bc, then_jump)
 		emit(&c.bc, .POP, span)   // pop condition (no-else path)
 		emit(&c.bc, .NIL, span)
 	}
+}
+
+compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span) {
+	// Determine subject kind: enum or scalar
+	enum_name := expr_enum_type(c, e.subject)
+	is_enum   := enum_name != ""
+
+	layout:        EnumLayout
+	subject_slots := 1
+	if is_enum {
+		has: bool
+		layout, has = c.enum_layouts[enum_name]
+		if !has {
+			compiler_error(c, fmt.tprintf("unknown enum '%s'", enum_name), span)
+			emit(&c.bc, .NIL, span)
+			return
+		}
+		subject_slots = layout.total_slots
+	}
+
+	// Push result placeholder — match is an expression; the matched arm writes
+	// its result here via SET_LOCAL before popping its bindings and jumping out.
+	emit(&c.bc, .NIL, span)
+	add_local(&c.bc, "__match_result__", 1)
+
+	// subj_slot = stack index of the first subject slot (right after result placeholder)
+	subj_slot := 0
+	for local in c.bc.locals {
+		subj_slot += local.slots
+	}
+	result_slot := subj_slot - 1
+
+	// push subject copy, register sentinel so resolve_local stays correct
+	compile_expr(c, e.subject)
+	add_local(&c.bc, "__match_subject__", subject_slots)
+
+	arm_end_jumps := make([dynamic]u16)
+	defer delete(arm_end_jumps)
+
+	for arm in e.arms {
+		pattern_node := c.ast.nodes[int(arm.pattern)]
+		pexpr, ok := pattern_node.(parser.Expression)
+		if !ok { compiler_error(c, "invalid match pattern", span); continue }
+
+		#partial switch pat in pexpr {
+		case parser.IdentExpression:
+			// Wildcard: _ => always fires, no discriminant check
+			if lexer.Token(pat).data != "_" {
+				compiler_error(c, "match pattern ident must be '_' (wildcard)", span)
+				continue
+			}
+			compile_expr(c, arm.body)
+			// Block bodies with no tail expression leave no value on the stack; push NIL.
+			if body_expr, bok := c.ast.nodes[int(arm.body)].(parser.Expression); bok {
+				if block, bbok := body_expr.(parser.BlockExpression); bbok {
+					if _, has_result := block.result.?; !has_result {
+						emit(&c.bc, .NIL, span)
+					}
+				}
+			}
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(result_slot), span)
+			emit(&c.bc, .POP, span)
+			jmp, _ := emit_jump(&c.bc, .JUMP, span)
+			append(&arm_end_jumps, jmp)
+
+		case parser.LiteralExpression:
+			// Scalar literal: compare subject to constant
+			emit(&c.bc, .GET_LOCAL, span)
+			emit_byte(&c.bc, u8(subj_slot), span)
+			emit_constant(&c.bc, parse_literal(lexer.Token(pat)), span)
+			emit(&c.bc, .EQ, span)
+			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
+			emit(&c.bc, .POP, span) // pop true
+
+			compile_expr(c, arm.body)
+			// Block bodies with no tail expression leave no value on the stack; push NIL.
+			if body_expr, bok := c.ast.nodes[int(arm.body)].(parser.Expression); bok {
+				if block, bbok := body_expr.(parser.BlockExpression); bbok {
+					if _, has_result := block.result.?; !has_result {
+						emit(&c.bc, .NIL, span)
+					}
+				}
+			}
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(result_slot), span)
+			emit(&c.bc, .POP, span)
+			jmp, _ := emit_jump(&c.bc, .JUMP, span)
+			append(&arm_end_jumps, jmp)
+
+			patch_jump(&c.bc, next_arm_jump)
+			emit(&c.bc, .POP, span) // pop false
+
+		case parser.EnumLiteralExpression:
+			// Enum variant: discriminant check + field bindings
+			if !is_enum {
+				compiler_error(c, "enum pattern on non-enum subject", span)
+				continue
+			}
+			variant_layout, vok := layout.variants[pat.variant_name.data]
+			if !vok {
+				compiler_error(c, fmt.tprintf("unknown variant '%s'", pat.variant_name.data), span)
+				continue
+			}
+
+			emit(&c.bc, .GET_LOCAL, span)
+			emit_byte(&c.bc, u8(subj_slot), span)
+			emit_constant(&c.bc, i64(variant_layout.discriminant), span)
+			emit(&c.bc, .EQ, span)
+			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
+			emit(&c.bc, .POP, span) // pop true
+
+			c.bc.scope_depth += 1
+			for field in pat.fields {
+				binding_name := field.name.data
+				field_offset := -1
+				for fi in 0..<len(variant_layout.field_names) {
+					if variant_layout.field_names[fi] == binding_name {
+						field_offset = variant_layout.field_offsets[fi]
+						break
+					}
+				}
+				if field_offset < 0 {
+					compiler_error(c, fmt.tprintf("unknown field '%s' in variant '%s'", binding_name, pat.variant_name.data), span)
+					continue
+				}
+				emit(&c.bc, .GET_LOCAL, span)
+				emit_byte(&c.bc, u8(subj_slot + 1 + field_offset), span)
+				add_local(&c.bc, binding_name)
+			}
+
+			compile_expr(c, arm.body)
+			// Block bodies with no tail expression leave no value on the stack; push NIL.
+			if body_expr, bok := c.ast.nodes[int(arm.body)].(parser.Expression); bok {
+				if block, bbok := body_expr.(parser.BlockExpression); bbok {
+					if _, has_result := block.result.?; !has_result {
+						emit(&c.bc, .NIL, span)
+					}
+				}
+			}
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(result_slot), span)
+			emit(&c.bc, .POP, span)
+
+			c.bc.scope_depth -= 1
+			for len(c.bc.locals) > 0 && c.bc.locals[len(c.bc.locals)-1].depth > c.bc.scope_depth {
+				local := c.bc.locals[len(c.bc.locals)-1]
+				for _ in 0..<local.slots {
+					emit(&c.bc, .POP, span)
+				}
+				pop(&c.bc.locals)
+			}
+
+			jmp, _ := emit_jump(&c.bc, .JUMP, span)
+			append(&arm_end_jumps, jmp)
+
+			patch_jump(&c.bc, next_arm_jump)
+			emit(&c.bc, .POP, span) // pop false
+
+		case:
+			compiler_error(c, "unsupported match pattern kind", span)
+		}
+	}
+
+	// all arm-end JUMPs land here
+	for jmp in arm_end_jumps {
+		patch_jump(&c.bc, jmp)
+	}
+
+	// remove subject sentinel, pop subject copy slots
+	pop(&c.bc.locals)
+	for _ in 0..<subject_slots {
+		emit(&c.bc, .POP, span)
+	}
+
+	// remove result sentinel — result value is now the top of the stack
+	pop(&c.bc.locals)
 }
 
 // ---- helpers ----
@@ -801,6 +1090,79 @@ compiler_error :: proc(c: ^Compiler, msg: string, span: lexer.Span) {
 
 // ---- struct helpers ----
 
+local_enum_type :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
+	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
+		if bc.locals[i].name == name {
+			return bc.locals[i].enum_type
+		}
+	}
+	return ""
+}
+
+type_ann_enum_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
+	if int(type_idx) >= len(c.ast.nodes) do return ""
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok do return ""
+	if _, is_ptr := ty.(parser.PointerType); is_ptr do return ""
+	named, ok2 := ty.(parser.NamedType)
+	if !ok2 do return ""
+	name := lexer.Token(named).data
+	if _, ok3 := c.enum_layouts[name]; ok3 {
+		return name
+	}
+	return ""
+}
+
+expr_enum_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok do return ""
+	#partial switch e in expr {
+	case parser.EnumLiteralExpression:
+		return e.enum_name.data
+	case parser.IdentExpression:
+		if name := local_enum_type(&c.bc, lexer.Token(e).data); name != "" {
+			return name
+		}
+		// Fall back to the type-checker's inference for cases where the compiler
+		// didn't propagate enum_type into bc.locals (e.g. global variables,
+		// function parameters whose annotation wasn't resolved at compile time).
+		if c.tc_types != nil && int(idx) < len(c.tc_types) {
+			type_id := c.tc_types[int(idx)]
+			if int(type_id) < len(c.tc_type_table) {
+				if et, ok := c.tc_type_table[int(type_id)].(tc.EnumType); ok {
+					return et.name
+				}
+			}
+		}
+		return ""
+	case parser.CallExpression:
+		return call_return_enum_type(c, e)
+	}
+	return ""
+}
+
+call_return_enum_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
+	callee_node := c.ast.nodes[e.callee]
+	expr, ok := callee_node.(parser.Expression)
+	if !ok do return ""
+	id, ok2 := expr.(parser.IdentExpression)
+	if !ok2 do return ""
+	fn_name := lexer.Token(id).data
+	for node in c.ast.nodes {
+		decl, ok3 := node.(parser.Declaration)
+		if !ok3 do continue
+		fn, ok4 := decl.(parser.FunctionDecl)
+		if !ok4 do continue
+		if fn.name.data != fn_name do continue
+		ret_idx, has_ret := fn.return_type.?
+		if !has_ret do return ""
+		return type_ann_enum_name(c, ret_idx)
+	}
+	return ""
+}
+
 local_struct_type :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
 	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
 		if bc.locals[i].name == name {
@@ -869,8 +1231,13 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 
 expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 	st := expr_struct_type(c, idx)
-	if st == "" do return 1
-	if layout, ok := c.struct_layouts[st]; ok do return layout.total_slots
+	if st != "" {
+		if layout, ok := c.struct_layouts[st]; ok do return layout.total_slots
+	}
+	et := expr_enum_type(c, idx)
+	if et != "" {
+		if layout, ok := c.enum_layouts[et]; ok do return layout.total_slots
+	}
 	return 1
 }
 
@@ -893,6 +1260,77 @@ build_struct_layout :: proc(c: ^Compiler, d: parser.StructDecl) -> StructLayout 
 		field_struct_types = field_struct_types,
 		field_ptr_inners   = field_ptr_inners,
 		total_slots        = offset,
+	}
+}
+
+build_enum_layout :: proc(c: ^Compiler, d: parser.EnumDecl) -> EnumLayout {
+	variants := make(map[string]EnumVariantLayout)
+	max_field_slots := 0
+	for variant, vi in d.variants {
+		start := int(variant.field_start)
+		end := len(d.fields)
+		if vi + 1 < len(d.variants) {
+			end = int(d.variants[vi + 1].field_start)
+		}
+		variant_fields := d.fields[start:end]
+		n := len(variant_fields)
+		field_names   := make([]string, n)
+		field_offsets := make([]int,    n)
+		offset := 0
+		for field, i in variant_fields {
+			field_names[i]   = field.name.data
+			field_offsets[i] = offset
+			offset += type_slot_count(c, field.type)
+		}
+		if offset > max_field_slots do max_field_slots = offset
+		variants[variant.name.data] = EnumVariantLayout{
+			discriminant  = vi,
+			field_names   = field_names,
+			field_offsets = field_offsets,
+			total_slots   = offset,
+		}
+	}
+	return EnumLayout{total_slots = 1 + max_field_slots, variants = variants}
+}
+
+// compile_enum_literal emits a stack-allocated enum value:
+//   slot 0: integer discriminant (variant index in declaration order)
+//   slots 1..N: field values in variant declaration order
+//   slots N+1..total-1: NIL padding so all variants occupy the same number of slots
+compile_enum_literal :: proc(c: ^Compiler, e: parser.EnumLiteralExpression, span: lexer.Span) {
+	layout, ok := c.enum_layouts[e.enum_name.data]
+	if !ok {
+		compiler_error(c, fmt.tprintf("undefined enum '%s'", e.enum_name.data), span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	variant_layout, vok := layout.variants[e.variant_name.data]
+	if !vok {
+		compiler_error(c, fmt.tprintf("unknown variant '%s' on enum '%s'", e.variant_name.data, e.enum_name.data), span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	// Slot 0: integer discriminant (index of this variant in declaration order)
+	emit_constant(&c.bc, i64(variant_layout.discriminant), span)
+	// Slots 1..N: fields in variant declaration order
+	field_map := make(map[string]parser.ExpressionIdx)
+	defer delete(field_map)
+	for field in e.fields {
+		field_map[field.name.data] = field.value
+	}
+	for name in variant_layout.field_names {
+		val_idx, has_val := field_map[name]
+		if !has_val {
+			compiler_error(c, fmt.tprintf("missing field '%s' in enum literal", name), span)
+			emit(&c.bc, .NIL, span)
+			continue
+		}
+		compile_expr(c, val_idx)
+	}
+	// NIL-pad so every variant fills the same total_slots
+	total_field_slots := layout.total_slots - 1 // excludes discriminant slot
+	for _ in 0..<(total_field_slots - variant_layout.total_slots) {
+		emit(&c.bc, .NIL, span)
 	}
 }
 

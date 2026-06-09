@@ -1,0 +1,19 @@
+enum Shape {
+    Circle { radius: float },
+    Rect   { w: float, h: float },
+}
+
+enum Direction { North {}, South {}, East {}, West {} }
+
+function make_unit_square() -> Shape {
+    return Shape.Rect { w = 1.0, h = 1.0 }
+}
+
+function main() {
+    let circle = Shape.Circle { radius = 5.0 }
+    let rect   = Shape.Rect   { w = 10.0, h = 4.0 }
+    let square = make_unit_square()
+    let dir    = Direction.North {}
+
+    print("enums ok")
+}

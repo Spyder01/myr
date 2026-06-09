@@ -158,7 +158,7 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	}
 	defer tc.tc_result_destroy(&tcr)
 
-	fn, comp_errors := bc.compile(&ast)
+	fn, comp_errors := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	if len(comp_errors) > 0 {
 		for e in comp_errors {
 			line, col := parser.offset_to_line_col(source, e.span.start)

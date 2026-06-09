@@ -36,12 +36,26 @@ PointerType :: struct {
 	inner: TypeId,
 }
 
+// Per-variant info stored inside EnumType.
+EnumVariantInfo :: struct {
+	name:        string,
+	field_names: []string,
+	field_types: []TypeId,
+}
+
+// Enum type stored in the type table.
+EnumType :: struct {
+	name:     string,
+	variants: []EnumVariantInfo,
+}
+
 // TypeInfo is the entry stored in the type table.
 TypeInfo :: union {
 	PrimitiveType,
 	FnType,
 	StructType,
 	PointerType,
+	EnumType,
 }
 
 TypeCheckerError :: struct {
@@ -112,6 +126,8 @@ type_id_name :: proc(id: TypeId, table: []TypeInfo) -> string {
 		return t.name
 	case PointerType:
 		return "pointer"
+	case EnumType:
+		return t.name
 	}
 	return "unknown"
 }
@@ -121,6 +137,12 @@ tc_result_destroy :: proc(r: ^TypecheckResult) {
 		#partial switch t in info {
 		case FnType:     delete(t.params)
 		case StructType: delete(t.field_names); delete(t.field_types)
+		case EnumType:
+			for v in t.variants {
+				delete(v.field_names)
+				delete(v.field_types)
+			}
+			delete(t.variants)
 		}
 	}
 	delete(r.type_table)
