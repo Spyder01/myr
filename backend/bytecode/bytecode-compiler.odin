@@ -361,18 +361,37 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			emit(&c.bc, .DEFINE_GLOBAL, span)
 			emit_byte(&c.bc, u8(name_idx), span)
 		} else {
-			struct_type := expr_struct_type(c, s.value)
-			ptr_inner   := expr_ptr_inner(c, s.value)
-			enum_type   := expr_enum_type(c, s.value)
-			if struct_type == "" && ptr_inner == "" && enum_type == "" {
+			struct_type      := expr_struct_type(c, s.value)
+			ptr_inner        := expr_ptr_inner(c, s.value)
+			enum_type        := expr_enum_type(c, s.value)
+			array_elem_slots := expr_array_elem_slots(c, s.value)
+			if struct_type == "" && ptr_inner == "" && enum_type == "" && array_elem_slots == 0 {
 				if ann_idx, has_ann := s.type.?; has_ann {
 					struct_type = type_ann_struct_name(c, ann_idx)
 					ptr_inner   = type_ann_ptr_inner(c, ann_idx)
 					enum_type   = type_ann_enum_name(c, ann_idx)
+					if struct_type == "" && enum_type == "" {
+						// Check if the annotation is Array[T, N]
+						if int(ann_idx) < len(c.ast.nodes) {
+							if ty, ok := c.ast.nodes[int(ann_idx)].(parser.Type); ok {
+								if at, ok2 := ty.(parser.ArrayType); ok2 {
+									array_elem_slots = type_slot_count(c, at.elem)
+								}
+							}
+						}
+					}
 				}
 			}
 			slots := 1
-			if struct_type != "" {
+			if array_elem_slots > 0 {
+				slots = expr_slot_count(c, s.value)
+				if slots == 1 {
+					// fallback: compute from annotation
+					if ann_idx, has_ann := s.type.?; has_ann {
+						slots = type_slot_count(c, ann_idx)
+					}
+				}
+			} else if struct_type != "" {
 				if layout, ok := c.struct_layouts^[struct_type]; ok {
 					slots = layout.total_slots
 				}
@@ -381,7 +400,7 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 					slots = layout.total_slots
 				}
 			}
-			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner, enum_type)
+			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner, enum_type, array_elem_slots)
 		}
 
 	case parser.ReturnStatement:
@@ -683,7 +702,10 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		compile_enum_literal(c, e, span)
 
 	case parser.IndexExpression:
-		compiler_error(c, "not yet implemented", span)
+		compile_index_expression(c, e, span)
+
+	case parser.ArrayLiteralExpression:
+		compile_array_literal(c, e, span)
 
 	case parser.MatchExpression:
 		compile_match(c, e, span)
@@ -810,6 +832,10 @@ compile_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer
 		}
 		if fa, ok3 := expr.(parser.FieldAccessExpression); ok3 {
 			compile_field_set(c, fa, span)
+			return
+		}
+		if ie, ok3 := expr.(parser.IndexExpression); ok3 {
+			compile_index_set(c, ie, span)
 			return
 		}
 	}
@@ -1290,6 +1316,9 @@ type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 		if layout, found := c.struct_layouts^[mangled]; found { return layout.total_slots }
 		return 1
 	}
+	if at, ok2 := ty.(parser.ArrayType); ok2 {
+		return at.size * type_slot_count(c, at.elem)
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return 1
 	name := lexer.Token(named).data
@@ -1347,6 +1376,15 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 }
 
 expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
+	node := c.ast.nodes[int(idx)]
+	if expr, ok := node.(parser.Expression); ok {
+		if ale, ok2 := expr.(parser.ArrayLiteralExpression); ok2 {
+			return ale.size * type_slot_count(c, ale.elem_type)
+		}
+		if ie, ok2 := expr.(parser.IndexExpression); ok2 {
+			return expr_array_elem_slots(c, ie.object)
+		}
+	}
 	st := expr_struct_type(c, idx)
 	if st != "" {
 		if layout, ok := c.struct_layouts^[st]; ok do return layout.total_slots
@@ -1356,6 +1394,26 @@ expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 		if layout, ok := c.enum_layouts[et]; ok do return layout.total_slots
 	}
 	return 1
+}
+
+// expr_array_elem_slots returns the slots-per-element for an array expression,
+// or 0 if the expression is not a known array local.
+expr_array_elem_slots :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok { return 0 }
+	if ale, ok2 := expr.(parser.ArrayLiteralExpression); ok2 {
+		return type_slot_count(c, ale.elem_type)
+	}
+	id, ok2 := expr.(parser.IdentExpression)
+	if !ok2 { return 0 }
+	name := lexer.Token(id).data
+	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+		if c.bc.locals[i].name == name {
+			return c.bc.locals[i].array_elem_slots
+		}
+	}
+	return 0
 }
 
 build_struct_layout :: proc(c: ^Compiler, d: parser.StructDecl) -> StructLayout {
@@ -1834,6 +1892,59 @@ compile_addr_of :: proc(c: ^Compiler, e: parser.AddrOfExpression, span: lexer.Sp
 	}
 	emit(&c.bc, .ADDR_LOCAL, span)
 	emit_byte(&c.bc, u8(slot), span)
+}
+
+// compile_array_literal pushes each element in order onto the stack.
+// The resulting N*elem_slots contiguous values become the array local's slots.
+compile_array_literal :: proc(c: ^Compiler, e: parser.ArrayLiteralExpression, span: lexer.Span) {
+	for val in e.values {
+		compile_expr(c, val)
+	}
+}
+
+// compile_index_expression reads one element from a local array.
+// Stack: [...] → [..., elem...]  (elem_slots values pushed)
+compile_index_expression :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.Span) {
+	obj_node := c.ast.nodes[int(e.object)]
+	obj_expr, ok := obj_node.(parser.Expression)
+	if !ok { compiler_error(c, "index: object is not an expression", span); emit(&c.bc, .NIL, span); return }
+	id, is_ident := obj_expr.(parser.IdentExpression)
+	if !is_ident { compiler_error(c, "index: only local array indexing is supported", span); emit(&c.bc, .NIL, span); return }
+	name := lexer.Token(id).data
+	slot, _, found := resolve_local(&c.bc, name)
+	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); emit(&c.bc, .NIL, span); return }
+	elem_slots := 0
+	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+		if c.bc.locals[i].name == name { elem_slots = c.bc.locals[i].array_elem_slots; break }
+	}
+	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array", name), span); emit(&c.bc, .NIL, span); return }
+	compile_expr(c, e.index)
+	emit(&c.bc, .ARRAY_GET, span)
+	emit_byte(&c.bc, u8(slot), span)
+	emit_byte(&c.bc, u8(elem_slots), span)
+}
+
+// compile_index_set writes one element into a local array.
+// Precondition: the value (elem_slots slots) is already on the stack (from compile_assignment).
+// Stack: [..., val..., i] after compiling the index.
+compile_index_set :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.Span) {
+	obj_node := c.ast.nodes[int(e.object)]
+	obj_expr, ok := obj_node.(parser.Expression)
+	if !ok { compiler_error(c, "index assign: object is not an expression", span); return }
+	id, is_ident := obj_expr.(parser.IdentExpression)
+	if !is_ident { compiler_error(c, "index assign: only local array indexing is supported", span); return }
+	name := lexer.Token(id).data
+	slot, _, found := resolve_local(&c.bc, name)
+	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); return }
+	elem_slots := 0
+	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+		if c.bc.locals[i].name == name { elem_slots = c.bc.locals[i].array_elem_slots; break }
+	}
+	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array", name), span); return }
+	compile_expr(c, e.index)
+	emit(&c.bc, .ARRAY_SET, span)
+	emit_byte(&c.bc, u8(slot), span)
+	emit_byte(&c.bc, u8(elem_slots), span)
 }
 
 // ---- generics ----

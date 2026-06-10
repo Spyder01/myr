@@ -2291,3 +2291,68 @@ test_e2e_addrof_stored_in_let :: proc(t: ^testing.T) {
 	`)
 	testing.expect_value(t, val.(i64), i64(37))
 }
+
+// ---- arrays ----
+
+@test
+test_e2e_array_literal_read :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let a = Array[i64, 3]{10, 20, 30}
+			return a[1]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(20))
+}
+
+@test
+test_e2e_array_write_read :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let a = Array[i64, 3]{1, 2, 3}
+			a[0] = 99
+			return a[0]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@test
+test_e2e_array_sum_loop :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let a = Array[i64, 5]{1, 2, 3, 4, 5}
+			let sum = 0
+			for let i = 0; i < 5; i += 1 {
+				sum += a[i]
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(15))
+}
+
+@test
+test_e2e_array_last_element :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let a = Array[i64, 4]{10, 20, 30, 40}
+			return a[3]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(40))
+}
+
+@test
+test_e2e_array_write_multiple :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let a = Array[i64, 3]{0, 0, 0}
+			a[0] = 5
+			a[1] = 10
+			a[2] = 15
+			return a[0] + a[1] + a[2]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(30))
+}

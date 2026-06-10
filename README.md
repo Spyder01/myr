@@ -382,6 +382,41 @@ function main() {
     print(a)
 }
 
+### Arrays
+
+`Array[T, N]` is a fixed-size, stack-allocated array. `T` is the element type and `N` is a compile-time integer size.
+
+```myr
+function main() {
+    let scores = Array[i64, 3]{10, 20, 30}
+
+    print(scores[0])   // 10
+    print(scores[1])   // 20
+
+    scores[2] = 99
+    print(scores[2])   // 99
+}
+```
+
+Iterate with a C-style for loop:
+
+```myr
+function sum(a: Array[i64, 5]) -> i64 {
+    let total = 0
+    for let i = 0; i < 5; i += 1 {
+        total += a[i]
+    }
+    return total
+}
+
+function main() {
+    let nums = Array[i64, 5]{1, 2, 3, 4, 5}
+    print(sum(nums))   // 15
+}
+```
+
+Arrays are value types — they live entirely on the stack, just like structs. There is no heap allocation.
+
 ### Generic functions
 
 Functions can be parameterised over one or more type variables using `[T]` syntax. Myr uses monomorphisation — a separate concrete copy is compiled for each distinct combination of argument types.
@@ -536,7 +571,7 @@ Phase 1 — bytecode compiler + VM. The pipeline is:
 source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`, address-of `&x`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params, generic struct return types, nested generic struct types like `Box[Box[int]]`), type checker.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`, address-of `&x`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params, generic struct return types, nested generic struct types like `Box[Box[int]]`), fixed-size stack arrays (`Array[T, N]`), type checker.
 
 Not yet: closures.
 

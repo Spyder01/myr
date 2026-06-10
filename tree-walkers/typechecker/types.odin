@@ -49,6 +49,12 @@ EnumType :: struct {
 	variants: []EnumVariantInfo,
 }
 
+// Array type stored in the type table.
+ArrayTypeInfo :: struct {
+	elem:   TypeId,
+	length: int,
+}
+
 // TypeInfo is the entry stored in the type table.
 TypeInfo :: union {
 	PrimitiveType,
@@ -56,6 +62,7 @@ TypeInfo :: union {
 	StructType,
 	PointerType,
 	EnumType,
+	ArrayTypeInfo,
 }
 
 TypeCheckerError :: struct {

@@ -61,6 +61,8 @@ Opcode :: enum u8 {
 	HEAP_SET,   // 1-byte: offset — pop ^Value (top), ptr[offset] = stack_top below it
 	HEAP_LOAD,  // 1-byte: N  — pop ^Value, push ptr[0..N-1] (full deref)
 	ADDR_LOCAL, // 1-byte: slot — push a raw pointer to frame[slot] (stack reference)
+	ARRAY_GET,  // 2-bytes: base_slot, elem_slots — pop index i, push frame[base_slot + i*elem_slots .. +elem_slots]
+	ARRAY_SET,  // 2-bytes: base_slot, elem_slots — pop index i and elem_slots values, write frame[base_slot + i*elem_slots]
 
 	POP,
 	PRINT,

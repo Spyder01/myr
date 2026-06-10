@@ -86,6 +86,8 @@ visit_expr :: proc(ast: ^AST, idx: ExpressionIdx, visit: Visitor) {
 		visit_expr(ast, e.operand, visit)
 	case AddrOfExpression:
 		visit_expr(ast, e.operand, visit)
+	case ArrayLiteralExpression:
+		for val in e.values { visit_expr(ast, val, visit) }
 	case LiteralExpression, IdentExpression:
 		// leaves
 	}
@@ -183,6 +185,10 @@ walker_push_expr :: proc(w: ^WalkerCursor, e: Expression) {
 		append(&w.stack, u32(v.operand))
 	case AddrOfExpression:
 		append(&w.stack, u32(v.operand))
+	case ArrayLiteralExpression:
+		for i := len(v.values) - 1; i >= 0; i -= 1 {
+			append(&w.stack, u32(v.values[i]))
+		}
 	case LiteralExpression, IdentExpression:
 		// leaves
 	}

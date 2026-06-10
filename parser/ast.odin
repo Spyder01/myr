@@ -84,6 +84,12 @@ AddrOfExpression :: struct {
 	operand: ExpressionIdx,
 }
 
+ArrayLiteralExpression :: struct {
+	elem_type: TypeIdx,
+	size:      int,
+	values:    []ExpressionIdx,
+}
+
 // EnumLiteralExpression represents EnumName.VariantName { field = value, ... }
 EnumLiteralExpression :: struct {
 	enum_name:    lexer.Token,
@@ -107,6 +113,7 @@ Expression :: union {
 	DerefExpression,
 	AddrOfExpression,
 	EnumLiteralExpression,
+	ArrayLiteralExpression,
 }
 
 LetStatement :: struct {
@@ -228,11 +235,17 @@ PointerType :: struct {
 	inner: TypeIdx,
 }
 
+ArrayType :: struct {
+	elem: TypeIdx,
+	size: int,
+}
+
 Type :: union {
 	NamedType,
 	GenericType,
 	FnType,
 	PointerType,
+	ArrayType,
 }
 
 Node :: union {
@@ -296,6 +309,8 @@ ast_destroy :: proc(ast: ^AST) {
 				delete(e.fields)
 			case EnumLiteralExpression:
 				delete(e.fields)
+			case ArrayLiteralExpression:
+				delete(e.values)
 			case BinaryExpression, UnaryExpression,
 			     FieldAccessExpression, IndexExpression,
 			     LiteralExpression, IdentExpression,
@@ -305,7 +320,7 @@ ast_destroy :: proc(ast: ^AST) {
 			switch ty in n {
 			case GenericType:   delete(ty.args)
 			case FnType:        delete(ty.params)
-			case NamedType, PointerType:
+			case NamedType, PointerType, ArrayType:
 			}
 		}
 	}

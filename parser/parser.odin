@@ -230,6 +230,9 @@ parse_type :: proc(p: ^Parser) -> TypeIdx {
 	}
 	tok := expect(p, .IDENT)
 	if peek(p) == .LEFT_BRACKET {
+		if tok.data == "Array" {
+			return parse_array_type(p, tok)
+		}
 		advance(p)
 		args := make([dynamic]TypeIdx)
 		for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
@@ -246,6 +249,43 @@ parse_type :: proc(p: ^Parser) -> TypeIdx {
 	append_elem(&p.ast.nodes, Node(Type(named)))
 	append_elem(&p.ast.spans, tok.span)
 	return TypeIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_array_type :: proc(p: ^Parser, tok: lexer.Token) -> TypeIdx {
+	expect(p, .LEFT_BRACKET)
+	elem_type := parse_type(p)
+	expect(p, .COMMA)
+	size_tok := expect(p, .INT)
+	n := 0
+	for c in size_tok.data { n = n * 10 + int(c - '0') }
+	expect(p, .RIGHT_BRACKET)
+	at := ArrayType{elem = elem_type, size = n}
+	append_elem(&p.ast.nodes, Node(Type(at)))
+	append_elem(&p.ast.spans, tok.span)
+	return TypeIdx(len(p.ast.nodes) - 1)
+}
+
+@private
+parse_array_literal :: proc(p: ^Parser, tok: lexer.Token) -> ExpressionIdx {
+	expect(p, .LEFT_BRACKET)
+	elem_type := parse_type(p)
+	expect(p, .COMMA)
+	size_tok := expect(p, .INT)
+	n := 0
+	for c in size_tok.data { n = n * 10 + int(c - '0') }
+	expect(p, .RIGHT_BRACKET)
+	expect(p, .LEFT_BRACE)
+	values := make([dynamic]ExpressionIdx)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		append_elem(&values, parse_expr(p, 0))
+		if peek(p) != .RIGHT_BRACE { expect(p, .COMMA) }
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := ArrayLiteralExpression{elem_type = elem_type, size = n, values = values[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, tok.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
 }
 
 @private
@@ -525,6 +565,9 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 				return parse_struct_literal(p, tok)
 			}
 			if peek(p) == .LEFT_BRACKET && token_after_brackets(p) == .LEFT_BRACE {
+				if tok.data == "Array" {
+					return parse_array_literal(p, tok)
+				}
 				return parse_generic_struct_literal(p, tok)
 			}
 		}

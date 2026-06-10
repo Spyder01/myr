@@ -286,5 +286,8 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 
 	case parser.AddrOfExpression:
 		nr_resolve_expr(nr, e.operand)
+
+	case parser.ArrayLiteralExpression:
+		for val in e.values { nr_resolve_expr(nr, val) }
 	}
 }

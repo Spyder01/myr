@@ -253,6 +253,29 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			ptr: [^]Value = raw_data(vm.stack[frame.slots + u16(slot):])
 			if err := vm_push(vm, ptr); err != nil do return err
 
+		case .ARRAY_GET:
+			base_slot  := u16(read_byte(vm))
+			elem_slots := int(read_byte(vm))
+			frame      := current_frame(vm)
+			idx_val, err := vm_pop(vm); if err != nil do return err
+			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
+			for s in 0..<elem_slots {
+				if push_err := vm_push(vm, vm.stack[frame.slots + base_slot + u16(int(i)*elem_slots + s)]); push_err != nil do return push_err
+			}
+
+		case .ARRAY_SET:
+			base_slot  := u16(read_byte(vm))
+			elem_slots := int(read_byte(vm))
+			frame      := current_frame(vm)
+			idx_val, err := vm_pop(vm); if err != nil do return err
+			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
+			top := int(vm.stack_top)
+			for s in 0..<elem_slots {
+				vm.stack[frame.slots + base_slot + u16(int(i)*elem_slots + s)] = vm.stack[top - elem_slots + s]
+			}
+			// Leave elem_slots values on the stack — mirrors SET_LOCAL's peek-not-pop contract.
+			// The expression statement caller emits POPs via expr_slot_count.
+
 		case .NEW:
 			n := int(read_byte(vm))
 			slots := make([]Value, n)

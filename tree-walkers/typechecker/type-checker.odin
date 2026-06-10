@@ -266,7 +266,24 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		return infer_field_access(tc, idx, e)
 
 	case parser.IndexExpression:
-		return UNKNOWN_TYPE
+		obj_type := infer(tc, e.object)
+		if obj_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
+		info, ok2 := get_type_info(tc, obj_type)
+		if !ok2 do return UNKNOWN_TYPE
+		at, is_arr := info.(ArrayTypeInfo)
+		if !is_arr {
+			tc_error_msg(tc, tc.ast.spans[int(idx)], "index of non-array value")
+			return UNKNOWN_TYPE
+		}
+		check(tc, e.index, INT_TYPE)
+		return at.elem
+
+	case parser.ArrayLiteralExpression:
+		elem_type := resolve_named_type(tc, e.elem_type)
+		for val in e.values {
+			check(tc, val, elem_type)
+		}
+		return register_array_type(tc, elem_type, e.size)
 
 	case parser.MatchExpression:
 		subj_type := infer(tc, e.subject)
@@ -578,6 +595,10 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 
 	case parser.GenericType:
 		return UNKNOWN_TYPE
+
+	case parser.ArrayType:
+		elem := resolve_named_type(tc, t.elem)
+		return register_array_type(tc, elem, t.size)
 	}
 	return UNKNOWN_TYPE
 }
@@ -609,6 +630,18 @@ register_ptr_type :: proc(tc: ^Typechecker, inner: TypeId) -> TypeId {
 	}
 	id := TypeId(len(tc.type_table))
 	append(&tc.type_table, TypeInfo(PointerType{inner = inner}))
+	return id
+}
+
+@private
+register_array_type :: proc(tc: ^Typechecker, elem: TypeId, length: int) -> TypeId {
+	for info, i in tc.type_table {
+		if at, ok := info.(ArrayTypeInfo); ok && at.elem == elem && at.length == length {
+			return TypeId(i)
+		}
+	}
+	id := TypeId(len(tc.type_table))
+	append(&tc.type_table, TypeInfo(ArrayTypeInfo{elem = elem, length = length}))
 	return id
 }
 
