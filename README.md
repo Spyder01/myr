@@ -387,7 +387,54 @@ function main() {
 }
 ```
 
-Generic functions can receive struct or enum values when the body only performs operations valid for that type. Returning the generic type `T` where T resolves to a struct or enum is not yet supported — use a concrete return type instead.
+Generic functions can receive and return generic struct types. A function can return `Stack[T]` and the caller gets a fully typed local with correct slot count and field access:
+
+```myr
+struct Stack[T] { top: T, size: int }
+
+function make_stack[T](val: T) -> Stack[T] {
+    return Stack[T]{top = val, size = 1}
+}
+
+function peek[T](s: Stack[T]) -> T {
+    return s.top
+}
+
+function main() {
+    let s = make_stack(42)
+    print(s.top)      // 42
+    print(s.size)     // 1
+    print(peek(s))    // 42
+}
+```
+
+Generic structs can be nested — `Box[Box[int]]` is fully supported, including field access through all levels, passing to generic functions, and returning from generic functions:
+
+```myr
+struct Box[T] { value: T }
+
+function wrap[T](v: T) -> Box[T] {
+    return Box[T]{value = v}
+}
+
+function unwrap[T](b: Box[T]) -> T {
+    return b.value
+}
+
+function main() {
+    let inner = Box[int]{value = 7}
+    let outer = Box[Box[int]]{value = inner}
+    print(outer.value.value)       // 7
+
+    let rewrapped = wrap(inner)    // Box[Box[int]]
+    print(rewrapped.value.value)   // 7
+
+    let mid = unwrap(outer)        // Box[int]
+    print(mid.value)               // 7
+}
+```
+
+Enums and structs are valid type arguments to generic functions:
 
 ```myr
 enum Shape { Circle { radius: int }, Rect { w: int, h: int } }
@@ -459,9 +506,9 @@ Phase 1 — bytecode compiler + VM. The pipeline is:
 source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params), type checker.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params, generic struct return types, nested generic struct types like `Box[Box[int]]`), type checker.
 
-Not yet: generic return type T resolving to struct/enum at call site, closures.
+Not yet: closures.
 
 ## Examples
 

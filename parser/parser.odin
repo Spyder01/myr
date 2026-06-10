@@ -175,13 +175,25 @@ parse_struct_declarations :: proc(p: ^Parser) {
 	expect(p, .STRUCT)
 	name := expect(p, .IDENT)
 
+	type_params := make([dynamic]lexer.Token)
+	if peek(p) == .LEFT_BRACKET {
+		advance(p)
+		for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
+			tp := expect(p, .IDENT)
+			append_elem(&type_params, tp)
+			if peek(p) != .RIGHT_BRACKET { expect(p, .COMMA) }
+		}
+		expect(p, .RIGHT_BRACKET)
+	}
+
 	expect(p, .LEFT_BRACE)
 	struct_fields := parse_struct_fields(p)
 	expect(p, .RIGHT_BRACE)
 
 	decl := StructDecl{
-		name=name,
-		fields=struct_fields,
+		name        = name,
+		type_params = type_params[:],
+		fields      = struct_fields,
 	}
 
 	append_elem(&p.ast.nodes, Node(Declaration(decl)))
@@ -217,6 +229,19 @@ parse_type :: proc(p: ^Parser) -> TypeIdx {
 		return TypeIdx(len(p.ast.nodes) - 1)
 	}
 	tok := expect(p, .IDENT)
+	if peek(p) == .LEFT_BRACKET {
+		advance(p)
+		args := make([dynamic]TypeIdx)
+		for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
+			append_elem(&args, parse_type(p))
+			if peek(p) != .RIGHT_BRACKET { expect(p, .COMMA) }
+		}
+		expect(p, .RIGHT_BRACKET)
+		gt := GenericType{name = tok, args = args[:]}
+		append_elem(&p.ast.nodes, Node(Type(gt)))
+		append_elem(&p.ast.spans, tok.span)
+		return TypeIdx(len(p.ast.nodes) - 1)
+	}
 	named := NamedType(tok)
 	append_elem(&p.ast.nodes, Node(Type(named)))
 	append_elem(&p.ast.spans, tok.span)
@@ -495,8 +520,13 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 
 	case .IDENT:
 		advance(p)
-		if peek(p) == .LEFT_BRACE && !p.no_struct_lit {
-			return parse_struct_literal(p, tok)
+		if !p.no_struct_lit {
+			if peek(p) == .LEFT_BRACE {
+				return parse_struct_literal(p, tok)
+			}
+			if peek(p) == .LEFT_BRACKET && token_after_brackets(p) == .LEFT_BRACE {
+				return parse_generic_struct_literal(p, tok)
+			}
 		}
 		expr := IdentExpression(tok)
 		append_elem(&p.ast.nodes, Node(Expression(expr)))
@@ -556,6 +586,57 @@ parse_struct_literal :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionId
 	}
 	expect(p, .RIGHT_BRACE)
 	expr := StructLiteralExpression{type_name = type_name, fields = fields[:]}
+	append_elem(&p.ast.nodes, Node(Expression(expr)))
+	append_elem(&p.ast.spans, type_name.span)
+	return ExpressionIdx(len(p.ast.nodes) - 1)
+}
+
+// token_after_brackets peeks past a balanced [...] without consuming any tokens.
+// Returns the kind of the first token that follows the closing ].
+@private
+token_after_brackets :: proc(p: ^Parser) -> lexer.TokenType {
+	saved_lex := p.lex
+	saved_tok := p.current_token
+	depth := 0
+	result := lexer.TokenType.EOF
+	loop: for p.current_token.kind != .EOF {
+		kind := p.current_token.kind
+		_ = advance(p)
+		if kind == .LEFT_BRACKET {
+			depth += 1
+		} else if kind == .RIGHT_BRACKET {
+			depth -= 1
+			if depth == 0 {
+				result = p.current_token.kind
+				break loop
+			}
+		}
+	}
+	p.lex = saved_lex
+	p.current_token = saved_tok
+	return result
+}
+
+@private
+parse_generic_struct_literal :: proc(p: ^Parser, type_name: lexer.Token) -> ExpressionIdx {
+	expect(p, .LEFT_BRACKET)
+	type_args := make([dynamic]TypeIdx)
+	for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
+		append_elem(&type_args, parse_type(p))
+		if peek(p) != .RIGHT_BRACKET { expect(p, .COMMA) }
+	}
+	expect(p, .RIGHT_BRACKET)
+	expect(p, .LEFT_BRACE)
+	fields := make([dynamic]StructLiteralField)
+	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
+		name  := expect(p, .IDENT)
+		expect(p, .EQ)
+		value := parse_expr(p, 0)
+		append_elem(&fields, StructLiteralField{name = name, value = value})
+		if peek(p) != .RIGHT_BRACE { expect(p, .COMMA) }
+	}
+	expect(p, .RIGHT_BRACE)
+	expr := StructLiteralExpression{type_name = type_name, type_args = type_args[:], fields = fields[:]}
 	append_elem(&p.ast.nodes, Node(Expression(expr)))
 	append_elem(&p.ast.spans, type_name.span)
 	return ExpressionIdx(len(p.ast.nodes) - 1)

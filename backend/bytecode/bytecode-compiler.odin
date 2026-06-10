@@ -46,28 +46,32 @@ Compiler :: struct {
 	error_count:       u8,
 	loop_ctx:          ^LoopCtx,
 	const_table:       map[string]Value,
-	struct_layouts:    map[string]StructLayout,
+	struct_layouts:    ^map[string]StructLayout,
 	enum_layouts:      map[string]EnumLayout,
 	tc_types:          []tc.TypeId,
 	tc_type_table:     []tc.TypeInfo,
-	generic_templates: map[string]parser.FunctionDecl, // name → template for generic functions
-	generic_emitted:   map[string]bool,                // mangled names already compiled
-	type_subst:        map[string]string,              // active during generic instantiation: T → "int"
-	root:              ^Compiler,                      // nil for root; points to root for child compilers
+	generic_templates:        map[string]parser.FunctionDecl, // name → template for generic functions
+	generic_struct_templates: map[string]parser.StructDecl,  // name → template for generic structs
+	generic_emitted:          map[string]bool,                // mangled names already compiled
+	type_subst:               map[string]string,              // active during generic instantiation: T → "int"
+	root:                     ^Compiler,                      // nil for root; points to root for child compilers
 }
 
 new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
+	sl := new(map[string]StructLayout)
+	sl^ = make(map[string]StructLayout)
 	return Compiler{
 		bc                = new_bytecode_compiler("__main__", 0),
 		ast               = ast,
 		const_table       = make(map[string]Value),
-		struct_layouts    = make(map[string]StructLayout),
+		struct_layouts    = sl,
 		enum_layouts      = make(map[string]EnumLayout),
 		tc_types          = tc_types,
 		tc_type_table     = tc_type_table,
-		generic_templates = make(map[string]parser.FunctionDecl),
-		generic_emitted   = make(map[string]bool),
-		type_subst        = make(map[string]string),
+		generic_templates        = make(map[string]parser.FunctionDecl),
+		generic_struct_templates = make(map[string]parser.StructDecl),
+		generic_emitted          = make(map[string]bool),
+		type_subst               = make(map[string]string),
 	}
 }
 
@@ -75,6 +79,7 @@ compiler_destroy :: proc(c: ^Compiler) {
 	compiler_free(&c.bc)
 	delete(c.const_table)
 	delete(c.generic_templates)
+	delete(c.generic_struct_templates)
 	delete(c.generic_emitted)
 	delete(c.type_subst)
 }
@@ -84,12 +89,14 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 
 	// Two-pass struct layout building: the first pass registers all struct names
 	// so the second pass can correctly resolve forward references (e.g. Monkey
-	// referencing Person which is declared after it).
+	// referencing Person which is declared after it). Generic structs are skipped —
+	// their layouts are built on demand during instantiation.
 	for _ in 0 ..= 1 {
 		for node in ast.nodes {
 			if decl, ok := node.(parser.Declaration); ok {
 				if sd, ok2 := decl.(parser.StructDecl); ok2 {
-					c.struct_layouts[sd.name.data] = build_struct_layout(&c, sd)
+					if len(sd.type_params) > 0 { continue }
+					c.struct_layouts^[sd.name.data] = build_struct_layout(&c, sd)
 				}
 			}
 		}
@@ -111,6 +118,11 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 			if fn, ok2 := decl.(parser.FunctionDecl); ok2 {
 				if len(fn.type_params) > 0 {
 					c.generic_templates[fn.name.data] = fn
+				}
+			}
+			if sd, ok2 := decl.(parser.StructDecl); ok2 {
+				if len(sd.type_params) > 0 {
+					c.generic_struct_templates[sd.name.data] = sd
 				}
 			}
 		}
@@ -164,8 +176,9 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 	case parser.ImportDecl:
 		// skip for now
 	case parser.StructDecl:
+		if len(d.type_params) > 0 { return }
 		layout := build_struct_layout(c, d)
-		c.struct_layouts[d.name.data] = layout
+		c.struct_layouts^[d.name.data] = layout
 	case parser.EnumDecl:
 		layout := build_enum_layout(c, d)
 		c.enum_layouts[d.name.data] = layout
@@ -180,7 +193,7 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		enum_name   := type_ann_enum_name(c, param.type)
 		slots := 1
 		if struct_name != "" {
-			if layout, ok := c.struct_layouts[struct_name]; ok {
+			if layout, ok := c.struct_layouts^[struct_name]; ok {
 				slots = layout.total_slots
 			}
 		} else if enum_name != "" {
@@ -203,7 +216,7 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		ptr_inner   := type_ann_ptr_inner(c, param.type)
 		slots := 1
 		if struct_name != "" {
-			if layout, ok := c.struct_layouts[struct_name]; ok {
+			if layout, ok := c.struct_layouts^[struct_name]; ok {
 				slots = layout.total_slots
 			}
 		} else if enum_name != "" {
@@ -233,10 +246,11 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		enum_layouts      = c.enum_layouts,
 		tc_types          = c.tc_types,
 		tc_type_table     = c.tc_type_table,
-		generic_templates = c.generic_templates,
-		generic_emitted   = c.generic_emitted,
-		type_subst        = child_subst,
-		root              = root_c,
+		generic_templates        = c.generic_templates,
+		generic_struct_templates = c.generic_struct_templates,
+		generic_emitted          = c.generic_emitted,
+		type_subst               = child_subst,
+		root                     = root_c,
 	}
 	compile_fn_body(&child, d.body)
 	emit(&child.bc, .RETURN, span)
@@ -359,7 +373,7 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			}
 			slots := 1
 			if struct_type != "" {
-				if layout, ok := c.struct_layouts[struct_type]; ok {
+				if layout, ok := c.struct_layouts^[struct_type]; ok {
 					slots = layout.total_slots
 				}
 			} else if enum_type != "" {
@@ -611,14 +625,9 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 							saved := make(map[string]string)
 							for k, v in root_c.type_subst { saved[k] = v }
 							clear(&root_c.type_subst)
-							for param, pi in tmpl.params {
-								if pi >= len(e.args) { break }
-								ann := type_ann_raw_name(c, param.type)
-								is_tp := false
-								for tp in tmpl.type_params { if tp.data == ann { is_tp = true; break } }
-								if !is_tp { continue }
-								concrete := infer_type_param(c, tmpl, ann, e.args)
-								if concrete != "" { root_c.type_subst[ann] = concrete }
+							for tp in tmpl.type_params {
+								concrete := infer_type_param(c, tmpl, tp.data, e.args)
+								if concrete != "" { root_c.type_subst[tp.data] = concrete }
 							}
 							compile_function(root_c, tmpl, mangled, span)
 							clear(&root_c.type_subst)
@@ -718,7 +727,7 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 	case parser.FieldAccessExpression:
 		base_slot, heap_offset, parent_type, chain_ok := resolve_access_chain(c, lhs.object)
 		if chain_ok && parent_type != "" {
-			layout, has_layout := c.struct_layouts[parent_type]
+			layout, has_layout := c.struct_layouts^[parent_type]
 			if !has_layout { compiler_error(c, "compound assignment on non-struct field", span); return }
 			field_offset, _, _, _, field_found := find_field(layout, lhs.field.data)
 			if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
@@ -748,7 +757,7 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 			// GET: emit ptr, HEAP_GET field; apply op; SET: emit ptr again, HEAP_SET field.
 			heap_base1, container_type, ok1 := compile_ptr_to_container(c, lhs.object, span)
 			if !ok1 { compiler_error(c, "invalid compound assignment target", span); return }
-			layout, has := c.struct_layouts[container_type]
+			layout, has := c.struct_layouts^[container_type]
 			if !has { compiler_error(c, "compound assignment on non-struct field", span); return }
 			field_offset, _, _, _, field_found := find_field(layout, lhs.field.data)
 			if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", lhs.field.data), span); return }
@@ -1273,11 +1282,16 @@ type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 	ty, ok := node.(parser.Type)
 	if !ok do return 1
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return 1
+	if gt, ok2 := ty.(parser.GenericType); ok2 {
+		mangled := generic_struct_mangled_name(c, gt.name.data, gt.args)
+		if layout, found := c.struct_layouts^[mangled]; found { return layout.total_slots }
+		return 1
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return 1
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
-	if layout, ok3 := c.struct_layouts[name]; ok3 {
+	if layout, ok3 := c.struct_layouts^[name]; ok3 {
 		return layout.total_slots
 	}
 	if layout, ok3 := c.enum_layouts[name]; ok3 {
@@ -1292,11 +1306,16 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	ty, ok := node.(parser.Type)
 	if !ok do return ""
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return ""
+	if gt, ok2 := ty.(parser.GenericType); ok2 {
+		mangled := generic_struct_mangled_name(c, gt.name.data, gt.args)
+		if _, found := c.struct_layouts^[mangled]; found { return mangled }
+		return ""
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
-	if _, ok3 := c.struct_layouts[name]; ok3 {
+	if _, ok3 := c.struct_layouts^[name]; ok3 {
 		return name
 	}
 	return ""
@@ -1323,7 +1342,7 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 	st := expr_struct_type(c, idx)
 	if st != "" {
-		if layout, ok := c.struct_layouts[st]; ok do return layout.total_slots
+		if layout, ok := c.struct_layouts^[st]; ok do return layout.total_slots
 	}
 	et := expr_enum_type(c, idx)
 	if et != "" {
@@ -1457,7 +1476,21 @@ call_return_struct_type :: proc(c: ^Compiler, e: parser.CallExpression) -> strin
 		if fn.name.data != fn_name do continue
 		ret_idx, has_ret := fn.return_type.?
 		if !has_ret do return ""
-		return type_ann_struct_name(c, ret_idx)
+		if len(fn.type_params) == 0 {
+			return type_ann_struct_name(c, ret_idx)
+		}
+		// Generic function: infer substitution from args, resolve return type with it.
+		saved := make(map[string]string)
+		for k, v in c.type_subst { saved[k] = v }
+		for tp in fn.type_params {
+			concrete := infer_type_param(c, fn, tp.data, e.args)
+			if concrete != "" { c.type_subst[tp.data] = concrete }
+		}
+		result := type_ann_struct_name(c, ret_idx)
+		clear(&c.type_subst)
+		for k, v in saved { c.type_subst[k] = v }
+		delete(saved)
+		return result
 	}
 	return ""
 }
@@ -1489,13 +1522,17 @@ expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	if !ok do return ""
 	#partial switch e in expr {
 	case parser.StructLiteralExpression:
+		if len(e.type_args) > 0 {
+			mangled := generic_struct_mangled_name(c, e.type_name.data, e.type_args)
+			if _, ok := c.struct_layouts^[mangled]; ok { return mangled }
+		}
 		return e.type_name.data
 	case parser.IdentExpression:
 		return local_struct_type(&c.bc, lexer.Token(e).data)
 	case parser.FieldAccessExpression:
 		_, _, parent_type, ok2 := resolve_access_chain(c, e.object)
 		if !ok2 do return ""
-		layout, has := c.struct_layouts[parent_type]
+		layout, has := c.struct_layouts^[parent_type]
 		if !has do return ""
 		_, _, field_st, _, found := find_field(layout, e.field.data)
 		if !found do return ""
@@ -1528,9 +1565,18 @@ expr_ptr_inner :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 }
 
 compile_struct_literal :: proc(c: ^Compiler, e: parser.StructLiteralExpression, span: lexer.Span) {
-	layout, ok := c.struct_layouts[e.type_name.data]
+	struct_name := e.type_name.data
+	if len(e.type_args) > 0 {
+		tmpl, is_generic := c.generic_struct_templates[struct_name]
+		if !is_generic {
+			compiler_error(c, fmt.tprintf("undefined generic struct '%s'", struct_name), span)
+			return
+		}
+		struct_name = instantiate_generic_struct(c, tmpl, e.type_args)
+	}
+	layout, ok := c.struct_layouts^[struct_name]
 	if !ok {
-		compiler_error(c, fmt.tprintf("undefined struct '%s'", e.type_name.data), span)
+		compiler_error(c, fmt.tprintf("undefined struct '%s'", struct_name), span)
 		return
 	}
 	field_map := make(map[string]parser.ExpressionIdx)
@@ -1571,7 +1617,7 @@ resolve_access_chain :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (slot: 
 	case parser.FieldAccessExpression:
 		base, h_off, parent_type, chain_ok := resolve_access_chain(c, e.object)
 		if !chain_ok do return 0, -1, "", false
-		layout, has := c.struct_layouts[parent_type]
+		layout, has := c.struct_layouts^[parent_type]
 		if !has do return 0, -1, "", false
 		offset, _, field_st, _, found := find_field(layout, e.field.data)
 		if !found do return 0, -1, "", false
@@ -1607,7 +1653,7 @@ compile_ptr_to_container :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: 
 	case parser.FieldAccessExpression:
 		base, parent_type, chain_ok := compile_ptr_to_container(c, e.object, span)
 		if !chain_ok do return 0, "", false
-		layout, has := c.struct_layouts[parent_type]
+		layout, has := c.struct_layouts^[parent_type]
 		if !has do return 0, "", false
 		field_offset, _, field_st, field_pi, found := find_field(layout, e.field.data)
 		if !found do return 0, "", false
@@ -1630,7 +1676,7 @@ compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span
 	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
 	if ok && parent_type != "" {
-		layout, has_layout := c.struct_layouts[parent_type]
+		layout, has_layout := c.struct_layouts^[parent_type]
 		if !has_layout {
 			compiler_error(c, "field access on non-struct value", span)
 			return
@@ -1659,7 +1705,7 @@ compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span
 	// Fallback: chain passes through a pointer-typed field (e.g. a.next.val).
 	heap_base, container_type, chain_ok := compile_ptr_to_container(c, e.object, span)
 	if !chain_ok { compiler_error(c, "invalid field access", span); return }
-	layout, has := c.struct_layouts[container_type]
+	layout, has := c.struct_layouts^[container_type]
 	if !has { compiler_error(c, "field access on non-struct value", span); return }
 	field_offset, field_slots, _, _, field_found := find_field(layout, e.field.data)
 	if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span); return }
@@ -1680,7 +1726,7 @@ compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: l
 	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
 	if ok && parent_type != "" {
-		layout, has_layout := c.struct_layouts[parent_type]
+		layout, has_layout := c.struct_layouts^[parent_type]
 		if !has_layout {
 			compiler_error(c, "field assignment on non-struct value", span)
 			return
@@ -1705,7 +1751,7 @@ compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: l
 	// Fallback: value is already on stack; emit ptr to container, then HEAP_SET.
 	heap_base, container_type, chain_ok := compile_ptr_to_container(c, e.object, span)
 	if !chain_ok { compiler_error(c, "invalid field assignment target", span); return }
-	layout, has := c.struct_layouts[container_type]
+	layout, has := c.struct_layouts^[container_type]
 	if !has { compiler_error(c, "field assignment on non-struct value", span); return }
 	field_offset, _, _, _, field_found := find_field(layout, e.field.data)
 	if !field_found { compiler_error(c, fmt.tprintf("unknown field '%s'", e.field.data), span); return }
@@ -1716,7 +1762,7 @@ compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: l
 // compile_new_expr pushes all struct fields in layout order, then emits NEW N.
 // The VM allocates a heap slice of N Value slots, pops them, and pushes a ^Value pointer.
 compile_new_expr :: proc(c: ^Compiler, e: parser.NewExpression, span: lexer.Span) {
-	layout, ok := c.struct_layouts[e.type_name.data]
+	layout, ok := c.struct_layouts^[e.type_name.data]
 	if !ok {
 		compiler_error(c, fmt.tprintf("undefined struct '%s'", e.type_name.data), span)
 		emit(&c.bc, .NIL, span)
@@ -1746,7 +1792,7 @@ compile_deref_expr :: proc(c: ^Compiler, e: parser.DerefExpression, span: lexer.
 	pi := expr_ptr_inner(c, e.operand)
 	n := 1
 	if pi != "" {
-		if layout, ok := c.struct_layouts[pi]; ok {
+		if layout, ok := c.struct_layouts^[pi]; ok {
 			n = layout.total_slots
 		}
 	}
@@ -1756,6 +1802,50 @@ compile_deref_expr :: proc(c: ^Compiler, e: parser.DerefExpression, span: lexer.
 }
 
 // ---- generics ----
+
+// generic_struct_mangled_name computes the monomorphised name for a generic struct,
+// e.g. Box[int] → "Box__int", Pair[int, float] → "Pair__int__float".
+@private
+generic_struct_mangled_name :: proc(c: ^Compiler, struct_name: string, type_args: []parser.TypeIdx) -> string {
+	b := strings.builder_make()
+	strings.write_string(&b, struct_name)
+	for arg in type_args {
+		strings.write_string(&b, "__")
+		strings.write_string(&b, type_arg_mangled_name(c, arg))
+	}
+	return strings.to_string(b)
+}
+
+// instantiate_generic_struct builds and registers the concrete StructLayout for a
+// generic struct if it has not been registered yet. Returns the mangled name.
+@private
+instantiate_generic_struct :: proc(c: ^Compiler, tmpl: parser.StructDecl, type_args: []parser.TypeIdx) -> string {
+	mangled := generic_struct_mangled_name(c, tmpl.name.data, type_args)
+	if _, exists := c.struct_layouts^[mangled]; exists { return mangled }
+	// Pre-instantiate any GenericType args so their layouts exist when we build ours.
+	for arg_idx in type_args {
+		if int(arg_idx) >= len(c.ast.nodes) { continue }
+		ty_node, ok := c.ast.nodes[int(arg_idx)].(parser.Type)
+		if !ok { continue }
+		if gt, ok2 := ty_node.(parser.GenericType); ok2 {
+			if inner_tmpl, has := c.generic_struct_templates[gt.name.data]; has {
+				instantiate_generic_struct(c, inner_tmpl, gt.args)
+			}
+		}
+	}
+	saved := make(map[string]string)
+	for k, v in c.type_subst { saved[k] = v }
+	for tp, i in tmpl.type_params {
+		if i >= len(type_args) { break }
+		c.type_subst[tp.data] = type_arg_mangled_name(c, type_args[i])
+	}
+	layout := build_struct_layout(c, tmpl)
+	c.struct_layouts^[mangled] = layout
+	clear(&c.type_subst)
+	for k, v in saved { c.type_subst[k] = v }
+	delete(saved)
+	return mangled
+}
 
 // type_ann_raw_name returns the raw identifier string of a NamedType annotation,
 // or "" for pointer/fn types. Used to detect which params are type parameters.
@@ -1768,6 +1858,51 @@ type_ann_raw_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 { return "" }
 	return lexer.Token(named).data
+}
+
+// type_arg_mangled_name returns the fully-resolved name for one type argument.
+// For NamedType it applies type_subst ("T" → "int").
+// For GenericType it recurses to produce a mangled name ("Box[int]" → "Box__int").
+@private
+type_arg_mangled_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
+	if int(type_idx) >= len(c.ast.nodes) { return "" }
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok { return "" }
+	if gt, ok2 := ty.(parser.GenericType); ok2 {
+		return generic_struct_mangled_name(c, gt.name.data, gt.args)
+	}
+	named, ok2 := ty.(parser.NamedType)
+	if !ok2 { return "" }
+	name := lexer.Token(named).data
+	if subst, has := c.type_subst[name]; has { name = subst }
+	return name
+}
+
+// parse_one_mangled_arg reads one type-arg token from the front of s, returning
+// the full mangled arg name and the rest of the string after consuming it.
+// Respects nested generic arities: "Box__int" in "Box__int__float" → ("Box__int", "float").
+@private
+parse_one_mangled_arg :: proc(c: ^Compiler, s: string) -> (arg: string, rest: string) {
+	sep := strings.index(s, "__")
+	token, tail: string
+	if sep < 0 {
+		token = s; tail = ""
+	} else {
+		token = s[:sep]; tail = s[sep+2:]
+	}
+	tmpl, is_gen := c.generic_struct_templates[token]
+	if !is_gen { return token, tail }
+	b := strings.builder_make()
+	strings.write_string(&b, token)
+	remaining := tail
+	for _ in tmpl.type_params {
+		sub_arg, sub_rest := parse_one_mangled_arg(c, remaining)
+		strings.write_string(&b, "__")
+		strings.write_string(&b, sub_arg)
+		remaining = sub_rest
+	}
+	return strings.to_string(b), remaining
 }
 
 // type_id_to_name converts a typechecker TypeId to a concrete type name string.
@@ -1788,26 +1923,84 @@ type_id_to_name :: proc(c: ^Compiler, id: tc.TypeId) -> string {
 	return ""
 }
 
-// infer_arg_type_name returns the concrete type name for an argument expression
-// using the type checker's results.
+// infer_arg_type_name returns the concrete type name for an argument expression.
+// Prefers the runtime mangled struct/enum name so generic struct args (e.g. Box__int)
+// are not collapsed back to their template name by the typechecker.
 @private
 infer_arg_type_name :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
+	if st := expr_struct_type(c, idx); st != "" { return st }
+	if et := expr_enum_type(c, idx); et != "" { return et }
 	if c.tc_types == nil || int(idx) >= len(c.tc_types) { return "" }
 	return type_id_to_name(c, c.tc_types[int(idx)])
 }
 
 // infer_type_param finds the concrete type for one type parameter by scanning the
-// call's argument list and matching parameters annotated with that type param name.
+// call's argument list matching parameters annotated with that type param name,
+// either directly (a: T) or structurally (b: Box[T]).
 @private
 infer_type_param :: proc(c: ^Compiler, tmpl: parser.FunctionDecl, type_param_name: string, args: []parser.ExpressionIdx) -> string {
 	for param, i in tmpl.params {
 		if i >= len(args) { break }
 		ann := type_ann_raw_name(c, param.type)
-		if ann != type_param_name { continue }
-		concrete := infer_arg_type_name(c, args[i])
-		if concrete != "" { return concrete }
-		// Fallback: inside a generic body, tc_types are UNKNOWN; use the active substitution instead.
-		if subst, has := c.type_subst[type_param_name]; has { return subst }
+		if ann == type_param_name {
+			// Direct match: param type is T itself.
+			concrete := infer_arg_type_name(c, args[i])
+			if concrete != "" { return concrete }
+			if subst, has := c.type_subst[type_param_name]; has { return subst }
+		} else {
+			// Structural match: param type might be a generic struct containing T, e.g. Box[T].
+			extracted := infer_type_param_from_generic(c, param.type, type_param_name, args[i])
+			if extracted != "" { return extracted }
+		}
+	}
+	return ""
+}
+
+// infer_type_param_from_generic handles the case where a parameter is declared as
+// a generic struct type such as Box[T]. It looks up which position T occupies in
+// the type args of the generic struct, then reads that position out of the
+// argument's concrete struct name (e.g. "Box__int" → "int").
+@private
+infer_type_param_from_generic :: proc(c: ^Compiler, param_type_idx: parser.TypeIdx, type_param_name: string, arg_idx: parser.ExpressionIdx) -> string {
+	if int(param_type_idx) >= len(c.ast.nodes) { return "" }
+	ty, ok := c.ast.nodes[int(param_type_idx)].(parser.Type)
+	if !ok { return "" }
+	gt, ok2 := ty.(parser.GenericType)
+	if !ok2 { return "" }
+
+	// Find which position type_param_name occupies in the generic type's args.
+	tp_pos := -1
+	for tp_arg, j in gt.args {
+		if type_ann_raw_name(c, tp_arg) == type_param_name { tp_pos = j; break }
+	}
+	if tp_pos < 0 { return "" }
+
+	// Case 1: arg is a struct literal with explicit type args, e.g. Box[int]{...}.
+	// Read the type directly without needing a compiled layout.
+	if arg_node, ok3 := c.ast.nodes[int(arg_idx)].(parser.Expression); ok3 {
+		if sle, ok4 := arg_node.(parser.StructLiteralExpression); ok4 {
+			if sle.type_name.data == gt.name.data && tp_pos < len(sle.type_args) {
+				name := type_arg_mangled_name(c, sle.type_args[tp_pos])
+				if name != "" { return name }
+			}
+		}
+	}
+
+	// Case 2: arg is a compiled local/expression — its struct type is a mangled
+	// name like "Box__int". Use parse_one_mangled_arg to correctly handle nested
+	// generic names such as "Box__Box__int" → tp_pos=0 yields "Box__int".
+	arg_struct := expr_struct_type(c, arg_idx)
+	if arg_struct == "" { return "" }
+	base := gt.name.data
+	if !strings.has_prefix(arg_struct, base) { return "" }
+	after_base := arg_struct[len(base):]
+	if !strings.has_prefix(after_base, "__") { return "" }
+	suffix := after_base[2:]
+	remaining := suffix
+	for i := 0; i <= tp_pos; i += 1 {
+		arg_tok, rest := parse_one_mangled_arg(c, remaining)
+		if i == tp_pos { return arg_tok }
+		remaining = rest
 	}
 	return ""
 }

@@ -2056,3 +2056,169 @@ test_e2e_generic_called_multiple_times :: proc(t: ^testing.T) {
 	`)
 	testing.expect_value(t, val.(i64), i64(10))
 }
+
+@(test)
+test_e2e_generic_struct_return_basic :: proc(t: ^testing.T) {
+	// Generic function that returns a generic struct; field access on the result.
+	val := result(`
+		struct Stack[T] { top: T, size: int }
+		function make_stack[T](val: T) -> Stack[T] {
+			return Stack[T]{top = val, size = 1}
+		}
+		function main() -> i64 {
+			let s = make_stack(99)
+			return s.top
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@(test)
+test_e2e_generic_struct_return_size :: proc(t: ^testing.T) {
+	// The non-type-param field (size: int) is also readable.
+	val := result(`
+		struct Stack[T] { top: T, size: int }
+		function make_stack[T](val: T) -> Stack[T] {
+			return Stack[T]{top = val, size = 3}
+		}
+		function main() -> i64 {
+			let s = make_stack(0)
+			return s.size
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(3))
+}
+
+@(test)
+test_e2e_generic_struct_return_then_pass :: proc(t: ^testing.T) {
+	// Generic struct returned from one function and passed to another.
+	val := result(`
+		struct Stack[T] { top: T, size: int }
+		function make_stack[T](val: T) -> Stack[T] {
+			return Stack[T]{top = val, size = 1}
+		}
+		function peek[T](s: Stack[T]) -> T {
+			return s.top
+		}
+		function main() -> i64 {
+			let s = make_stack(55)
+			return peek(s)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(55))
+}
+
+@(test)
+test_e2e_generic_struct_return_two_type_params :: proc(t: ^testing.T) {
+	// Generic function returning a two-parameter generic struct.
+	val := result(`
+		struct Pair[A, B] { first: A, second: B }
+		function make_pair[A, B](a: A, b: B) -> Pair[A, B] {
+			return Pair[A, B]{first = a, second = b}
+		}
+		function main() -> i64 {
+			let p = make_pair(7, 3.14)
+			return p.first
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_generic_struct_return_get_first :: proc(t: ^testing.T) {
+	// Generic function that takes and returns from a two-type-param struct.
+	val := result(`
+		struct Pair[A, B] { first: A, second: B }
+		function make_pair[A, B](a: A, b: B) -> Pair[A, B] {
+			return Pair[A, B]{first = a, second = b}
+		}
+		function get_first[A, B](p: Pair[A, B]) -> A {
+			return p.first
+		}
+		function main() -> i64 {
+			let p = make_pair(42, 1.0)
+			return get_first(p)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@test
+test_e2e_nested_generic_struct_field_access :: proc(t: ^testing.T) {
+	// Box[Box[int]] — two levels of nesting, field access traverses both.
+	val := result(`
+		struct Box[T] { value: T }
+		function main() -> i64 {
+			let inner = Box[int]{value = 99}
+			let outer = Box[Box[int]]{value = inner}
+			return outer.value.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@test
+test_e2e_nested_generic_struct_triple :: proc(t: ^testing.T) {
+	// Box[Box[Box[int]]] — three levels of nesting.
+	val := result(`
+		struct Box[T] { value: T }
+		function main() -> i64 {
+			let a = Box[int]{value = 7}
+			let b = Box[Box[int]]{value = a}
+			let c = Box[Box[Box[int]]]{value = b}
+			return c.value.value.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@test
+test_e2e_nested_generic_struct_unwrap :: proc(t: ^testing.T) {
+	// Generic function unwrap[T](b: Box[T]) -> T called with Box[Box[int]] arg.
+	val := result(`
+		struct Box[T] { value: T }
+		function unwrap[T](b: Box[T]) -> T {
+			return b.value
+		}
+		function main() -> i64 {
+			let inner = Box[int]{value = 42}
+			let outer = Box[Box[int]]{value = inner}
+			let mid = unwrap(outer)
+			return mid.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@test
+test_e2e_nested_generic_struct_wrap_return :: proc(t: ^testing.T) {
+	// Generic function wrap[T](v: T) -> Box[T] called with Box[int] arg,
+	// returning Box[Box[int]] — tests generic struct in return position.
+	val := result(`
+		struct Box[T] { value: T }
+		function wrap[T](v: T) -> Box[T] {
+			return Box[T]{value = v}
+		}
+		function main() -> i64 {
+			let inner = Box[int]{value = 55}
+			let outer = wrap(inner)
+			return outer.value.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(55))
+}
+
+@test
+test_e2e_nested_generic_struct_pair_box :: proc(t: ^testing.T) {
+	// Pair where one member is a generic struct Box[int].
+	val := result(`
+		struct Box[T] { value: T }
+		struct Pair[A, B] { first: A, second: B }
+		function main() -> i64 {
+			let b = Box[int]{value = 13}
+			let p = Pair[Box[int], int]{first = b, second = 99}
+			return p.first.value
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(13))
+}

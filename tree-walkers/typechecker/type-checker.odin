@@ -56,6 +56,7 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 		tc.types[int(def)] = infer(tc, d.value)
 
 	case parser.StructDecl:
+		if len(d.type_params) > 0 { return }
 		// Pre-register a stub so self-referential fields (e.g. next: ^Node) can resolve this struct.
 		st_id := TypeId(len(tc.type_table))
 		append(&tc.type_table, TypeInfo(StructType{name = d.name.data}))
@@ -617,6 +618,12 @@ get_type_info :: proc(tc: ^Typechecker, id: TypeId) -> (TypeInfo, bool) {
 
 @private
 infer_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.StructLiteralExpression) -> TypeId {
+	// Generic struct literal (e.g. Box[int]{...}): visit field values for tc_types
+	// but skip template-level type checking — the compiler handles monomorphisation.
+	if len(e.type_args) > 0 {
+		for field in e.fields { infer(tc, field.value) }
+		return UNKNOWN_TYPE
+	}
 	struct_type_id := UNKNOWN_TYPE
 	found_st: StructType
 	for info, i in tc.type_table {

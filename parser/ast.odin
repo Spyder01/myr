@@ -67,6 +67,7 @@ StructLiteralField :: struct {
 
 StructLiteralExpression :: struct {
 	type_name: lexer.Token,
+	type_args: []TypeIdx,
 	fields:    []StructLiteralField,
 }
 
@@ -174,9 +175,10 @@ StructField :: struct {
 Layout_Qualifier :: enum { SOA, AOS }
 
 StructDecl :: struct {
-	name:      lexer.Token,
-	qualifier: Maybe(Layout_Qualifier),
-	fields:    []StructField,
+	name:        lexer.Token,
+	type_params: []lexer.Token,
+	qualifier:   Maybe(Layout_Qualifier),
+	fields:      []StructField,
 }
 
 EnumVariant :: struct {
@@ -250,6 +252,7 @@ ast_destroy :: proc(ast: ^AST) {
 				delete(d.params)
 				delete(d.body.stmts)
 			case StructDecl:
+				delete(d.type_params)
 				delete(d.fields)
 			case EnumDecl:
 				delete(d.variants)
@@ -282,6 +285,7 @@ ast_destroy :: proc(ast: ^AST) {
 				delete(e.then_block.stmts)
 				if eb, ok := e.else_block.?; ok do delete(eb.stmts)
 			case StructLiteralExpression:
+				delete(e.type_args)
 				delete(e.fields)
 			case NewExpression:
 				delete(e.fields)
