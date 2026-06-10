@@ -1,0 +1,44 @@
+// String operations: character counting, boundary checks, .len
+
+function count_char(s: str, ch: str) -> int {
+    let n = 0
+    for let i = 0; i < s.len; i += 1 {
+        if s[i] == ch {
+            n += 1
+        }
+    }
+    return n
+}
+
+function main() {
+    // Count occurrences of a character
+    let sentence = "mississippi"
+    let count_s = count_char(sentence, "s")
+    print(count_s)
+
+    let count_i = count_char(sentence, "i")
+    print(count_i)
+
+    let count_p = count_char(sentence, "p")
+    print(count_p)
+
+    // Verify first and last character of a string
+    let word = "myr"
+    let first = word[0]
+    let last = word[word.len - 1]
+    print(first)
+    print(last)
+
+    // Show .len usage
+    print(word.len)
+    print(sentence.len)
+
+    // Another boundary check
+    let greeting = "hello"
+    if greeting[0] == "h" {
+        print(greeting.len)
+    }
+    if greeting[greeting.len - 1] == "o" {
+        print(greeting[2])
+    }
+}

@@ -32,6 +32,7 @@ VMError :: enum {
 	CALL_NON_FUNCTION,
 	DIVISION_BY_ZERO,
 	NULL_DEREF,
+	INDEX_OUT_OF_BOUNDS,
 }
 
 new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
@@ -276,6 +277,88 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			// Leave elem_slots values on the stack — mirrors SET_LOCAL's peek-not-pop contract.
 			// The expression statement caller emits POPs via expr_slot_count.
 
+		case .MAKE_SLICE:
+			elem_slots      := int(read_byte(vm))
+			gf_val, err1    := vm_pop(vm); if err1 != nil do return err1
+			cap_val, err2   := vm_pop(vm); if err2 != nil do return err2
+			cap, ok1        := cap_val.(i64); if !ok1 do return .TYPE_ERROR
+			gf_raw, ok2     := gf_val.(i64);  if !ok2 do return .TYPE_ERROR
+			if gf_raw < 0 || gf_raw > 255 do return .TYPE_ERROR
+			if cap <= 0 { cap = 1 }
+			if cap > i64(max(u32)) do return .TYPE_ERROR
+			cap = i64(u32(cap))
+			gf := u8(gf_raw)
+			slots           := make([]Value, int(cap) * elem_slots)
+			append(&vm.heap_objects, slots)
+			ptr: [^]Value = raw_data(slots)
+			if err3 := vm_push(vm, ptr);        err3 != nil do return err3  // ptr
+			if err3 := vm_push(vm, i64(0));     err3 != nil do return err3  // len = 0
+			if err3 := vm_push(vm, cap);        err3 != nil do return err3  // cap
+			if err3 := vm_push(vm, i64(gf));    err3 != nil do return err3  // grow_factor (stored as i64, semantically u8)
+
+		case .SLICE_GET:
+			elem_slots := int(read_byte(vm))
+			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
+			ptr_val, err2 := vm_pop(vm); if err2 != nil do return err2
+			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
+			ptr, ok2 := ptr_val.([^]Value); if !ok2 do return .TYPE_ERROR
+			if ptr == nil do return .NULL_DEREF
+			for s in 0..<elem_slots {
+				if push_err := vm_push(vm, ptr[int(i)*elem_slots + s]); push_err != nil do return push_err
+			}
+
+		case .SLICE_SET:
+			base_slot  := u16(read_byte(vm))
+			elem_slots := int(read_byte(vm))
+			frame      := current_frame(vm)
+			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
+			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
+			ptr         := vm.stack[frame.slots + base_slot].([^]Value)
+			cap         := u32(vm.stack[frame.slots + base_slot + 2].(i64))
+			grow_factor := u8(vm.stack[frame.slots + base_slot + 3].(i64))
+			if i >= i64(cap) {
+				if grow_factor == 0 do return .INDEX_OUT_OF_BOUNDS
+				new_cap := cap
+				for i64(new_cap) <= i { new_cap += u32(grow_factor) * new_cap }
+				new_slots := make([]Value, int(new_cap) * elem_slots)
+				old_len := int(cap) * elem_slots
+				for j in 0..<old_len { new_slots[j] = ptr[j] }
+				for obj, oi in vm.heap_objects {
+					if raw_data(obj) == ptr {
+						delete(obj)
+						vm.heap_objects[oi] = new_slots
+						break
+					}
+				}
+				ptr = raw_data(new_slots)
+				vm.stack[frame.slots + base_slot]     = ptr
+				vm.stack[frame.slots + base_slot + 2] = i64(new_cap)
+			}
+			top := int(vm.stack_top)
+			for s in 0..<elem_slots {
+				ptr[int(i)*elem_slots + s] = vm.stack[top - elem_slots + s]
+			}
+			cur_len := vm.stack[frame.slots + base_slot + 1].(i64)
+			if i + 1 > cur_len {
+				vm.stack[frame.slots + base_slot + 1] = i + 1
+			}
+			// Leave val on stack (peek contract — caller pops via expr_slot_count).
+
+		case .STR_LEN:
+			str_val, err1 := vm_pop(vm); if err1 != nil do return err1
+			s, ok := str_val.(string); if !ok do return .TYPE_ERROR
+			if push_err := vm_push(vm, i64(len(s))); push_err != nil do return push_err
+
+		case .STR_GET:
+			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
+			str_val, err2 := vm_pop(vm); if err2 != nil do return err2
+			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
+			s, ok2 := str_val.(string); if !ok2 do return .TYPE_ERROR
+			if i < 0 || i >= i64(len(s)) do return .INDEX_OUT_OF_BOUNDS
+			buf := make([]byte, 1)
+			buf[0] = s[i]
+			if push_err := vm_push(vm, string(buf)); push_err != nil do return push_err
+
 		case .NEW:
 			n := int(read_byte(vm))
 			slots := make([]Value, n)
@@ -442,7 +525,7 @@ print_value :: proc(val: Value) {
 vm_values_equal :: proc(a, b: Value) -> bool {
 	if as, ok := a.(string); ok {
 		if bs, ok2 := b.(string); ok2 {
-			return raw_data(as) == raw_data(bs)
+			return as == bs
 		}
 		return false
 	}

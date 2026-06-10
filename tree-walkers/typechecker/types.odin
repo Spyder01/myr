@@ -55,6 +55,11 @@ ArrayTypeInfo :: struct {
 	length: int,
 }
 
+// Slice type stored in the type table.
+SliceTypeInfo :: struct {
+	elem: TypeId,
+}
+
 // TypeInfo is the entry stored in the type table.
 TypeInfo :: union {
 	PrimitiveType,
@@ -63,6 +68,7 @@ TypeInfo :: union {
 	PointerType,
 	EnumType,
 	ArrayTypeInfo,
+	SliceTypeInfo,
 }
 
 TypeCheckerError :: struct {

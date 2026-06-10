@@ -2356,3 +2356,266 @@ test_e2e_array_write_multiple :: proc(t: ^testing.T) {
 	`)
 	testing.expect_value(t, val.(i64), i64(30))
 }
+
+// ---- Slice[T] tests ----
+
+@test
+test_e2e_slice_create_cap :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 5}
+			return s.cap
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+@test
+test_e2e_slice_initial_len :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 4}
+			return s.len
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(0))
+}
+
+@test
+test_e2e_slice_write_read :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 3}
+			s[0] = 42
+			return s[0]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@test
+test_e2e_slice_write_multiple :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 3}
+			s[0] = 10
+			s[1] = 20
+			s[2] = 30
+			return s[0] + s[1] + s[2]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(60))
+}
+
+@test
+test_e2e_slice_loop_sum :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 5}
+			s[0] = 1
+			s[1] = 2
+			s[2] = 3
+			s[3] = 4
+			s[4] = 5
+			let sum = 0
+			for let i = 0; i < 5; i += 1 {
+				sum += s[i]
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(15))
+}
+
+@test
+test_e2e_slice_default_cap :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{}
+			return s.cap
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(64))
+}
+
+@test
+test_e2e_slice_grow_beyond_cap :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 2}
+			s[0] = 10
+			s[1] = 20
+			s[2] = 30
+			return s[2]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(30))
+}
+
+@test
+test_e2e_slice_grow_preserves_data :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 2}
+			s[0] = 10
+			s[1] = 20
+			s[2] = 30
+			return s[0] + s[1] + s[2]
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(60))
+}
+
+@test
+test_e2e_slice_default_grow_factor :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{}
+			return s.grow_factor
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(1))
+}
+
+@test
+test_e2e_slice_explicit_grow_factor :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 4, grow_factor = 2}
+			return s.grow_factor
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(2))
+}
+
+@test
+test_e2e_slice_grow_cap_doubles :: proc(t: ^testing.T) {
+	val := result(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 2}
+			s[3] = 99
+			return s.cap
+		}
+	`)
+	// grow_factor=1: new_cap = cap + 1*cap = 2*cap → 2→4 (4>3, done)
+	testing.expect_value(t, val.(i64), i64(4))
+}
+
+@test
+test_e2e_slice_grow_factor_zero_panics :: proc(t: ^testing.T) {
+	_, err := run_source(`
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 2, grow_factor = 0}
+			s[5] = 99
+			return 0
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(VMError.INDEX_OUT_OF_BOUNDS))
+}
+
+// ---- string tests ----
+
+@test
+test_e2e_str_char_eq :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> bool {
+			let s = "hello"
+			return s[0] == "h"
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(true))
+}
+
+@test
+test_e2e_str_len :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> int {
+			let s = "hello"
+			return s.len
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(i64(5)))
+}
+
+@test
+test_e2e_str_get :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> str {
+			let s = "ABC"
+			return s[0]
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value("A"))
+}
+
+@test
+test_e2e_str_traverse :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> bool {
+			let s = "hello"
+			let found = false
+			for let i = 0; i < s.len; i += 1 {
+				if s[i] == "l" {
+					found = true
+				}
+			}
+			return found
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(true))
+}
+
+@test
+test_e2e_str_get_out_of_bounds :: proc(t: ^testing.T) {
+	_, err := run_source(`
+		function main() -> str {
+			let s = "hi"
+			return s[5]
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(VMError.INDEX_OUT_OF_BOUNDS))
+}
+
+// ---- slice tests ----
+
+// len tracks the highest index written + 1
+@test
+test_e2e_slice_len_tracking :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> i64 {
+			let s = Slice[i64]{cap = 2}
+			s[0] = 10
+			s[1] = 20
+			s[2] = 30
+			return s.len
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(i64(3)))
+}
+
+// fixed bound write + len-based read: the correct pattern for filling a growing slice
+@test
+test_e2e_slice_fill_and_read_via_len :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> i64 {
+			let s = Slice[i64]{cap = 2}
+			let n: i64 = 6
+			for let i: i64 = 0; i < n; i += 1 {
+				s[i] = i
+			}
+			let sum: i64 = 0
+			for let i: i64 = 0; i < s.len; i += 1 {
+				sum += s[i]
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	// sum of 0+1+2+3+4+5 = 15
+	testing.expect_value(t, val, Value(i64(15)))
+}

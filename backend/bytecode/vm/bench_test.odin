@@ -159,3 +159,135 @@ bench_flat_loop_accumulate :: proc(t: ^testing.T) {
 	dur := bench_interp(src, BENCH_ITERS)
 	bench_log(t, "scalar local write in loop (100 iters)", dur, BENCH_ITERS)
 }
+
+// ---- new benchmarks ----
+
+@(test)
+bench_fib_recursive :: proc(t: ^testing.T) {
+	src := `
+		function fib(n: i64) -> i64 {
+			if n <= 1 {
+				return n
+			}
+			return fib(n - 1) + fib(n - 2)
+		}
+		function main() -> i64 {
+			return fib(20)
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "fib(20) recursive", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_fib_iterative :: proc(t: ^testing.T) {
+	src := `
+		function fib(n: i64) -> i64 {
+			let a: i64 = 0
+			let b: i64 = 1
+			for let i: i64 = 0; i < n; i += 1 {
+				let tmp = a + b
+				a = b
+				b = tmp
+			}
+			return a
+		}
+		function main() -> i64 {
+			return fib(1000)
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "fib(1000) iterative", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_enum_match_loop :: proc(t: ^testing.T) {
+	src := `
+		enum Shape { Circle { radius: i64 }, Rect { w: i64, h: i64 } }
+		function area(s: Shape) -> i64 {
+			match s {
+				Shape.Circle { radius } => {
+					return radius * radius
+				}
+				Shape.Rect { w, h } => {
+					return w * h
+				}
+				_ => {
+					return 0
+				}
+			}
+			return 0
+		}
+		function main() -> i64 {
+			let total: i64 = 0
+			for let i: i64 = 0; i < 500; i += 1 {
+				total += area(Shape.Circle{radius = i})
+			}
+			return total
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "enum match loop (500 iters)", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_first_class_fn_call :: proc(t: ^testing.T) {
+	src := `
+		function double(x: i64) -> i64 {
+			return x * 2
+		}
+		function main() -> i64 {
+			let f = double
+			let sum: i64 = 0
+			for let i: i64 = 0; i < 1000; i += 1 {
+				sum += f(i)
+			}
+			return sum
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "first-class fn call in loop (1000 iters)", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_string_scan :: proc(t: ^testing.T) {
+	src := `
+		function count_char(s: str, ch: str) -> i64 {
+			let n: i64 = 0
+			for let i: i64 = 0; i < s.len; i += 1 {
+				if s[i] == ch {
+					n += 1
+				}
+			}
+			return n
+		}
+		function main() -> i64 {
+			let total: i64 = 0
+			for let i: i64 = 0; i < 100; i += 1 {
+				total += count_char("hello world", "l")
+			}
+			return total
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "string scan for char (100 outer iters)", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_slice_fill_sum :: proc(t: ^testing.T) {
+	src := `
+		function main() -> i64 {
+			let s: Slice[i64] = Slice[i64]{cap = 64}
+			for let i: i64 = 0; i < 64; i += 1 {
+				s[i] = i
+			}
+			let sum: i64 = 0
+			for let i: i64 = 0; i < 64; i += 1 {
+				sum += s[i]
+			}
+			return sum
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "slice fill + sum (64 elements)", dur, BENCH_ITERS)
+}

@@ -361,6 +361,11 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			emit(&c.bc, .DEFINE_GLOBAL, span)
 			emit_byte(&c.bc, u8(name_idx), span)
 		} else {
+			slice_es := expr_slice_elem_slots(c, s.value)
+			if slice_es > 0 {
+				add_local(&c.bc, s.name.data, 4, "", "", "", 0, slice_es)
+				break
+			}
 			struct_type      := expr_struct_type(c, s.value)
 			ptr_inner        := expr_ptr_inner(c, s.value)
 			enum_type        := expr_enum_type(c, s.value)
@@ -687,6 +692,10 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		compile_field_access(c, e, span)
 
 	case parser.StructLiteralExpression:
+		if e.type_name.data == "Slice" {
+			compile_slice_literal(c, e, span)
+			return
+		}
 		compile_struct_literal(c, e, span)
 
 	case parser.NewExpression:
@@ -1287,6 +1296,28 @@ call_return_enum_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string 
 	return ""
 }
 
+local_slice_elem_slots :: proc(bc: ^ByteCodeCompiler, name: string) -> int {
+	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
+		if bc.locals[i].name == name { return bc.locals[i].slice_elem_slots }
+	}
+	return 0
+}
+
+// expr_slice_elem_slots returns the elem_slots for a slice expression (>0), or 0 if not a slice.
+expr_slice_elem_slots :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok { return 0 }
+	if sle, ok2 := expr.(parser.StructLiteralExpression); ok2 {
+		if sle.type_name.data != "Slice" || len(sle.type_args) == 0 { return 0 }
+		return type_slot_count(c, sle.type_args[0])
+	}
+	if id, ok2 := expr.(parser.IdentExpression); ok2 {
+		return local_slice_elem_slots(&c.bc, lexer.Token(id).data)
+	}
+	return 0
+}
+
 local_struct_type :: proc(bc: ^ByteCodeCompiler, name: string) -> string {
 	for i := len(bc.locals) - 1; i >= 0; i -= 1 {
 		if bc.locals[i].name == name {
@@ -1312,6 +1343,7 @@ type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 	if !ok do return 1
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return 1
 	if gt, ok2 := ty.(parser.GenericType); ok2 {
+		if gt.name.data == "Slice" { return 4 }
 		mangled := generic_struct_mangled_name(c, gt.name.data, gt.args)
 		if layout, found := c.struct_layouts^[mangled]; found { return layout.total_slots }
 		return 1
@@ -1382,9 +1414,14 @@ expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 			return ale.size * type_slot_count(c, ale.elem_type)
 		}
 		if ie, ok2 := expr.(parser.IndexExpression); ok2 {
-			return expr_array_elem_slots(c, ie.object)
+			// Result is one element — could be from an array, slice, or string.
+			arr_es := expr_array_elem_slots(c, ie.object)
+			if arr_es > 0 { return arr_es }
+			if ses := expr_slice_elem_slots(c, ie.object); ses > 0 { return ses }
+			return 1  // string index or other scalar-valued index
 		}
 	}
+	if es := expr_slice_elem_slots(c, idx); es > 0 { return 4 }
 	st := expr_struct_type(c, idx)
 	if st != "" {
 		if layout, ok := c.struct_layouts^[st]; ok do return layout.total_slots
@@ -1587,6 +1624,7 @@ expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	if !ok do return ""
 	#partial switch e in expr {
 	case parser.StructLiteralExpression:
+		if e.type_name.data == "Slice" { return "" }
 		if len(e.type_args) > 0 {
 			mangled := generic_struct_mangled_name(c, e.type_name.data, e.type_args)
 			if _, ok := c.struct_layouts^[mangled]; ok { return mangled }
@@ -1741,6 +1779,33 @@ compile_ptr_to_container :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: 
 }
 
 compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
+	// String field access: s.len → STR_LEN
+	if c.tc_types != nil && int(e.object) < len(c.tc_types) && c.tc_types[int(e.object)] == tc.STRING_TYPE {
+		if e.field.data == "len" {
+			compile_expr(c, e.object)
+			emit(&c.bc, .STR_LEN, span)
+			return
+		}
+		compiler_error(c, fmt.tprintf("no field '%s' on str", e.field.data), span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	// Slice field access: s.len → slot+1, s.cap → slot+2, s.grow_factor → slot+3
+	if obj_expr, obj_ok := c.ast.nodes[int(e.object)].(parser.Expression); obj_ok {
+		if id, is_id := obj_expr.(parser.IdentExpression); is_id {
+			name := lexer.Token(id).data
+			if local_slice_elem_slots(&c.bc, name) > 0 {
+				slot, _, _ := resolve_local(&c.bc, name)
+				switch e.field.data {
+				case "len":         emit(&c.bc, .GET_LOCAL, span); emit_byte(&c.bc, u8(slot + 1), span)
+				case "cap":         emit(&c.bc, .GET_LOCAL, span); emit_byte(&c.bc, u8(slot + 2), span)
+				case "grow_factor": emit(&c.bc, .GET_LOCAL, span); emit_byte(&c.bc, u8(slot + 3), span)
+				case: compiler_error(c, fmt.tprintf("no field '%s' on Slice[T]", e.field.data), span); emit(&c.bc, .NIL, span)
+				}
+				return
+			}
+		}
+	}
 	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
 	if ok && parent_type != "" {
@@ -1791,6 +1856,22 @@ compile_field_access :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span
 }
 
 compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: lexer.Span) {
+	// Slice field set: s.len → slot+1, s.cap → slot+2, s.grow_factor → slot+3
+	if obj_expr, obj_ok := c.ast.nodes[int(e.object)].(parser.Expression); obj_ok {
+		if id, is_id := obj_expr.(parser.IdentExpression); is_id {
+			name := lexer.Token(id).data
+			if local_slice_elem_slots(&c.bc, name) > 0 {
+				slot, _, _ := resolve_local(&c.bc, name)
+				switch e.field.data {
+				case "len":         emit(&c.bc, .SET_LOCAL, span); emit_byte(&c.bc, u8(slot + 1), span)
+				case "cap":         emit(&c.bc, .SET_LOCAL, span); emit_byte(&c.bc, u8(slot + 2), span)
+				case "grow_factor": emit(&c.bc, .SET_LOCAL, span); emit_byte(&c.bc, u8(slot + 3), span)
+				case: compiler_error(c, fmt.tprintf("no field '%s' on Slice[T]", e.field.data), span)
+				}
+				return
+			}
+		}
+	}
 	base_slot, heap_offset, parent_type, ok := resolve_access_chain(c, e.object)
 
 	if ok && parent_type != "" {
@@ -1894,6 +1975,36 @@ compile_addr_of :: proc(c: ^Compiler, e: parser.AddrOfExpression, span: lexer.Sp
 	emit_byte(&c.bc, u8(slot), span)
 }
 
+// compile_slice_literal handles Slice[T]{cap = n, grow_factor = k}.
+// Emits cap then grow_factor onto the stack, then MAKE_SLICE elem_slots.
+// Leaves 4 slots on the stack: [ptr, len=0, cap, grow_factor].
+compile_slice_literal :: proc(c: ^Compiler, e: parser.StructLiteralExpression, span: lexer.Span) {
+	if len(e.type_args) == 0 {
+		compiler_error(c, "Slice[T]{} requires a type argument", span)
+		emit(&c.bc, .NIL, span); emit(&c.bc, .NIL, span); emit(&c.bc, .NIL, span); emit(&c.bc, .NIL, span)
+		return
+	}
+	cap_expr         := parser.ExpressionIdx(parser.INVALID_IDX)
+	grow_factor_expr := parser.ExpressionIdx(parser.INVALID_IDX)
+	for field in e.fields {
+		if field.name.data == "cap"         { cap_expr         = field.value }
+		if field.name.data == "grow_factor" { grow_factor_expr = field.value }
+	}
+	if u32(cap_expr) == parser.INVALID_IDX {
+		emit_constant(&c.bc, i64(64), span)
+	} else {
+		compile_expr(c, cap_expr)
+	}
+	if u32(grow_factor_expr) == parser.INVALID_IDX {
+		emit_constant(&c.bc, i64(1), span)
+	} else {
+		compile_expr(c, grow_factor_expr)
+	}
+	elem_slots := type_slot_count(c, e.type_args[0])
+	emit(&c.bc, .MAKE_SLICE, span)
+	emit_byte(&c.bc, u8(elem_slots), span)
+}
+
 // compile_array_literal pushes each element in order onto the stack.
 // The resulting N*elem_slots contiguous values become the array local's slots.
 compile_array_literal :: proc(c: ^Compiler, e: parser.ArrayLiteralExpression, span: lexer.Span) {
@@ -1902,45 +2013,70 @@ compile_array_literal :: proc(c: ^Compiler, e: parser.ArrayLiteralExpression, sp
 	}
 }
 
-// compile_index_expression reads one element from a local array.
-// Stack: [...] → [..., elem...]  (elem_slots values pushed)
+// compile_index_expression reads one element from a local array or slice.
 compile_index_expression :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.Span) {
 	obj_node := c.ast.nodes[int(e.object)]
 	obj_expr, ok := obj_node.(parser.Expression)
 	if !ok { compiler_error(c, "index: object is not an expression", span); emit(&c.bc, .NIL, span); return }
 	id, is_ident := obj_expr.(parser.IdentExpression)
-	if !is_ident { compiler_error(c, "index: only local array indexing is supported", span); emit(&c.bc, .NIL, span); return }
+	if !is_ident { compiler_error(c, "index: only local array/slice indexing is supported", span); emit(&c.bc, .NIL, span); return }
 	name := lexer.Token(id).data
 	slot, _, found := resolve_local(&c.bc, name)
 	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); emit(&c.bc, .NIL, span); return }
+	// String path
+	if c.tc_types != nil && int(e.object) < len(c.tc_types) && c.tc_types[int(e.object)] == tc.STRING_TYPE {
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(slot), span)
+		compile_expr(c, e.index)
+		emit(&c.bc, .STR_GET, span)
+		return
+	}
+	// Slice path
+	if ses := local_slice_elem_slots(&c.bc, name); ses > 0 {
+		emit(&c.bc, .GET_LOCAL, span)
+		emit_byte(&c.bc, u8(slot), span)  // push ptr
+		compile_expr(c, e.index)
+		emit(&c.bc, .SLICE_GET, span)
+		emit_byte(&c.bc, u8(ses), span)
+		return
+	}
+	// Array path
 	elem_slots := 0
 	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
 		if c.bc.locals[i].name == name { elem_slots = c.bc.locals[i].array_elem_slots; break }
 	}
-	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array", name), span); emit(&c.bc, .NIL, span); return }
+	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array or slice", name), span); emit(&c.bc, .NIL, span); return }
 	compile_expr(c, e.index)
 	emit(&c.bc, .ARRAY_GET, span)
 	emit_byte(&c.bc, u8(slot), span)
 	emit_byte(&c.bc, u8(elem_slots), span)
 }
 
-// compile_index_set writes one element into a local array.
-// Precondition: the value (elem_slots slots) is already on the stack (from compile_assignment).
-// Stack: [..., val..., i] after compiling the index.
+// compile_index_set writes one element into a local array or slice.
+// Precondition: the value is already on the stack (from compile_assignment).
 compile_index_set :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.Span) {
 	obj_node := c.ast.nodes[int(e.object)]
 	obj_expr, ok := obj_node.(parser.Expression)
 	if !ok { compiler_error(c, "index assign: object is not an expression", span); return }
 	id, is_ident := obj_expr.(parser.IdentExpression)
-	if !is_ident { compiler_error(c, "index assign: only local array indexing is supported", span); return }
+	if !is_ident { compiler_error(c, "index assign: only local array/slice indexing is supported", span); return }
 	name := lexer.Token(id).data
 	slot, _, found := resolve_local(&c.bc, name)
 	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); return }
+	// Slice path: SLICE_SET reads ptr/cap from the frame directly (base_slot, elem_slots).
+	if ses := local_slice_elem_slots(&c.bc, name); ses > 0 {
+		compile_expr(c, e.index)
+		emit(&c.bc, .SLICE_SET, span)
+		emit_byte(&c.bc, u8(slot), span)
+		emit_byte(&c.bc, u8(ses), span)
+		return
+	}
+	// Array path
 	elem_slots := 0
 	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
 		if c.bc.locals[i].name == name { elem_slots = c.bc.locals[i].array_elem_slots; break }
 	}
-	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array", name), span); return }
+	if elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not an array or slice", name), span); return }
 	compile_expr(c, e.index)
 	emit(&c.bc, .ARRAY_SET, span)
 	emit_byte(&c.bc, u8(slot), span)

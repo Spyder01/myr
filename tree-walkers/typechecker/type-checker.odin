@@ -270,13 +270,20 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		if obj_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
 		info, ok2 := get_type_info(tc, obj_type)
 		if !ok2 do return UNKNOWN_TYPE
-		at, is_arr := info.(ArrayTypeInfo)
-		if !is_arr {
-			tc_error_msg(tc, tc.ast.spans[int(idx)], "index of non-array value")
-			return UNKNOWN_TYPE
+		if obj_type == STRING_TYPE {
+			check(tc, e.index, INT_TYPE)
+			return STRING_TYPE
 		}
-		check(tc, e.index, INT_TYPE)
-		return at.elem
+		if at, is_arr := info.(ArrayTypeInfo); is_arr {
+			check(tc, e.index, INT_TYPE)
+			return at.elem
+		}
+		if st, is_slice := info.(SliceTypeInfo); is_slice {
+			check(tc, e.index, INT_TYPE)
+			return st.elem
+		}
+		tc_error_msg(tc, tc.ast.spans[int(idx)], "index of non-array/slice/string value")
+		return UNKNOWN_TYPE
 
 	case parser.ArrayLiteralExpression:
 		elem_type := resolve_named_type(tc, e.elem_type)
@@ -594,6 +601,10 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 		return register_fn_type(tc, params, ret)
 
 	case parser.GenericType:
+		if t.name.data == "Slice" && len(t.args) > 0 {
+			elem := resolve_named_type(tc, t.args[0])
+			return register_slice_type(tc, elem)
+		}
 		return UNKNOWN_TYPE
 
 	case parser.ArrayType:
@@ -646,6 +657,18 @@ register_array_type :: proc(tc: ^Typechecker, elem: TypeId, length: int) -> Type
 }
 
 @private
+register_slice_type :: proc(tc: ^Typechecker, elem: TypeId) -> TypeId {
+	for info, i in tc.type_table {
+		if st, ok := info.(SliceTypeInfo); ok && st.elem == elem {
+			return TypeId(i)
+		}
+	}
+	id := TypeId(len(tc.type_table))
+	append(&tc.type_table, TypeInfo(SliceTypeInfo{elem = elem}))
+	return id
+}
+
+@private
 get_type_info :: proc(tc: ^Typechecker, id: TypeId) -> (TypeInfo, bool) {
 	if id == UNKNOWN_TYPE || int(id) >= len(tc.type_table) {
 		return nil, false
@@ -657,6 +680,12 @@ get_type_info :: proc(tc: ^Typechecker, id: TypeId) -> (TypeInfo, bool) {
 
 @private
 infer_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.StructLiteralExpression) -> TypeId {
+	// Slice[T]{cap = n} — builtin slice construction.
+	if e.type_name.data == "Slice" && len(e.type_args) > 0 {
+		for field in e.fields { infer(tc, field.value) }
+		elem := resolve_named_type(tc, e.type_args[0])
+		return register_slice_type(tc, elem)
+	}
 	// Generic struct literal (e.g. Box[int]{...}): visit field values for tc_types
 	// but skip template-level type checking — the compiler handles monomorphisation.
 	if len(e.type_args) > 0 {
@@ -710,6 +739,17 @@ infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parse
 		st_info = inner_info
 	}
 
+	if obj_type == STRING_TYPE {
+		if e.field.data == "len" { return INT_TYPE }
+		tc_error_msg(tc, e.field.span, fmt.tprintf("no field '%s' on str", e.field.data))
+		return UNKNOWN_TYPE
+	}
+	if sl, is_slice := st_info.(SliceTypeInfo); is_slice {
+		_ = sl
+		if e.field.data == "len" || e.field.data == "cap" || e.field.data == "grow_factor" { return INT_TYPE }
+		tc_error_msg(tc, e.field.span, fmt.tprintf("no field '%s' on Slice[T]", e.field.data))
+		return UNKNOWN_TYPE
+	}
 	st, is_struct := st_info.(StructType)
 	if !is_struct {
 		tc_error_msg(tc, e.field.span, "field access on non-struct value")

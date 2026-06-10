@@ -1,0 +1,21 @@
+// Bubble sort on a fixed-size Array[i64, 8]
+
+function main() {
+    let arr = Array[i64, 8]{64, 34, 25, 12, 22, 11, 90, 3}
+
+    // Bubble sort in-place
+    for let i = 0; i < 7; i += 1 {
+        for let j = 0; j < 7 - i; j += 1 {
+            if arr[j] > arr[j + 1] {
+                let tmp = arr[j]
+                arr[j] = arr[j + 1]
+                arr[j + 1] = tmp
+            }
+        }
+    }
+
+    // Print sorted: 3 11 12 22 25 34 64 90
+    for let i = 0; i < 8; i += 1 {
+        print(arr[i])
+    }
+}

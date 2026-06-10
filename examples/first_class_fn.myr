@@ -1,0 +1,46 @@
+// First-class functions: passing functions as arguments and storing in variables
+
+function double(x: int) -> int {
+    return x * 2
+}
+
+function square(x: int) -> int {
+    return x * x
+}
+
+function negate(x: int) -> int {
+    return x * -1
+}
+
+function is_even(x: int) -> bool {
+    return x % 2 == 0
+}
+
+function apply(f: (int) -> int, x: int) -> int {
+    return f(x)
+}
+
+function main() {
+    // Call apply with each function
+    print(apply(double, 5))
+    print(apply(square, 5))
+    print(apply(negate, 5))
+
+    // is_even is int -> bool, call directly
+    print(is_even(4))
+    print(is_even(7))
+
+    // Store a function in a variable and call it
+    let f = double
+    print(f(10))
+
+    let g = square
+    print(g(6))
+
+    let h = negate
+    print(h(3))
+
+    // Chain: apply stored function
+    print(apply(f, 7))
+    print(apply(g, 4))
+}

@@ -1,0 +1,32 @@
+// Slice examples: fill, sum, and auto-grow
+
+function main() {
+    // Fill a Slice[i64] with values 1..8 and sum them
+    let s: Slice[i64] = Slice[i64]{cap = 8}
+    for let i = 0; i < 8; i += 1 {
+        s[i] = i + 1
+    }
+
+    let total = 0
+    for let i = 0; i < s.len; i += 1 {
+        total += s[i]
+    }
+    print(total)   // 36
+
+    // Auto-grow: start with cap=2, write 6 elements
+    let small: Slice[i64] = Slice[i64]{cap = 2}
+    for let i = 0; i < 6; i += 1 {
+        small[i] = (i + 1) * 10
+    }
+
+    let small_sum = 0
+    for let i = 0; i < small.len; i += 1 {
+        small_sum += small[i]
+    }
+    print(small_sum)   // 210 (10+20+30+40+50+60)
+
+    // .len and .cap after writes
+    print(s.len)      // 8
+    print(small.len)  // 6
+    print(s.cap)      // 8
+}

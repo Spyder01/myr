@@ -1,0 +1,61 @@
+// Generic functions and generic structs
+
+function max[T](a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+function min[T](a: T, b: T) -> T {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+function clamp[T](val: T, lo: T, hi: T) -> T {
+    if val < lo {
+        return lo
+    }
+    if val > hi {
+        return hi
+    }
+    return val
+}
+
+struct Pair[T] { first: T, second: T }
+
+function swap[T](a: T, b: T) {
+    print(b)
+    print(a)
+}
+
+function main() {
+    // max and min on int
+    print(max(3, 7))
+    print(min(3, 7))
+
+    // max and min on float
+    print(max(1.5, 2.5))
+    print(min(1.5, 2.5))
+
+    // clamp
+    print(clamp(10, 0, 5))
+    print(clamp(-3, 0, 5))
+    print(clamp(3, 0, 5))
+
+    // Generic struct Pair[int]
+    let p = Pair[int]{first = 42, second = 99}
+    print(p.first)
+    print(p.second)
+
+    // Generic struct Pair[str]
+    let sp = Pair[str]{first = "hello", second = "world"}
+    print(sp.first)
+    print(sp.second)
+
+    // swap
+    swap(1, 2)
+    swap("alpha", "beta")
+}

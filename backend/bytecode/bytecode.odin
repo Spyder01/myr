@@ -63,6 +63,11 @@ Opcode :: enum u8 {
 	ADDR_LOCAL, // 1-byte: slot — push a raw pointer to frame[slot] (stack reference)
 	ARRAY_GET,  // 2-bytes: base_slot, elem_slots — pop index i, push frame[base_slot + i*elem_slots .. +elem_slots]
 	ARRAY_SET,  // 2-bytes: base_slot, elem_slots — pop index i and elem_slots values, write frame[base_slot + i*elem_slots]
+	MAKE_SLICE, // 1-byte: elem_slots — pop grow_factor, pop cap, alloc heap, push [ptr, len=0, cap, grow_factor]
+	SLICE_GET,  // 1-byte: elem_slots — pop index, pop ptr, push ptr[i*elem_slots .. +elem_slots]
+	SLICE_SET,  // 2-bytes: base_slot, elem_slots — pop index, grow if needed (doubling), write frame[base_slot]..+elem_slots (peek, leave val)
+	STR_LEN,    // no operands — pop string, push i64 byte-length
+	STR_GET,    // no operands — pop index (i64), pop string, push byte at index as i64
 
 	POP,
 	PRINT,
