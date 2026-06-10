@@ -54,6 +54,8 @@ Compiler :: struct {
 	generic_struct_templates: map[string]parser.StructDecl,  // name → template for generic structs
 	generic_emitted:          map[string]bool,                // mangled names already compiled
 	type_subst:               map[string]string,              // active during generic instantiation: T → "int"
+	global_slots:             map[string]u16,                 // name → runtime slot index (shared via root)
+	global_count:             u16,                            // next slot to assign (root only)
 	root:                     ^Compiler,                      // nil for root; points to root for child compilers
 }
 
@@ -72,6 +74,7 @@ new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_tabl
 		generic_struct_templates = make(map[string]parser.StructDecl),
 		generic_emitted          = make(map[string]bool),
 		type_subst               = make(map[string]string),
+		global_slots             = make(map[string]u16),
 	}
 }
 
@@ -82,47 +85,36 @@ compiler_destroy :: proc(c: ^Compiler) {
 	delete(c.generic_struct_templates)
 	delete(c.generic_emitted)
 	delete(c.type_subst)
+	delete(c.global_slots)
+}
+
+// assign_global_slot returns the runtime slot for a global name, allocating one if new.
+// Always operates on the root compiler so all child compilers share the same table.
+assign_global_slot :: proc(c: ^Compiler, name: string) -> u16 {
+	root := c if c.root == nil else c.root
+	if slot, ok := root.global_slots[name]; ok { return slot }
+	slot := root.global_count
+	root.global_slots[name] = slot
+	root.global_count += 1
+	return slot
 }
 
 compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Function, []CompilerError) {
 	c := new_compiler(ast, tc_types, tc_type_table)
 
-	// Two-pass struct layout building: the first pass registers all struct names
-	// so the second pass can correctly resolve forward references (e.g. Monkey
-	// referencing Person which is declared after it). Generic structs are skipped —
-	// their layouts are built on demand during instantiation.
-	for _ in 0 ..= 1 {
-		for node in ast.nodes {
-			if decl, ok := node.(parser.Declaration); ok {
-				if sd, ok2 := decl.(parser.StructDecl); ok2 {
-					if len(sd.type_params) > 0 { continue }
-					c.struct_layouts^[sd.name.data] = build_struct_layout(&c, sd)
-				}
-			}
-		}
-	}
-
-	// Build enum layouts (single pass; enum fields are scalar types only in Phase 1).
 	for node in ast.nodes {
 		if decl, ok := node.(parser.Declaration); ok {
-			if ed, ok2 := decl.(parser.EnumDecl); ok2 {
-				c.enum_layouts[ed.name.data] = build_enum_layout(&c, ed)
-			}
-		}
-	}
-
-	// Collect generic templates before compiling anything so that call sites can
-	// find and instantiate them in any declaration order.
-	for node in ast.nodes {
-		if decl, ok := node.(parser.Declaration); ok {
-			if fn, ok2 := decl.(parser.FunctionDecl); ok2 {
-				if len(fn.type_params) > 0 {
-					c.generic_templates[fn.name.data] = fn
-				}
-			}
 			if sd, ok2 := decl.(parser.StructDecl); ok2 {
 				if len(sd.type_params) > 0 {
 					c.generic_struct_templates[sd.name.data] = sd
+				} else {
+					c.struct_layouts^[sd.name.data] = build_struct_layout(&c, sd)
+				}
+			} else if ed, ok2 := decl.(parser.EnumDecl); ok2 {
+				c.enum_layouts[ed.name.data] = build_enum_layout(&c, ed)
+			} else if fn, ok2 := decl.(parser.FunctionDecl); ok2 {
+				if len(fn.type_params) > 0 {
+					c.generic_templates[fn.name.data] = fn
 				}
 			}
 		}
@@ -135,16 +127,11 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 	}
 
 	// call main — leave its return value on the stack so __main__ returns it
-	main_idx, main_err := chunk_add_constant(current_chunk(&c.bc), "main")
-	if main_err == nil {
-		emit(&c.bc, .GET_GLOBAL, {})
-		emit_byte(&c.bc, u8(main_idx), {})
-		emit(&c.bc, .CALL, {})
-		emit_byte(&c.bc, 0, {})
-		// no POP — __main__'s RETURN will pop and store it at stack[0]
-	} else {
-		emit(&c.bc, .NIL, {})
-	}
+	main_slot := assign_global_slot(&c, "main")
+	emit(&c.bc, .GET_GLOBAL, {})
+	emit_byte(&c.bc, u8(main_slot), {})
+	emit(&c.bc, .CALL, {})
+	emit_byte(&c.bc, 0, {})
 
 	emit(&c.bc, .RETURN, {})
 	emit_byte(&c.bc, 1, {})
@@ -250,6 +237,7 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		generic_struct_templates = c.generic_struct_templates,
 		generic_emitted          = c.generic_emitted,
 		type_subst               = child_subst,
+		global_slots             = c.global_slots,
 		root                     = root_c,
 	}
 	compile_fn_body(&child, d.body)
@@ -263,9 +251,8 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 
 	// emit function as a constant in parent, bind to emit_name
 	emit_constant(&c.bc, fn, span)
-	name_idx, _ := chunk_add_constant(current_chunk(&c.bc), emit_name)
 	emit(&c.bc, .DEFINE_GLOBAL, span)
-	emit_byte(&c.bc, u8(name_idx), span)
+	emit_byte(&c.bc, u8(assign_global_slot(c, emit_name)), span)
 }
 
 // ---- blocks ----
@@ -357,9 +344,8 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 	case parser.LetStatement:
 		compile_expr(c, s.value)
 		if c.bc.scope_depth == 0 {
-			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), s.name.data)
 			emit(&c.bc, .DEFINE_GLOBAL, span)
-			emit_byte(&c.bc, u8(name_idx), span)
+			emit_byte(&c.bc, u8(assign_global_slot(c, s.name.data)), span)
 		} else {
 			slice_es := expr_slice_elem_slots(c, s.value)
 			if slice_es > 0 {
@@ -567,15 +553,18 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 				emit_byte(&c.bc, u8(slot + s), span)
 			}
 		} else {
-			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 			emit(&c.bc, .GET_GLOBAL, span)
-			emit_byte(&c.bc, u8(name_idx), span)
+			emit_byte(&c.bc, u8(assign_global_slot(c, name)), span)
 		}
 
 	case parser.UnaryExpression:
+		if val, ok := try_fold_expr(c, idx); ok {
+			emit_constant(&c.bc, val, span)
+			return
+		}
 		compile_expr(c, e.operand)
 		#partial switch e.op.kind {
-		case .MINUS: emit(&c.bc, .NEGATE, span)
+		case .MINUS: emit(&c.bc, specialize_opcode(c, .NEGATE, e.operand), span)
 		case .BANG:  emit(&c.bc, .NOT, span)
 		case .TILDE: emit(&c.bc, .BNOT, span)
 		}
@@ -590,6 +579,10 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		   e.operation.kind == .STAR_EQ  || e.operation.kind == .SLASH_EQ ||
 		   e.operation.kind == .PERCENT_EQ {
 			compile_compound_assignment(c, e, span)
+			return
+		}
+		if val, ok := try_fold_expr(c, idx); ok {
+			emit_constant(&c.bc, val, span)
 			return
 		}
 		// short-circuit logical operators
@@ -611,7 +604,7 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		}
 		compile_expr(c, e.left)
 		compile_expr(c, e.right)
-		emit(&c.bc, op_to_opcode(e.operation.kind), span)
+		emit(&c.bc, specialize_opcode(c, op_to_opcode(e.operation.kind), e.left), span)
 
 	case parser.CallExpression:
 		// check for print builtin
@@ -659,9 +652,8 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 							delete(saved)
 						}
 					}
-					name_idx, _ := chunk_add_constant(current_chunk(&c.bc), mangled)
 					emit(&c.bc, .GET_GLOBAL, span)
-					emit_byte(&c.bc, u8(name_idx), span)
+					emit_byte(&c.bc, u8(assign_global_slot(c, mangled)), span)
 					total_arg_slots := 0
 					for arg in e.args {
 						compile_expr(c, arg)
@@ -743,9 +735,8 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 			emit(&c.bc, .GET_LOCAL, span)
 			emit_byte(&c.bc, u8(slot), span)
 		} else {
-			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 			emit(&c.bc, .GET_GLOBAL, span)
-			emit_byte(&c.bc, u8(name_idx), span)
+			emit_byte(&c.bc, u8(assign_global_slot(c, name)), span)
 		}
 		compile_expr(c, e.right)
 		emit(&c.bc, op, span)
@@ -753,9 +744,8 @@ compile_compound_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, sp
 			emit(&c.bc, .SET_LOCAL, span)
 			emit_byte(&c.bc, u8(slot), span)
 		} else {
-			name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 			emit(&c.bc, .SET_GLOBAL, span)
-			emit_byte(&c.bc, u8(name_idx), span)
+			emit_byte(&c.bc, u8(assign_global_slot(c, name)), span)
 		}
 
 	case parser.FieldAccessExpression:
@@ -833,9 +823,8 @@ compile_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer
 					emit(&c.bc, .NIL, span)
 				}
 			} else {
-				name_idx, _ := chunk_add_constant(current_chunk(&c.bc), name)
 				emit(&c.bc, .SET_GLOBAL, span)
-				emit_byte(&c.bc, u8(name_idx), span)
+				emit_byte(&c.bc, u8(assign_global_slot(c, name)), span)
 			}
 			return
 		}
@@ -1072,6 +1061,42 @@ resolve_local :: proc(bc: ^ByteCodeCompiler, name: string) -> (stack_slot: int, 
 	return offset, bc.locals[target].slots, true
 }
 
+// specialize_opcode upgrades a generic arithmetic/comparison opcode to a
+// type-specific one when the type of the left operand is statically known.
+specialize_opcode :: proc(c: ^Compiler, op: Opcode, left: parser.ExpressionIdx) -> Opcode {
+	if c.tc_types == nil || int(left) >= len(c.tc_types) { return op }
+	switch c.tc_types[int(left)] {
+	case tc.INT_TYPE:
+		#partial switch op {
+		case .ADD:    return .ADD_I64
+		case .SUB:    return .SUB_I64
+		case .MUL:    return .MUL_I64
+		case .DIV:    return .DIV_I64
+		case .MOD:    return .MOD_I64
+		case .LT:     return .LT_I64
+		case .LTE:    return .LTE_I64
+		case .GT:     return .GT_I64
+		case .GTE:    return .GTE_I64
+		case .NEGATE: return .NEGATE_I64
+		}
+	case tc.FLOAT_TYPE:
+		#partial switch op {
+		case .ADD:    return .ADD_F64
+		case .SUB:    return .SUB_F64
+		case .MUL:    return .MUL_F64
+		case .DIV:    return .DIV_F64
+		case .LT:     return .LT_F64
+		case .LTE:    return .LTE_F64
+		case .GT:     return .GT_F64
+		case .GTE:    return .GTE_F64
+		case .NEGATE: return .NEGATE_F64
+		}
+	case tc.STRING_TYPE:
+		if op == .ADD { return .ADD_STR }
+	}
+	return op
+}
+
 op_to_opcode :: proc(kind: lexer.TokenType) -> Opcode {
 	#partial switch kind {
 	case .PLUS:    return .ADD
@@ -1184,6 +1209,106 @@ eval_const_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: lexer.Spa
 	}
 
 	compiler_error(c, "not a compile-time constant expression", span)
+	return Nil{}, false
+}
+
+// try_fold_expr attempts to evaluate an expression as a compile-time constant.
+// Returns (value, true) on success, (Nil{}, false) if any operand is not constant.
+// Never emits errors — callers fall back to normal code generation on false.
+try_fold_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (Value, bool) {
+	node := c.ast.nodes[idx]
+	#partial switch e in node.(parser.Expression) {
+	case parser.LiteralExpression:
+		tok := lexer.Token(e)
+		if tok.kind == .NIL { return Nil{}, true }
+		return parse_literal(tok), true
+
+	case parser.IdentExpression:
+		name := lexer.Token(e).data
+		if val, ok := c.const_table[name]; ok { return val, true }
+		return Nil{}, false
+
+	case parser.UnaryExpression:
+		val, ok := try_fold_expr(c, e.operand)
+		if !ok { return Nil{}, false }
+		#partial switch e.op.kind {
+		case .MINUS:
+			if n, ok2 := val.(i64);  ok2 { return -n,  true }
+			if f, ok2 := val.(f64);  ok2 { return -f,  true }
+		case .BANG:
+			if b, ok2 := val.(bool); ok2 { return !b,  true }
+		case .TILDE:
+			if n, ok2 := val.(i64);  ok2 { return ~n,  true }
+		}
+		return Nil{}, false
+
+	case parser.BinaryExpression:
+		lv, lok := try_fold_expr(c, e.left)
+		rv, rok := try_fold_expr(c, e.right)
+		if !lok || !rok { return Nil{}, false }
+		if ln, ok := lv.(i64); ok {
+			if rn, ok2 := rv.(i64); ok2 {
+				#partial switch e.operation.kind {
+				case .PLUS:      return ln + rn,        true
+				case .MINUS:     return ln - rn,        true
+				case .STAR:      return ln * rn,        true
+				case .SLASH:
+					if rn == 0 { return Nil{}, false }
+					return ln / rn, true
+				case .PERCENT:
+					if rn == 0 { return Nil{}, false }
+					return ln % rn, true
+				case .LT_LT:     return ln << uint(rn), true
+				case .GT_GT:     return ln >> uint(rn), true
+				case .AMPERSAND: return ln & rn,        true
+				case .PIPE:      return ln | rn,        true
+				case .CARET:     return ln ~ rn,        true
+				case .EQ_EQ:     return ln == rn,       true
+				case .BANG_EQ:   return ln != rn,       true
+				case .LT:        return ln <  rn,       true
+				case .LT_EQ:     return ln <= rn,       true
+				case .GT:        return ln >  rn,       true
+				case .GT_EQ:     return ln >= rn,       true
+				}
+			}
+		}
+		if lf, ok := lv.(f64); ok {
+			if rf, ok2 := rv.(f64); ok2 {
+				#partial switch e.operation.kind {
+				case .PLUS:    return lf + rf,  true
+				case .MINUS:   return lf - rf,  true
+				case .STAR:    return lf * rf,  true
+				case .SLASH:   return lf / rf,  true
+				case .EQ_EQ:   return lf == rf, true
+				case .BANG_EQ: return lf != rf, true
+				case .LT:      return lf <  rf, true
+				case .LT_EQ:   return lf <= rf, true
+				case .GT:      return lf >  rf, true
+				case .GT_EQ:   return lf >= rf, true
+				}
+			}
+		}
+		if lb, ok := lv.(bool); ok {
+			if rb, ok2 := rv.(bool); ok2 {
+				#partial switch e.operation.kind {
+				case .EQ_EQ:   return lb == rb, true
+				case .BANG_EQ: return lb != rb, true
+				case .AND:     return lb && rb, true
+				case .OR:      return lb || rb, true
+				}
+			}
+		}
+		if ls, ok := lv.(string); ok {
+			if rs, ok2 := rv.(string); ok2 {
+				#partial switch e.operation.kind {
+				case .PLUS:    return strings.concatenate([]string{ls, rs}), true
+				case .EQ_EQ:   return ls == rs, true
+				case .BANG_EQ: return ls != rs, true
+				}
+			}
+		}
+		return Nil{}, false
+	}
 	return Nil{}, false
 }
 

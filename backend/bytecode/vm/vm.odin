@@ -15,9 +15,10 @@ CallFrame :: struct {
 VM :: struct {
 	frames:       [FRAMES_MAX]CallFrame,
 	stack:        [STACK_MAX]Value,
-	globals:      map[string]Value,
+	globals:      [256]Value,
 	strings:      StringPool,
 	heap_objects: [dynamic][]Value,
+	char_cache:   [256]string,
 	stack_top:    u16,
 	frame_count:  u8,
 	stdin:        io.Reader,
@@ -37,21 +38,21 @@ VMError :: enum {
 
 new_vm :: proc(max_globals: Maybe(int) = nil) -> VM {
 	vm: VM
-	if cap, ok := max_globals.?; ok {
-		vm.globals = make(map[string]Value, cap)
-	} else {
-		vm.globals = make(map[string]Value)
-	}
 	vm.strings      = string_pool_new()
 	vm.heap_objects = make([dynamic][]Value)
+	for i in 0..<256 {
+		buf    := make([]byte, 1)
+		buf[0]  = byte(i)
+		vm.char_cache[i] = string(buf)
+	}
 	return vm
 }
 
 destroy_vm :: proc(vm: ^VM) {
-	delete(vm.globals)
 	string_pool_destroy(&vm.strings)
 	for obj in vm.heap_objects { delete(obj) }
 	delete(vm.heap_objects)
+	for s in vm.char_cache { delete(s) }
 }
 
 vm_push :: proc(vm: ^VM, val: Value) -> Maybe(VMError) {
@@ -76,41 +77,41 @@ current_frame :: proc(vm: ^VM) -> ^CallFrame {
 	return &vm.frames[vm.frame_count - 1]
 }
 
-read_byte :: proc(vm: ^VM) -> u8 {
-	frame := current_frame(vm)
+read_byte :: proc(frame: ^CallFrame) -> u8 {
 	b := frame.function.chunk.code[frame.ip]
 	frame.ip += 1
 	return b
 }
 
-read_short :: proc(vm: ^VM) -> u16 {
-	hi := u16(read_byte(vm)) << 8
-	lo := u16(read_byte(vm))
+read_short :: proc(frame: ^CallFrame) -> u16 {
+	hi := u16(read_byte(frame)) << 8
+	lo := u16(read_byte(frame))
 	return hi | lo
 }
 
-read_constant :: proc(vm: ^VM) -> Value {
-	idx := read_byte(vm)
-	return current_frame(vm).function.chunk.constants[idx]
+read_constant :: proc(frame: ^CallFrame) -> Value {
+	idx := read_byte(frame)
+	return frame.function.chunk.constants[idx]
 }
 
-read_constant_long :: proc(vm: ^VM) -> Value {
-	idx := read_short(vm)
-	return current_frame(vm).function.chunk.constants[idx]
+read_constant_long :: proc(frame: ^CallFrame) -> Value {
+	idx := read_short(frame)
+	return frame.function.chunk.constants[idx]
 }
 
 vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
+	frame := current_frame(vm)
 	for {
-		op := Opcode(read_byte(vm))
+		op := Opcode(read_byte(frame))
 		#partial switch op {
 
 		case .CONST:
-			val := read_constant(vm)
+			val := read_constant(frame)
 			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
 			if err := vm_push(vm, val); err != nil do return err
 
 		case .CONST_LONG:
-			val := read_constant_long(vm)
+			val := read_constant_long(frame)
 			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
 			if err := vm_push(vm, val); err != nil do return err
 
@@ -198,66 +199,60 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			vm_push(vm, interned)
 
 		case .DEFINE_GLOBAL:
-			name := read_constant(vm).(string)
+			slot := read_byte(frame)
 			top, _ := vm_peek(vm)
-			vm.globals[name] = top
+			vm.globals[slot] = top
 			vm_pop(vm)
 
 		case .GET_GLOBAL:
-			name := read_constant(vm).(string)
-			val, ok := vm.globals[name]
-			if !ok do return .UNDEFINED_VARIABLE
-			if err := vm_push(vm, val); err != nil do return err
+			slot := read_byte(frame)
+			if err := vm_push(vm, vm.globals[slot]); err != nil do return err
 
 		case .SET_GLOBAL:
-			name := read_constant(vm).(string)
-			if !(name in vm.globals) do return .UNDEFINED_VARIABLE
+			slot := read_byte(frame)
 			top, _ := vm_peek(vm)
-			vm.globals[name] = top
+			vm.globals[slot] = top
 
 		case .GET_LOCAL:
-			slot := u16(read_byte(vm))
-			frame := current_frame(vm)
+			slot := u16(read_byte(frame))
 			if err := vm_push(vm, vm.stack[frame.slots + slot]); err != nil do return err
 
 		case .SET_LOCAL:
-			slot := u16(read_byte(vm))
-			frame := current_frame(vm)
+			slot := u16(read_byte(frame))
 			top, _ := vm_peek(vm)
 			vm.stack[frame.slots + slot] = top
 
 		case .JUMP:
-			offset := read_short(vm)
-			current_frame(vm).ip += int(offset)
+			offset := read_short(frame)
+			frame.ip += int(offset)
 
 		case .JUMP_IF_FALSE:
-			offset := read_short(vm)
+			offset := read_short(frame)
 			top, _ := vm_peek(vm)
-			if is_falsy(top) { current_frame(vm).ip += int(offset) }
+			if is_falsy(top) { frame.ip += int(offset) }
 
 		case .JUMP_IF_TRUE:
-			offset := read_short(vm)
+			offset := read_short(frame)
 			top, _ := vm_peek(vm)
-			if !is_falsy(top) { current_frame(vm).ip += int(offset) }
+			if !is_falsy(top) { frame.ip += int(offset) }
 
 		case .LOOP:
-			offset := read_short(vm)
-			current_frame(vm).ip -= int(offset)
+			offset := read_short(frame)
+			frame.ip -= int(offset)
 
 		case .CALL:
-			arg_count := u16(read_byte(vm))
+			arg_count := u16(read_byte(frame))
 			if err := vm_call(vm, arg_count); err != nil do return err
+			frame = current_frame(vm)
 
 		case .ADDR_LOCAL:
-			slot := int(read_byte(vm))
-			frame := current_frame(vm)
+			slot := int(read_byte(frame))
 			ptr: [^]Value = raw_data(vm.stack[frame.slots + u16(slot):])
 			if err := vm_push(vm, ptr); err != nil do return err
 
 		case .ARRAY_GET:
-			base_slot  := u16(read_byte(vm))
-			elem_slots := int(read_byte(vm))
-			frame      := current_frame(vm)
+			base_slot  := u16(read_byte(frame))
+			elem_slots := int(read_byte(frame))
 			idx_val, err := vm_pop(vm); if err != nil do return err
 			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
 			for s in 0..<elem_slots {
@@ -265,9 +260,8 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			}
 
 		case .ARRAY_SET:
-			base_slot  := u16(read_byte(vm))
-			elem_slots := int(read_byte(vm))
-			frame      := current_frame(vm)
+			base_slot  := u16(read_byte(frame))
+			elem_slots := int(read_byte(frame))
 			idx_val, err := vm_pop(vm); if err != nil do return err
 			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
 			top := int(vm.stack_top)
@@ -278,7 +272,7 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			// The expression statement caller emits POPs via expr_slot_count.
 
 		case .MAKE_SLICE:
-			elem_slots      := int(read_byte(vm))
+			elem_slots      := int(read_byte(frame))
 			gf_val, err1    := vm_pop(vm); if err1 != nil do return err1
 			cap_val, err2   := vm_pop(vm); if err2 != nil do return err2
 			cap, ok1        := cap_val.(i64); if !ok1 do return .TYPE_ERROR
@@ -297,7 +291,7 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			if err3 := vm_push(vm, i64(gf));    err3 != nil do return err3  // grow_factor (stored as i64, semantically u8)
 
 		case .SLICE_GET:
-			elem_slots := int(read_byte(vm))
+			elem_slots := int(read_byte(frame))
 			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
 			ptr_val, err2 := vm_pop(vm); if err2 != nil do return err2
 			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
@@ -308,9 +302,8 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			}
 
 		case .SLICE_SET:
-			base_slot  := u16(read_byte(vm))
-			elem_slots := int(read_byte(vm))
-			frame      := current_frame(vm)
+			base_slot  := u16(read_byte(frame))
+			elem_slots := int(read_byte(frame))
 			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
 			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
 			ptr         := vm.stack[frame.slots + base_slot].([^]Value)
@@ -355,12 +348,10 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
 			s, ok2 := str_val.(string); if !ok2 do return .TYPE_ERROR
 			if i < 0 || i >= i64(len(s)) do return .INDEX_OUT_OF_BOUNDS
-			buf := make([]byte, 1)
-			buf[0] = s[i]
-			if push_err := vm_push(vm, string(buf)); push_err != nil do return push_err
+			if push_err := vm_push(vm, vm.char_cache[s[i]]); push_err != nil do return push_err
 
 		case .NEW:
-			n := int(read_byte(vm))
+			n := int(read_byte(frame))
 			slots := make([]Value, n)
 			for i := n - 1; i >= 0; i -= 1 {
 				v, err := vm_pop(vm)
@@ -372,14 +363,14 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			if err := vm_push(vm, ptr); err != nil do return err
 
 		case .HEAP_GET:
-			offset := int(read_byte(vm))
+			offset := int(read_byte(frame))
 			pv, err := vm_pop(vm); if err != nil do return err
 			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
 			if err2 := vm_push(vm, ptr[offset]); err2 != nil do return err2
 
 		case .HEAP_SET:
-			offset := int(read_byte(vm))
+			offset := int(read_byte(frame))
 			pv, err1 := vm_pop(vm); if err1 != nil do return err1
 			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
@@ -387,7 +378,7 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			ptr[offset] = val
 
 		case .HEAP_LOAD:
-			n := int(read_byte(vm))
+			n := int(read_byte(frame))
 			pv, err := vm_pop(vm); if err != nil do return err
 			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
@@ -399,72 +390,159 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			// nothing
 
 		case .ADD_LOCALS:
-			a := u16(read_byte(vm))
-			b := u16(read_byte(vm))
-			frame := current_frame(vm)
+			a := u16(read_byte(frame))
+			b := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + a].(i64)
 			bv, ok2 := vm.stack[frame.slots + b].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
 			if err := vm_push(vm, av + bv); err != nil do return err
 
 		case .MUL_LOCALS:
-			a := u16(read_byte(vm))
-			b := u16(read_byte(vm))
-			frame := current_frame(vm)
+			a := u16(read_byte(frame))
+			b := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + a].(i64)
 			bv, ok2 := vm.stack[frame.slots + b].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
 			if err := vm_push(vm, av * bv); err != nil do return err
 
 		case .LT_LOCAL_CONST:
-			slot := u16(read_byte(vm))
-			hi   := u16(read_byte(vm))
-			lo   := u16(read_byte(vm))
-			frame := current_frame(vm)
+			slot := u16(read_byte(frame))
+			hi   := u16(read_byte(frame))
+			lo   := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
 			if err := vm_push(vm, av < bv); err != nil do return err
 
 		case .LTE_LOCAL_CONST:
-			slot := u16(read_byte(vm))
-			hi   := u16(read_byte(vm))
-			lo   := u16(read_byte(vm))
-			frame := current_frame(vm)
+			slot := u16(read_byte(frame))
+			hi   := u16(read_byte(frame))
+			lo   := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
 			if err := vm_push(vm, av <= bv); err != nil do return err
 
 		case .SUB_LOCAL_CONST:
-			slot := u16(read_byte(vm))
-			hi   := u16(read_byte(vm))
-			lo   := u16(read_byte(vm))
-			frame := current_frame(vm)
+			slot := u16(read_byte(frame))
+			hi   := u16(read_byte(frame))
+			lo   := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
 			if err := vm_push(vm, av - bv); err != nil do return err
 
 		case .RETURN:
-			n := int(read_byte(vm))
-			tmp: [256]Value
-			for i := n - 1; i >= 0; i -= 1 {
-				v, pop_err := vm_pop(vm)
-				if pop_err != nil do return pop_err
-				tmp[i] = v
+			n := int(read_byte(frame))
+			if n == 0 {
+				vm.frame_count -= 1
+				if vm.frame_count == 0 { vm.stack_top = 0; return nil }
+				vm.stack_top = vm.frames[vm.frame_count].slots
+				frame = current_frame(vm)
+			} else if n == 1 {
+				ret := vm.stack[vm.stack_top - 1]
+				vm.frame_count -= 1
+				if vm.frame_count == 0 {
+					vm.stack[0] = ret
+					vm.stack_top = 1
+					return nil
+				}
+				vm.stack_top = vm.frames[vm.frame_count].slots
+				vm.stack[vm.stack_top] = ret
+				vm.stack_top += 1
+				frame = current_frame(vm)
+			} else {
+				tmp: [256]Value
+				for i := n - 1; i >= 0; i -= 1 {
+					v, pop_err := vm_pop(vm)
+					if pop_err != nil do return pop_err
+					tmp[i] = v
+				}
+				vm.frame_count -= 1
+				if vm.frame_count == 0 {
+					for i in 0..<n { vm.stack[i] = tmp[i] }
+					vm.stack_top = u16(n)
+					return nil
+				}
+				vm.stack_top = vm.frames[vm.frame_count].slots
+				for i in 0..<n {
+					if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
+				}
+				frame = current_frame(vm)
 			}
-			vm.frame_count -= 1
-			if vm.frame_count == 0 {
-				for i in 0..<n { vm.stack[i] = tmp[i] }
-				vm.stack_top = u16(n)
-				return nil
-			}
-			frame := &vm.frames[vm.frame_count]
-			vm.stack_top = frame.slots
-			for i in 0..<n {
-				if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
-			}
+
+		// ---- type-specific arithmetic ----
+
+		case .ADD_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av + bv
+		case .SUB_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av - bv
+		case .MUL_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av * bv
+		case .DIV_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av / bv
+		case .MOD_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av % bv
+
+		case .ADD_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av + bv
+		case .SUB_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av - bv
+		case .MUL_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av * bv
+		case .DIV_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av / bv
+
+		case .ADD_STR:
+			bv, _ := vm_pop(vm); av, _ := vm_pop(vm)
+			a, _ := av.(string); b, _ := bv.(string)
+			tmp := strings.concatenate({a, b})
+			interned := string_pool_intern(&vm.strings, tmp)
+			if raw_data(tmp) != raw_data(interned) { delete(tmp) }
+			if err := vm_push(vm, interned); err != nil do return err
+
+		case .LT_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av < bv
+		case .LTE_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av <= bv
+		case .GT_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av > bv
+		case .GTE_I64:
+			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av >= bv
+
+		case .LT_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av < bv
+		case .LTE_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av <= bv
+		case .GT_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av > bv
+		case .GTE_F64:
+			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
+			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av >= bv
+
+		case .NEGATE_I64:
+			vm.stack[vm.stack_top-1] = -vm.stack[vm.stack_top-1].(i64)
+		case .NEGATE_F64:
+			vm.stack[vm.stack_top-1] = -vm.stack[vm.stack_top-1].(f64)
 		}
 	}
 }

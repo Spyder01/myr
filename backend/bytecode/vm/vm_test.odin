@@ -296,16 +296,20 @@ test_run_define_get_global :: proc(t: ^testing.T) {
 
 @(test)
 test_run_undefined_global :: proc(t: ^testing.T) {
+	// Globals are now slot-indexed: an uninitialized slot holds nil (zero Value),
+	// not an error. Verify that reading slot 0 without a prior DEFINE_GLOBAL returns nil.
 	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
 		span := dummy_span()
-		name_idx, _ := bc.chunk_add_constant(bc.current_chunk(c), "missing")
 		bc.emit(c, .GET_GLOBAL, span)
-		bc.emit_byte(c, u8(name_idx), span)
+		bc.emit_byte(c, 0, span)       // slot 0, never defined
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
 	defer bc.function_free(fn)
-	testing.expect_value(t, run(fn), Maybe(VMError)(.UNDEFINED_VARIABLE))
+	vm := new_vm()
+	defer destroy_vm(&vm)
+	vm_interpret(&vm, fn)
+	testing.expect(t, vm.stack[0] == nil, "uninitialized global slot should be nil")
 }
 
 // ---- string pool unit tests ----

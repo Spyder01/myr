@@ -80,6 +80,15 @@ Opcode :: enum u8 {
 	LT_LOCAL_CONST,
 	LTE_LOCAL_CONST,
 	SUB_LOCAL_CONST,
+
+	// Type-specific arithmetic — emitted when both operands have a known type.
+	// Skips the union switch in the VM handler.
+	ADD_I64, SUB_I64, MUL_I64, DIV_I64, MOD_I64,
+	ADD_F64, SUB_F64, MUL_F64, DIV_F64,
+	ADD_STR,
+	LT_I64, LTE_I64, GT_I64, GTE_I64,
+	LT_F64, LTE_F64, GT_F64, GTE_F64,
+	NEGATE_I64, NEGATE_F64,
 }
 
 

@@ -6,6 +6,8 @@ import "core:time"
 import "core:fmt"
 import bc "../../bytecode"
 import "../../../parser"
+import nr "../../../tree-walkers/nameresolution"
+import tc "../../../tree-walkers/typechecker"
 
 // ---- helpers ----
 
@@ -16,7 +18,13 @@ bench_interp :: proc(src: string, iters: int) -> time.Duration {
 	defer parser.ast_destroy(&ast)
 	delete(p.errors)
 
-	fn, errs := bc.compile(&ast)
+	nrr := nr.resolve_program(&ast)
+	defer nr.nr_result_destroy(&nrr)
+
+	tcr := tc.typecheck(&ast, &nrr)
+	defer tc.tc_result_destroy(&tcr)
+
+	fn, errs := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	if len(errs) > 0 || fn == nil do return 0
 	defer bc.function_free(fn)
 

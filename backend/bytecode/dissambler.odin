@@ -67,9 +67,9 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .CONST:        return const_instruction("CONST", chunk, offset)
     case .GET_LOCAL:    return byte_instruction("GET_LOCAL", chunk, offset)
     case .SET_LOCAL:    return byte_instruction("SET_LOCAL", chunk, offset)
-    case .GET_GLOBAL:   return const_instruction("GET_GLOBAL", chunk, offset)
-    case .SET_GLOBAL:   return const_instruction("SET_GLOBAL", chunk, offset)
-    case .DEFINE_GLOBAL: return const_instruction("DEFINE_GLOBAL", chunk, offset)
+    case .GET_GLOBAL:    return byte_instruction("GET_GLOBAL",    chunk, offset)
+    case .SET_GLOBAL:    return byte_instruction("SET_GLOBAL",    chunk, offset)
+    case .DEFINE_GLOBAL: return byte_instruction("DEFINE_GLOBAL", chunk, offset)
     case .CALL:         return byte_instruction("CALL", chunk, offset)
     case .NEW:          return byte_instruction("NEW",       chunk, offset)
     case .HEAP_GET:     return byte_instruction("HEAP_GET",  chunk, offset)
@@ -83,7 +83,44 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .JUMP_IF_TRUE:  return jump_instruction("JUMP_IF_TRUE",  1, chunk, offset)
     case .LOOP:         return jump_instruction("LOOP", -1, chunk, offset)
 
-    case .NOP: return simple_instruction("NOP", offset)
+    case .NOP:          return simple_instruction("NOP",          offset)
+    case .STR_LEN:      return simple_instruction("STR_LEN",      offset)
+    case .STR_GET:      return simple_instruction("STR_GET",      offset)
+    case .ADDR_LOCAL:   return byte_instruction("ADDR_LOCAL",     chunk, offset)
+    case .MAKE_SLICE:   return byte_instruction("MAKE_SLICE",     chunk, offset)
+    case .SLICE_GET:    return byte_instruction("SLICE_GET",      chunk, offset)
+    case .ARRAY_GET:    return two_byte_instruction("ARRAY_GET",  chunk, offset)
+    case .ARRAY_SET:    return two_byte_instruction("ARRAY_SET",  chunk, offset)
+    case .SLICE_SET:    return two_byte_instruction("SLICE_SET",  chunk, offset)
+
+    // Superinstructions
+    case .ADD_LOCALS:       return two_byte_instruction("ADD_LOCALS",      chunk, offset)
+    case .MUL_LOCALS:       return two_byte_instruction("MUL_LOCALS",      chunk, offset)
+    case .LT_LOCAL_CONST:   return two_byte_instruction("LT_LOCAL_CONST",  chunk, offset)
+    case .LTE_LOCAL_CONST:  return two_byte_instruction("LTE_LOCAL_CONST", chunk, offset)
+    case .SUB_LOCAL_CONST:  return two_byte_instruction("SUB_LOCAL_CONST", chunk, offset)
+
+    // Type-specific arithmetic
+    case .ADD_I64:      return simple_instruction("ADD_I64",    offset)
+    case .SUB_I64:      return simple_instruction("SUB_I64",    offset)
+    case .MUL_I64:      return simple_instruction("MUL_I64",    offset)
+    case .DIV_I64:      return simple_instruction("DIV_I64",    offset)
+    case .MOD_I64:      return simple_instruction("MOD_I64",    offset)
+    case .ADD_F64:      return simple_instruction("ADD_F64",    offset)
+    case .SUB_F64:      return simple_instruction("SUB_F64",    offset)
+    case .MUL_F64:      return simple_instruction("MUL_F64",    offset)
+    case .DIV_F64:      return simple_instruction("DIV_F64",    offset)
+    case .ADD_STR:      return simple_instruction("ADD_STR",    offset)
+    case .LT_I64:       return simple_instruction("LT_I64",     offset)
+    case .LTE_I64:      return simple_instruction("LTE_I64",    offset)
+    case .GT_I64:       return simple_instruction("GT_I64",     offset)
+    case .GTE_I64:      return simple_instruction("GTE_I64",    offset)
+    case .LT_F64:       return simple_instruction("LT_F64",     offset)
+    case .LTE_F64:      return simple_instruction("LTE_F64",    offset)
+    case .GT_F64:       return simple_instruction("GT_F64",     offset)
+    case .GTE_F64:      return simple_instruction("GTE_F64",    offset)
+    case .NEGATE_I64:   return simple_instruction("NEGATE_I64", offset)
+    case .NEGATE_F64:   return simple_instruction("NEGATE_F64", offset)
 
     case:
         fmt.printf("UNKNOWN opcode %d\n", op)
@@ -121,6 +158,14 @@ const_long_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int 
     fmt.printf("%-16s %4d '", name, idx)
     print_value(chunk.constants[idx])
     fmt.printf("'\n")
+    return offset + 3
+}
+
+// two byte operands — print name + both raw bytes
+two_byte_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
+    a := chunk.code[offset + 1]
+    b := chunk.code[offset + 2]
+    fmt.printf("%-16s %4d %4d\n", name, a, b)
     return offset + 3
 }
 
