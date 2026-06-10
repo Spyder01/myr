@@ -1,8 +1,8 @@
 # Myr
 
-A language designed around simplicity and control.
+A lightweight, embeddable, strongly-typed language with FP ergonomics.
 
-Algebraic types and FP ergonomics without a borrow checker. No hidden costs, no magic — you see what the program does and you decide how it does it. Implemented in [Odin](https://odin-lang.org).
+Memory-efficient and performant by design — algebraic types, no hidden costs, no magic. You see what the program does and you decide how it does it. Implemented in [Odin](https://odin-lang.org).
 
 ---
 
@@ -352,6 +352,55 @@ function main() {
     print(a)
 }
 
+### Generic functions
+
+Functions can be parameterised over one or more type variables using `[T]` syntax. Myr uses monomorphisation — a separate concrete copy is compiled for each distinct combination of argument types.
+
+```myr
+function max[T](a: T, b: T) -> T {
+    if a > b { return a }
+    return b
+}
+
+function main() {
+    print(max(3, 7))        // 7   — max__int
+    print(max(1.5, 2.5))    // 2.5 — max__float
+}
+```
+
+Multiple type parameters and multiple instantiations in the same program are supported:
+
+```myr
+function min[T](a: T, b: T) -> T {
+    if a < b { return a }
+    return b
+}
+
+function clamp[T](val: T, lo: T, hi: T) -> T {
+    return max(min(val, hi), lo)
+}
+
+function main() {
+    print(clamp(15, 0, 10))   // 10
+    print(clamp(-5, 0, 10))   // 0
+    print(clamp(5, 0, 10))    // 5
+}
+```
+
+Generic functions can receive struct or enum values when the body only performs operations valid for that type. Returning the generic type `T` where T resolves to a struct or enum is not yet supported — use a concrete return type instead.
+
+```myr
+enum Shape { Circle { radius: int }, Rect { w: int, h: int } }
+
+function area[T](s: T) -> int {
+    match s {
+        Shape.Circle { radius } => { return radius * radius }
+        Shape.Rect   { w, h }  => { return w * h }
+    }
+    return 0
+}
+```
+
 ### First-class functions
 
 Functions are values — store them in variables, pass them as arguments, return them from other functions.
@@ -410,9 +459,9 @@ Phase 1 — bytecode compiler + VM. The pipeline is:
 source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), type checker.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params), type checker.
 
-Not yet: generic types, closures.
+Not yet: generic return type T resolving to struct/enum at call site, closures.
 
 ## Examples
 

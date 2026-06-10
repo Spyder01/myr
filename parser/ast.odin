@@ -160,6 +160,7 @@ Param :: struct {
 
 FunctionDecl :: struct {
 	name:        lexer.Token,
+	type_params: []lexer.Token,
 	params:      []Param,
 	return_type: Maybe(TypeIdx),
 	body:        BlockExpression,
@@ -245,6 +246,7 @@ ast_destroy :: proc(ast: ^AST) {
 		case Declaration:
 			switch d in n {
 			case FunctionDecl:
+				delete(d.type_params)
 				delete(d.params)
 				delete(d.body.stmts)
 			case StructDecl:

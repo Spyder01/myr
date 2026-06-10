@@ -133,6 +133,19 @@ parse_function_declarations :: proc(p: ^Parser) {
 	expect(p, .FN)
 	name := expect(p, .IDENT)
 
+	type_params := make([dynamic]lexer.Token)
+	if peek(p) == .LEFT_BRACKET {
+		advance(p)
+		for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
+			tp := expect(p, .IDENT)
+			append_elem(&type_params, tp)
+			if peek(p) != .RIGHT_BRACKET {
+				expect(p, .COMMA)
+			}
+		}
+		expect(p, .RIGHT_BRACKET)
+	}
+
 	expect(p, .LEFT_PAREN)
 	params := parse_params(p)
 	expect(p, .RIGHT_PAREN)
@@ -147,6 +160,7 @@ parse_function_declarations :: proc(p: ^Parser) {
 
 	decl := FunctionDecl{
 		name        = name,
+		type_params = type_params[:],
 		params      = params,
 		return_type = return_type,
 		body        = body,

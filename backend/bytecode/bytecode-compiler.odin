@@ -40,33 +40,43 @@ EnumLayout :: struct {
 }
 
 Compiler :: struct {
-	bc:             ByteCodeCompiler,
-	ast:            ^parser.AST,
-	errors:         [MAX_ERROR_COUNT]CompilerError,
-	error_count:    u8,
-	loop_ctx:       ^LoopCtx,
-	const_table:    map[string]Value,
-	struct_layouts: map[string]StructLayout,
-	enum_layouts:   map[string]EnumLayout,
-	tc_types:       []tc.TypeId,   // nil when type checker output is unavailable
-	tc_type_table:  []tc.TypeInfo, // nil when type checker output is unavailable
+	bc:                ByteCodeCompiler,
+	ast:               ^parser.AST,
+	errors:            [MAX_ERROR_COUNT]CompilerError,
+	error_count:       u8,
+	loop_ctx:          ^LoopCtx,
+	const_table:       map[string]Value,
+	struct_layouts:    map[string]StructLayout,
+	enum_layouts:      map[string]EnumLayout,
+	tc_types:          []tc.TypeId,
+	tc_type_table:     []tc.TypeInfo,
+	generic_templates: map[string]parser.FunctionDecl, // name → template for generic functions
+	generic_emitted:   map[string]bool,                // mangled names already compiled
+	type_subst:        map[string]string,              // active during generic instantiation: T → "int"
+	root:              ^Compiler,                      // nil for root; points to root for child compilers
 }
 
 new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
 	return Compiler{
-		bc             = new_bytecode_compiler("__main__", 0),
-		ast            = ast,
-		const_table    = make(map[string]Value),
-		struct_layouts = make(map[string]StructLayout),
-		enum_layouts   = make(map[string]EnumLayout),
-		tc_types       = tc_types,
-		tc_type_table  = tc_type_table,
+		bc                = new_bytecode_compiler("__main__", 0),
+		ast               = ast,
+		const_table       = make(map[string]Value),
+		struct_layouts    = make(map[string]StructLayout),
+		enum_layouts      = make(map[string]EnumLayout),
+		tc_types          = tc_types,
+		tc_type_table     = tc_type_table,
+		generic_templates = make(map[string]parser.FunctionDecl),
+		generic_emitted   = make(map[string]bool),
+		type_subst        = make(map[string]string),
 	}
 }
 
 compiler_destroy :: proc(c: ^Compiler) {
 	compiler_free(&c.bc)
 	delete(c.const_table)
+	delete(c.generic_templates)
+	delete(c.generic_emitted)
+	delete(c.type_subst)
 }
 
 compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Function, []CompilerError) {
@@ -90,6 +100,18 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 		if decl, ok := node.(parser.Declaration); ok {
 			if ed, ok2 := decl.(parser.EnumDecl); ok2 {
 				c.enum_layouts[ed.name.data] = build_enum_layout(&c, ed)
+			}
+		}
+	}
+
+	// Collect generic templates before compiling anything so that call sites can
+	// find and instantiate them in any declaration order.
+	for node in ast.nodes {
+		if decl, ok := node.(parser.Declaration); ok {
+			if fn, ok2 := decl.(parser.FunctionDecl); ok2 {
+				if len(fn.type_params) > 0 {
+					c.generic_templates[fn.name.data] = fn
+				}
 			}
 		}
 	}
@@ -133,7 +155,8 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 
 	switch d in node.(parser.Declaration) {
 	case parser.FunctionDecl:
-		compile_function(c, d, span)
+		if len(d.type_params) > 0 { return } // generic — already instantiated in pre-scan
+		compile_function(c, d, d.name.data, span)
 	case parser.ConstDecl:
 		if val, ok := eval_const_expr(c, d.value, span); ok {
 			c.const_table[d.name.data] = val
@@ -149,7 +172,7 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 	}
 }
 
-compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span) {
+compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string, span: lexer.Span) {
 	// Compute total slot count for arity: struct and enum params occupy N slots each.
 	total_param_slots := 0
 	for param in d.params {
@@ -169,10 +192,10 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 	}
 
 	// create a child compiler for this function
-	fn_compiler := new_bytecode_compiler(d.name.data, u8(total_param_slots), &c.bc)
+	fn_compiler := new_bytecode_compiler(emit_name, u8(total_param_slots), &c.bc)
 
 	// slot 0 is the function itself (allows recursion, matches VM frame layout)
-	add_local(&fn_compiler, d.name.data)
+	add_local(&fn_compiler, emit_name)
 	// parameters start at slot 1; register each with its actual slot count
 	for param in d.params {
 		struct_name := type_ann_struct_name(c, param.type)
@@ -191,8 +214,30 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 		add_local(&fn_compiler, param.name.data, slots, struct_name, ptr_inner, enum_name)
 	}
 
-	// compile body
-	child := Compiler{bc = fn_compiler, ast = c.ast, errors = c.errors, error_count = c.error_count, const_table = c.const_table, struct_layouts = c.struct_layouts, enum_layouts = c.enum_layouts, tc_types = c.tc_types, tc_type_table = c.tc_type_table}
+	// compile body — child shares all read-only tables and the generic registry.
+	// Each child gets its OWN copy of type_subst so that clearing the root's
+	// substitution during a nested instantiation does not affect this child's view.
+	// root points to the __main__ compiler so nested generic instantiations can
+	// emit DEFINE_GLOBAL into the top-level chunk from inside a function body.
+	root_c := c.root
+	if root_c == nil { root_c = c }
+	child_subst := make(map[string]string)
+	for k, v in c.type_subst { child_subst[k] = v }
+	child := Compiler{
+		bc                = fn_compiler,
+		ast               = c.ast,
+		errors            = c.errors,
+		error_count       = c.error_count,
+		const_table       = c.const_table,
+		struct_layouts    = c.struct_layouts,
+		enum_layouts      = c.enum_layouts,
+		tc_types          = c.tc_types,
+		tc_type_table     = c.tc_type_table,
+		generic_templates = c.generic_templates,
+		generic_emitted   = c.generic_emitted,
+		type_subst        = child_subst,
+		root              = root_c,
+	}
 	compile_fn_body(&child, d.body)
 	emit(&child.bc, .RETURN, span)
 	emit_byte(&child.bc, 1, span)
@@ -202,9 +247,9 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, span: lexer.Span)
 	// get compiled function
 	fn := compiler_end(&child.bc)
 
-	// emit function as a constant in parent, bind to name
+	// emit function as a constant in parent, bind to emit_name
 	emit_constant(&c.bc, fn, span)
-	name_idx, _ := chunk_add_constant(current_chunk(&c.bc), d.name.data)
+	name_idx, _ := chunk_add_constant(current_chunk(&c.bc), emit_name)
 	emit(&c.bc, .DEFINE_GLOBAL, span)
 	emit_byte(&c.bc, u8(name_idx), span)
 }
@@ -535,7 +580,8 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		callee_node := c.ast.nodes[e.callee]
 		if expr, ok := callee_node.(parser.Expression); ok {
 			if id, ok2 := expr.(parser.IdentExpression); ok2 {
-				switch lexer.Token(id).data {
+				fn_name := lexer.Token(id).data
+				switch fn_name {
 				case "print":
 					for arg in e.args {
 						compile_expr(c, arg)
@@ -544,13 +590,52 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 					emit(&c.bc, .NIL, span)
 					return
 				case "input":
-					// emit prompt (empty string if no argument given)
 					if len(e.args) > 0 {
 						compile_expr(c, e.args[0])
 					} else {
 						emit_constant(&c.bc, "", span)
 					}
 					emit(&c.bc, .INPUT, span)
+					return
+				}
+				// Generic function call: emit the instantiation into the root chunk
+				// on first use, then call it by its mangled name.
+				if tmpl, is_generic := c.generic_templates[fn_name]; is_generic {
+					mangled := compute_generic_mangled_name(c, tmpl, e.args)
+					if !strings.contains(mangled, "__unknown") {
+						root_c := c.root
+						if root_c == nil { root_c = c }
+						if !root_c.generic_emitted[mangled] {
+							root_c.generic_emitted[mangled] = true
+							// Save root's substitution, build one for this instantiation.
+							saved := make(map[string]string)
+							for k, v in root_c.type_subst { saved[k] = v }
+							clear(&root_c.type_subst)
+							for param, pi in tmpl.params {
+								if pi >= len(e.args) { break }
+								ann := type_ann_raw_name(c, param.type)
+								is_tp := false
+								for tp in tmpl.type_params { if tp.data == ann { is_tp = true; break } }
+								if !is_tp { continue }
+								concrete := infer_type_param(c, tmpl, ann, e.args)
+								if concrete != "" { root_c.type_subst[ann] = concrete }
+							}
+							compile_function(root_c, tmpl, mangled, span)
+							clear(&root_c.type_subst)
+							for k, v in saved { root_c.type_subst[k] = v }
+							delete(saved)
+						}
+					}
+					name_idx, _ := chunk_add_constant(current_chunk(&c.bc), mangled)
+					emit(&c.bc, .GET_GLOBAL, span)
+					emit_byte(&c.bc, u8(name_idx), span)
+					total_arg_slots := 0
+					for arg in e.args {
+						compile_expr(c, arg)
+						total_arg_slots += expr_slot_count(c, arg)
+					}
+					emit(&c.bc, .CALL, span)
+					emit_byte(&c.bc, u8(total_arg_slots), span)
 					return
 				}
 			}
@@ -1108,6 +1193,7 @@ type_ann_enum_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
+	if subst, has := c.type_subst[name]; has { name = subst }
 	if _, ok3 := c.enum_layouts[name]; ok3 {
 		return name
 	}
@@ -1186,12 +1272,15 @@ type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 	node := c.ast.nodes[int(type_idx)]
 	ty, ok := node.(parser.Type)
 	if !ok do return 1
-	// Pointer types always occupy exactly 1 slot.
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return 1
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return 1
 	name := lexer.Token(named).data
+	if subst, has := c.type_subst[name]; has { name = subst }
 	if layout, ok3 := c.struct_layouts[name]; ok3 {
+		return layout.total_slots
+	}
+	if layout, ok3 := c.enum_layouts[name]; ok3 {
 		return layout.total_slots
 	}
 	return 1
@@ -1202,11 +1291,11 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	node := c.ast.nodes[int(type_idx)]
 	ty, ok := node.(parser.Type)
 	if !ok do return ""
-	// Pointer types are not flat structs — the local holds 1 pointer slot.
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return ""
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
+	if subst, has := c.type_subst[name]; has { name = subst }
 	if _, ok3 := c.struct_layouts[name]; ok3 {
 		return name
 	}
@@ -1226,7 +1315,9 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	if !ok2 do return ""
 	named, ok3 := inner_ty.(parser.NamedType)
 	if !ok3 do return ""
-	return lexer.Token(named).data
+	name := lexer.Token(named).data
+	if subst, has := c.type_subst[name]; has { name = subst }
+	return name
 }
 
 expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
@@ -1663,3 +1754,79 @@ compile_deref_expr :: proc(c: ^Compiler, e: parser.DerefExpression, span: lexer.
 	emit(&c.bc, .HEAP_LOAD, span)
 	emit_byte(&c.bc, u8(n), span)
 }
+
+// ---- generics ----
+
+// type_ann_raw_name returns the raw identifier string of a NamedType annotation,
+// or "" for pointer/fn types. Used to detect which params are type parameters.
+@private
+type_ann_raw_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
+	if int(type_idx) >= len(c.ast.nodes) { return "" }
+	node := c.ast.nodes[int(type_idx)]
+	ty, ok := node.(parser.Type)
+	if !ok { return "" }
+	named, ok2 := ty.(parser.NamedType)
+	if !ok2 { return "" }
+	return lexer.Token(named).data
+}
+
+// type_id_to_name converts a typechecker TypeId to a concrete type name string.
+@private
+type_id_to_name :: proc(c: ^Compiler, id: tc.TypeId) -> string {
+	switch id {
+	case tc.VOID_TYPE, tc.UNKNOWN_TYPE: return ""
+	case tc.INT_TYPE:    return "int"
+	case tc.FLOAT_TYPE:  return "float"
+	case tc.BOOL_TYPE:   return "bool"
+	case tc.STRING_TYPE: return "string"
+	}
+	if c.tc_type_table == nil || int(id) >= len(c.tc_type_table) { return "" }
+	#partial switch t in c.tc_type_table[int(id)] {
+	case tc.StructType: return t.name
+	case tc.EnumType:   return t.name
+	}
+	return ""
+}
+
+// infer_arg_type_name returns the concrete type name for an argument expression
+// using the type checker's results.
+@private
+infer_arg_type_name :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
+	if c.tc_types == nil || int(idx) >= len(c.tc_types) { return "" }
+	return type_id_to_name(c, c.tc_types[int(idx)])
+}
+
+// infer_type_param finds the concrete type for one type parameter by scanning the
+// call's argument list and matching parameters annotated with that type param name.
+@private
+infer_type_param :: proc(c: ^Compiler, tmpl: parser.FunctionDecl, type_param_name: string, args: []parser.ExpressionIdx) -> string {
+	for param, i in tmpl.params {
+		if i >= len(args) { break }
+		ann := type_ann_raw_name(c, param.type)
+		if ann != type_param_name { continue }
+		concrete := infer_arg_type_name(c, args[i])
+		if concrete != "" { return concrete }
+		// Fallback: inside a generic body, tc_types are UNKNOWN; use the active substitution instead.
+		if subst, has := c.type_subst[type_param_name]; has { return subst }
+	}
+	return ""
+}
+
+// compute_generic_mangled_name produces the unique name for one instantiation,
+// e.g. "max__int" or "pair__int__float".
+@private
+compute_generic_mangled_name :: proc(c: ^Compiler, tmpl: parser.FunctionDecl, args: []parser.ExpressionIdx) -> string {
+	b := strings.builder_make()
+	strings.write_string(&b, tmpl.name.data)
+	for tp in tmpl.type_params {
+		concrete := infer_type_param(c, tmpl, tp.data, args)
+		strings.write_string(&b, "__")
+		if concrete != "" {
+			strings.write_string(&b, concrete)
+		} else {
+			strings.write_string(&b, "unknown")
+		}
+	}
+	return strings.to_string(b)
+}
+

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project: Myr Language
 
-Myr is a systems/game-development language — Rust's algebraic type system + Odin's data-layout awareness, no borrow checker, FP ergonomics. The interpreter is written in **Odin**.
+Myr is a highly embedded, lightweight, memory-efficient, performant, strongly-typed language with FP ergonomics and algebraic types. It is not a systems language by default, but is designed to be extensible toward one if needed. The interpreter is written in **Odin**.
 
 **Phase 1 (current):** Tree-walking interpreter in Odin. Goal: nail syntax and type system.  
 **Phase 2 (future):** Compiler targeting bytecode VM, manual memory management + optional GC.

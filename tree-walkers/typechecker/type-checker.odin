@@ -40,6 +40,7 @@ typecheck :: proc(ast: ^parser.AST, nrr: ^nr.NRResult) -> TypecheckResult {
 register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration) {
 	switch d in decl {
 	case parser.FunctionDecl:
+		if len(d.type_params) > 0 { return }
 		params := make([]TypeId, len(d.params))
 		for param, i in d.params {
 			params[i] = resolve_named_type(tc, param.type)
@@ -109,6 +110,7 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 check_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration) {
 	switch d in decl {
 	case parser.FunctionDecl:
+		if len(d.type_params) > 0 { return }
 		info, ok := get_type_info(tc, tc.types[int(def)])
 		if !ok do return
 
@@ -474,7 +476,12 @@ infer_binary :: proc(tc: ^Typechecker, e: parser.BinaryExpression) -> TypeId {
 @private
 infer_call :: proc(tc: ^Typechecker, call_idx: parser.ExpressionIdx, e: parser.CallExpression) -> TypeId {
 	callee_type := infer(tc, e.callee)
-	if callee_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
+	if callee_type == UNKNOWN_TYPE {
+		// Callee unresolved (e.g. a generic function). Still infer arg types so
+		// tc.types is populated for the generic instantiation pre-scan.
+		for arg in e.args { infer(tc, arg) }
+		return UNKNOWN_TYPE
+	}
 
 	info, ok := get_type_info(tc, callee_type)
 	if !ok {

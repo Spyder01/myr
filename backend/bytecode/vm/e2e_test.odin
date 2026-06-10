@@ -1910,3 +1910,149 @@ test_e2e_enum_wrong_arg_type :: proc(t: ^testing.T) {
 	`)
 	testing.expect(t, n > 0, "expected type error: enum where i64 required")
 }
+
+// ---- generics ----
+
+@(test)
+test_e2e_generic_max_int :: proc(t: ^testing.T) {
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function main() -> i64 { return max(3, 7) }
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_generic_max_float :: proc(t: ^testing.T) {
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function main() -> float { return max(3.14, 2.71) }
+	`)
+	testing.expect_value(t, val.(f64), f64(3.14))
+}
+
+@(test)
+test_e2e_generic_min_int :: proc(t: ^testing.T) {
+	val := result(`
+		function min[T](a: T, b: T) -> T {
+			if a < b { return a }
+			return b
+		}
+		function main() -> i64 { return min(10, 3) }
+	`)
+	testing.expect_value(t, val.(i64), i64(3))
+}
+
+@(test)
+test_e2e_generic_add :: proc(t: ^testing.T) {
+	val := result(`
+		function add[T](a: T, b: T) -> T { return a + b }
+		function main() -> i64 { return add(3, 4) }
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_generic_add_float :: proc(t: ^testing.T) {
+	val := result(`
+		function add[T](a: T, b: T) -> T { return a + b }
+		function main() -> float { return add(1.5, 2.5) }
+	`)
+	testing.expect_value(t, val.(f64), f64(4.0))
+}
+
+@(test)
+test_e2e_generic_two_instantiations :: proc(t: ^testing.T) {
+	// Same template instantiated at both int and float in the same program.
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function main() -> i64 {
+			let a = max(3, 7)
+			let b = max(1.5, 2.5)
+			return a
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(7))
+}
+
+@(test)
+test_e2e_generic_nested_clamp_hi :: proc(t: ^testing.T) {
+	// clamp calls max and min internally — nested generic instantiation.
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function min[T](a: T, b: T) -> T {
+			if a < b { return a }
+			return b
+		}
+		function clamp[T](val: T, lo: T, hi: T) -> T {
+			return max(min(val, hi), lo)
+		}
+		function main() -> i64 { return clamp(15, 0, 10) }
+	`)
+	testing.expect_value(t, val.(i64), i64(10))
+}
+
+@(test)
+test_e2e_generic_nested_clamp_lo :: proc(t: ^testing.T) {
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function min[T](a: T, b: T) -> T {
+			if a < b { return a }
+			return b
+		}
+		function clamp[T](val: T, lo: T, hi: T) -> T {
+			return max(min(val, hi), lo)
+		}
+		function main() -> i64 { return clamp(-5, 0, 10) }
+	`)
+	testing.expect_value(t, val.(i64), i64(0))
+}
+
+@(test)
+test_e2e_generic_nested_clamp_mid :: proc(t: ^testing.T) {
+	// Value within range passes through unchanged.
+	val := result(`
+		function max[T](a: T, b: T) -> T {
+			if a > b { return a }
+			return b
+		}
+		function min[T](a: T, b: T) -> T {
+			if a < b { return a }
+			return b
+		}
+		function clamp[T](val: T, lo: T, hi: T) -> T {
+			return max(min(val, hi), lo)
+		}
+		function main() -> i64 { return clamp(5, 0, 10) }
+	`)
+	testing.expect_value(t, val.(i64), i64(5))
+}
+
+@(test)
+test_e2e_generic_called_multiple_times :: proc(t: ^testing.T) {
+	// Same instantiation called more than once; result accumulates correctly.
+	val := result(`
+		function add[T](a: T, b: T) -> T { return a + b }
+		function main() -> i64 {
+			let x = add(1, 2)
+			let y = add(x, 3)
+			return add(y, 4)
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(10))
+}
