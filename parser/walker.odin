@@ -84,6 +84,8 @@ visit_expr :: proc(ast: ^AST, idx: ExpressionIdx, visit: Visitor) {
 		for field in e.fields do visit_expr(ast, field.value, visit)
 	case DerefExpression:
 		visit_expr(ast, e.operand, visit)
+	case AddrOfExpression:
+		visit_expr(ast, e.operand, visit)
 	case LiteralExpression, IdentExpression:
 		// leaves
 	}
@@ -178,6 +180,8 @@ walker_push_expr :: proc(w: ^WalkerCursor, e: Expression) {
 			append(&w.stack, u32(v.fields[i].value))
 		}
 	case DerefExpression:
+		append(&w.stack, u32(v.operand))
+	case AddrOfExpression:
 		append(&w.stack, u32(v.operand))
 	case LiteralExpression, IdentExpression:
 		// leaves

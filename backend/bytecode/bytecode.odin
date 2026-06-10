@@ -56,10 +56,11 @@ Opcode :: enum u8 {
 	CALL,
 	RETURN,
 
-	NEW,       // 1-byte: N  — pop N values, heap-alloc slice, push ^Value base
-	HEAP_GET,  // 1-byte: offset — pop ^Value, push ptr[offset]
-	HEAP_SET,  // 1-byte: offset — pop ^Value (top), ptr[offset] = stack_top below it
-	HEAP_LOAD, // 1-byte: N  — pop ^Value, push ptr[0..N-1] (full deref)
+	NEW,        // 1-byte: N  — pop N values, heap-alloc slice, push ^Value base
+	HEAP_GET,   // 1-byte: offset — pop ^Value, push ptr[offset]
+	HEAP_SET,   // 1-byte: offset — pop ^Value (top), ptr[offset] = stack_top below it
+	HEAP_LOAD,  // 1-byte: N  — pop ^Value, push ptr[0..N-1] (full deref)
+	ADDR_LOCAL, // 1-byte: slot — push a raw pointer to frame[slot] (stack reference)
 
 	POP,
 	PRINT,

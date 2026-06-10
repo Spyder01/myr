@@ -362,6 +362,12 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 		}
 		return pt.inner
 
+	case parser.AddrOfExpression:
+		// &x — result is ^T where T is the type of x
+		inner_id := infer(tc, e.operand)
+		if inner_id == UNKNOWN_TYPE do return UNKNOWN_TYPE
+		return register_ptr_type(tc, inner_id)
+
 	case parser.EnumLiteralExpression:
 		return infer_enum_literal(tc, idx, e)
 	}

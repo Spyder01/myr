@@ -533,6 +533,14 @@ parse_prefix :: proc(p: ^Parser) -> ExpressionIdx {
 		append_elem(&p.ast.spans, tok.span)
 		return ExpressionIdx(len(p.ast.nodes) - 1)
 
+	case .AMPERSAND:
+		advance(p)
+		operand := parse_expr(p, 21)
+		expr    := AddrOfExpression{operand = operand}
+		append_elem(&p.ast.nodes, Node(Expression(expr)))
+		append_elem(&p.ast.spans, tok.span)
+		return ExpressionIdx(len(p.ast.nodes) - 1)
+
 	case .MINUS, .BANG, .TILDE:
 		advance(p)
 		operand := parse_expr(p, 21)

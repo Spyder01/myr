@@ -80,6 +80,10 @@ DerefExpression :: struct {
 	operand: ExpressionIdx,
 }
 
+AddrOfExpression :: struct {
+	operand: ExpressionIdx,
+}
+
 // EnumLiteralExpression represents EnumName.VariantName { field = value, ... }
 EnumLiteralExpression :: struct {
 	enum_name:    lexer.Token,
@@ -101,6 +105,7 @@ Expression :: union {
 	StructLiteralExpression,
 	NewExpression,
 	DerefExpression,
+	AddrOfExpression,
 	EnumLiteralExpression,
 }
 
@@ -294,7 +299,7 @@ ast_destroy :: proc(ast: ^AST) {
 			case BinaryExpression, UnaryExpression,
 			     FieldAccessExpression, IndexExpression,
 			     LiteralExpression, IdentExpression,
-			     DerefExpression:
+			     DerefExpression, AddrOfExpression:
 			}
 		case Type:
 			switch ty in n {

@@ -2222,3 +2222,72 @@ test_e2e_nested_generic_struct_pair_box :: proc(t: ^testing.T) {
 	`)
 	testing.expect_value(t, val.(i64), i64(13))
 }
+
+@test
+test_e2e_addrof_basic :: proc(t: ^testing.T) {
+	// &local gives a live pointer — field write through pointer is visible on original.
+	val := result(`
+		struct Point { x: int, y: int }
+		function main() -> i64 {
+			let p = Point{x = 10, y = 20}
+			let ptr = &p
+			ptr.x = 99
+			return p.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(99))
+}
+
+@test
+test_e2e_addrof_passed_to_fn :: proc(t: ^testing.T) {
+	// Pass &local to a function expecting ^T; mutation is visible after the call.
+	val := result(`
+		struct Counter { n: int }
+		function inc(c: ^Counter) {
+			c.n += 1
+		}
+		function main() -> i64 {
+			let c = Counter{n = 0}
+			inc(&c)
+			inc(&c)
+			inc(&c)
+			return c.n
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(3))
+}
+
+@test
+test_e2e_addrof_two_aliases :: proc(t: ^testing.T) {
+	// Two stack refs to the same local both see mutations.
+	val := result(`
+		struct Val { x: int }
+		function main() -> i64 {
+			let v = Val{x = 1}
+			let a = &v
+			let b = &v
+			a.x = 42
+			return b.x
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(42))
+}
+
+@test
+test_e2e_addrof_stored_in_let :: proc(t: ^testing.T) {
+	// &local stored in a let, then used with auto-deref field access.
+	val := result(`
+		struct Point { x: int, y: int }
+		function move(p: ^Point, dx: int, dy: int) {
+			p.x += dx
+			p.y += dy
+		}
+		function main() -> i64 {
+			let pt = Point{x = 10, y = 20}
+			let p = &pt
+			move(p, 3, 4)
+			return pt.x + pt.y
+		}
+	`)
+	testing.expect_value(t, val.(i64), i64(37))
+}

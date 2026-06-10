@@ -283,5 +283,8 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 
 	case parser.DerefExpression:
 		nr_resolve_expr(nr, e.operand)
+
+	case parser.AddrOfExpression:
+		nr_resolve_expr(nr, e.operand)
 	}
 }

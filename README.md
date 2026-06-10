@@ -147,7 +147,12 @@ function main() {
 
 ### Pointers
 
-Use `^T` for a heap-allocated pointer to a struct. `new T{...}` allocates and returns a `^T`. Field access auto-derefs — no explicit `->` needed.
+Myr has two ways to get a `^T` pointer:
+
+- `new T{...}` — heap-allocates a struct and returns a `^T`
+- `&x` — takes the address of an existing local variable, returning a `^T` that points directly into the stack frame
+
+Field access through either kind of pointer auto-derefs — no `->` needed.
 
 ```myr
 struct Point { x: int, y: int }
@@ -158,10 +163,35 @@ function move(p: ^Point, dx: int, dy: int) {
 }
 
 function main() {
+    // heap allocation
     let p: ^Point = new Point{x = 0, y = 0}
     move(p, 3, 4)
     print(p.x)   // 3
     print(p.y)   // 4
+
+    // stack reference — mutations are visible on the original
+    let pt = Point{x = 10, y = 20}
+    move(&pt, 5, 5)
+    print(pt.x)  // 15
+    print(pt.y)  // 25
+}
+```
+
+`&x` gives a live reference — writes through the pointer mutate the original local:
+
+```myr
+struct Counter { n: int }
+
+function inc(c: ^Counter) {
+    c.n += 1
+}
+
+function main() {
+    let c = Counter{n = 0}
+    inc(&c)
+    inc(&c)
+    inc(&c)
+    print(c.n)   // 3
 }
 ```
 
@@ -506,7 +536,7 @@ Phase 1 — bytecode compiler + VM. The pipeline is:
 source → lex → parse → type-check → compile → VM
 ```
 
-Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params, generic struct return types, nested generic struct types like `Box[Box[int]]`), type checker.
+Working: integers, floats, booleans, strings, arithmetic, comparisons, logical and bitwise operators, compound assignment, if/else, all loop forms (while / infinite / C-style), break, continue, functions, recursion, first-class functions, constants, structs (value semantics, nested), pointers (`^T`, `new`, `nil`, auto-deref, explicit deref `p^`, address-of `&x`), recursive structs, enums with named-field variants, `match` expressions (variant dispatch, field destructuring, wildcard arm, match-as-expression), generic functions (monomorphisation, nested generics, struct/enum params, generic struct return types, nested generic struct types like `Box[Box[int]]`), type checker.
 
 Not yet: closures.
 

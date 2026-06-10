@@ -247,6 +247,12 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			arg_count := u16(read_byte(vm))
 			if err := vm_call(vm, arg_count); err != nil do return err
 
+		case .ADDR_LOCAL:
+			slot := int(read_byte(vm))
+			frame := current_frame(vm)
+			ptr: [^]Value = raw_data(vm.stack[frame.slots + u16(slot):])
+			if err := vm_push(vm, ptr); err != nil do return err
+
 		case .NEW:
 			n := int(read_byte(vm))
 			slots := make([]Value, n)

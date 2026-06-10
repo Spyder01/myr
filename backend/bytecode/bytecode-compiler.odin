@@ -676,6 +676,9 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 	case parser.DerefExpression:
 		compile_deref_expr(c, e, span)
 
+	case parser.AddrOfExpression:
+		compile_addr_of(c, e, span)
+
 	case parser.EnumLiteralExpression:
 		compile_enum_literal(c, e, span)
 
@@ -1322,6 +1325,7 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 }
 
 // type_ann_ptr_inner returns the name of T when the annotation is ^T, or "".
+// Handles both ^NamedType and ^GenericType (e.g. ^Stack[T] with active type_subst).
 type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	if int(type_idx) >= len(c.ast.nodes) do return ""
 	node := c.ast.nodes[int(type_idx)]
@@ -1332,6 +1336,9 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	inner_node := c.ast.nodes[int(ptr.inner)]
 	inner_ty, ok2 := inner_node.(parser.Type)
 	if !ok2 do return ""
+	if gt, ok3 := inner_ty.(parser.GenericType); ok3 {
+		return generic_struct_mangled_name(c, gt.name.data, gt.args)
+	}
 	named, ok3 := inner_ty.(parser.NamedType)
 	if !ok3 do return ""
 	name := lexer.Token(named).data
@@ -1560,6 +1567,9 @@ expr_ptr_inner :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	}
 	if ce, ok2 := expr.(parser.CallExpression); ok2 {
 		return call_return_ptr_inner(c, ce)
+	}
+	if ao, ok2 := expr.(parser.AddrOfExpression); ok2 {
+		return expr_struct_type(c, ao.operand)
 	}
 	return ""
 }
@@ -1801,6 +1811,31 @@ compile_deref_expr :: proc(c: ^Compiler, e: parser.DerefExpression, span: lexer.
 	emit_byte(&c.bc, u8(n), span)
 }
 
+// compile_addr_of emits ADDR_LOCAL for &x, pushing a raw pointer into the frame.
+// Only struct or scalar locals are supported as the operand.
+compile_addr_of :: proc(c: ^Compiler, e: parser.AddrOfExpression, span: lexer.Span) {
+	ident, ok := c.ast.nodes[int(e.operand)].(parser.Expression)
+	if !ok {
+		compiler_error(c, "&: operand is not an expression", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	id, is_ident := ident.(parser.IdentExpression)
+	if !is_ident {
+		compiler_error(c, "&: operand must be a local variable", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	slot, _, found := resolve_local(&c.bc, lexer.Token(id).data)
+	if !found {
+		compiler_error(c, fmt.tprintf("&: undefined variable '%s'", lexer.Token(id).data), span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	emit(&c.bc, .ADDR_LOCAL, span)
+	emit_byte(&c.bc, u8(slot), span)
+}
+
 // ---- generics ----
 
 // generic_struct_mangled_name computes the monomorphised name for a generic struct,
@@ -1965,6 +2000,36 @@ infer_type_param_from_generic :: proc(c: ^Compiler, param_type_idx: parser.TypeI
 	if int(param_type_idx) >= len(c.ast.nodes) { return "" }
 	ty, ok := c.ast.nodes[int(param_type_idx)].(parser.Type)
 	if !ok { return "" }
+
+	// Handle ^GenericType: param is a pointer to a generic struct (e.g. ^Stack[T]).
+	// Strip the pointer on both sides, then match inner GenericType against the
+	// concrete inner struct name obtained from the arg's pointer target.
+	if ptr, ok2 := ty.(parser.PointerType); ok2 {
+		arg_inner := expr_ptr_inner(c, arg_idx)
+		if arg_inner == "" { return "" }
+		if int(ptr.inner) >= len(c.ast.nodes) { return "" }
+		inner_ty, ok3 := c.ast.nodes[int(ptr.inner)].(parser.Type)
+		if !ok3 { return "" }
+		inner_gt, ok4 := inner_ty.(parser.GenericType)
+		if !ok4 { return "" }
+		tp_pos := -1
+		for tp_arg, j in inner_gt.args {
+			if type_ann_raw_name(c, tp_arg) == type_param_name { tp_pos = j; break }
+		}
+		if tp_pos < 0 { return "" }
+		base := inner_gt.name.data
+		if !strings.has_prefix(arg_inner, base) { return "" }
+		after := arg_inner[len(base):]
+		if !strings.has_prefix(after, "__") { return "" }
+		remaining := after[2:]
+		for i := 0; i <= tp_pos; i += 1 {
+			tok, rest := parse_one_mangled_arg(c, remaining)
+			if i == tp_pos { return tok }
+			remaining = rest
+		}
+		return ""
+	}
+
 	gt, ok2 := ty.(parser.GenericType)
 	if !ok2 { return "" }
 
