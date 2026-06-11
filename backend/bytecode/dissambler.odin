@@ -34,7 +34,7 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     }
 
     op := Opcode(chunk.code[offset])
-    #partial switch op {
+    switch op {
     // simple instructions (no operands)
     case .ADD:          return simple_instruction("ADD", offset)
     case .SUB:          return simple_instruction("SUB", offset)
@@ -121,6 +121,14 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     // RETURN_LOCAL (3 bytes: opcode slot n), RETURN_CONST (3 bytes: opcode const_idx n)
     case .RETURN_LOCAL:  return two_byte_instruction("RETURN_LOCAL",  chunk, offset)
     case .RETURN_CONST:  return const_return_instruction("RETURN_CONST", chunk, offset)
+    // MOD_LOCAL_LOCAL_EQ_ZERO (3 bytes: opcode slot_a slot_b)
+    case .MOD_LOCAL_LOCAL_EQ_ZERO: return two_byte_instruction("MOD_LL_EQ_ZERO", chunk, offset)
+    // SQUARE_I64 / SQUARE_F64 (2 bytes: opcode slot)
+    case .SQUARE_I64: return byte_instruction("SQUARE_I64", chunk, offset)
+    case .SQUARE_F64: return byte_instruction("SQUARE_F64", chunk, offset)
+    // NIL_EQ / NIL_NEQ (1 byte: opcode only)
+    case .NIL_EQ:  return simple_instruction("NIL_EQ",  offset)
+    case .NIL_NEQ: return simple_instruction("NIL_NEQ", offset)
 
     // Type-specific arithmetic
     case .ADD_I64:      return simple_instruction("ADD_I64",    offset)
@@ -143,11 +151,8 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .GTE_F64:      return simple_instruction("GTE_F64",    offset)
     case .NEGATE_I64:   return simple_instruction("NEGATE_I64", offset)
     case .NEGATE_F64:   return simple_instruction("NEGATE_F64", offset)
-
-    case:
-        fmt.printf("UNKNOWN opcode %d\n", op)
-        return offset + 1
     }
+    return offset + 1
 }
 
 // no operands — just print name, advance by 1

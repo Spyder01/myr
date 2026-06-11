@@ -100,6 +100,19 @@ Opcode :: enum u8 {
 	// return a constant: CONST c; RETURN n → RETURN_CONST c n (3 bytes: const_idx n)
 	RETURN_CONST,
 
+	// GET_LOCAL a; GET_LOCAL b; MOD_I64; CONST 0; EQ → MOD_LOCAL_LOCAL_EQ_ZERO a b (3 bytes)
+	MOD_LOCAL_LOCAL_EQ_ZERO,
+
+	// GET_LOCAL s; GET_LOCAL s; MUL_I64 → SQUARE_I64 s (2 bytes)
+	SQUARE_I64,
+	// GET_LOCAL s; GET_LOCAL s; MUL_F64 → SQUARE_F64 s (2 bytes)
+	SQUARE_F64,
+
+	// NIL; EQ → NIL_EQ (1 byte): in-place nil check on top of stack
+	NIL_EQ,
+	// NIL; NEQ → NIL_NEQ (1 byte): in-place non-nil check on top of stack
+	NIL_NEQ,
+
 	// Type-specific arithmetic — emitted when both operands have a known type.
 	// Skips the union switch in the VM handler.
 	ADD_I64, SUB_I64, MUL_I64, DIV_I64, MOD_I64,

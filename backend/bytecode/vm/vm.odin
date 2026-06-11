@@ -556,6 +556,34 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			if ret_n == 1 { vm.stack[sp] = ret; sp += 1 }
 			frame = current_frame(vm)
 
+		case .MOD_LOCAL_LOCAL_EQ_ZERO:
+			a  := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av := vm.stack[frame.slots + a].(i64)
+			bv := vm.stack[frame.slots + b].(i64)
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack[sp] = av % bv == 0
+			sp += 1
+
+		case .SQUARE_I64:
+			s := u16(read_byte(frame))
+			v := vm.stack[frame.slots + s].(i64)
+			vm.stack[sp] = v * v
+			sp += 1
+
+		case .SQUARE_F64:
+			s := u16(read_byte(frame))
+			v := vm.stack[frame.slots + s].(f64)
+			vm.stack[sp] = v * v
+			sp += 1
+
+		case .NIL_EQ:
+			_, is_nil := vm.stack[sp-1].(Nil)
+			vm.stack[sp-1] = is_nil
+
+		case .NIL_NEQ:
+			_, is_nil := vm.stack[sp-1].(Nil)
+			vm.stack[sp-1] = !is_nil
+
 		// ---- type-specific arithmetic (pop b, overwrite a in-place) ----
 
 		case .ADD_I64:

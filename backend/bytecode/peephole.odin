@@ -92,11 +92,45 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			}
 		}
 
+		// ── GET_LOCAL a; GET_LOCAL b; MOD_I64; CONST 0; EQ → MOD_LOCAL_LOCAL_EQ_ZERO a b ─
+		if op == .GET_LOCAL && i+8 <= n && Opcode(code[i+2]) == .GET_LOCAL &&
+		   (Opcode(code[i+4]) == .MOD_I64 || Opcode(code[i+4]) == .MOD) &&
+		   Opcode(code[i+5]) == .CONST && Opcode(code[i+7]) == .EQ {
+			c_idx := code[i+6]
+			if int(c_idx) < len(chunk.constants) {
+				if v, ok2 := chunk.constants[c_idx].(i64); ok2 && v == 0 {
+					a := code[i+1]
+					b := code[i+3]
+					code[i]   = u8(Opcode.MOD_LOCAL_LOCAL_EQ_ZERO)
+					code[i+1] = a
+					code[i+2] = b
+					for j in 3..<8 { code[i+j] = u8(Opcode.NOP) }
+					i += 8
+					continue
+				}
+			}
+		}
+
 		// ── GET_LOCAL a; GET_LOCAL b; OP → op_LOCALS a b; NOP; NOP ──────────
 		if op == .GET_LOCAL && i+5 <= n && Opcode(code[i+2]) == .GET_LOCAL {
 			a   := code[i+1]
 			b   := code[i+3]
 			op3 := Opcode(code[i+4])
+			// Same-slot squaring: GET_LOCAL s; GET_LOCAL s; MUL → SQUARE s (2 bytes)
+			if a == b {
+				sq: Maybe(Opcode)
+				switch {
+				case op3 == .MUL || op3 == .MUL_I64: sq = .SQUARE_I64
+				case op3 == .MUL_F64:                 sq = .SQUARE_F64
+				}
+				if sq_op, ok2 := sq.?; ok2 {
+					code[i]   = u8(sq_op)
+					code[i+1] = a
+					for j in 2..<5 { code[i+j] = u8(Opcode.NOP) }
+					i += 5
+					continue
+				}
+			}
 			fused: Maybe(Opcode)
 			switch {
 			case op3 == .ADD  || op3 == .ADD_I64: fused = .ADD_LOCALS
@@ -189,6 +223,23 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			code[i+1] = u8(Opcode.NOP)
 			i += 2
 			continue
+		}
+
+		// ── NIL; EQ → NIL_EQ / NIL; NEQ → NIL_NEQ ─────────────────────────────
+		// EQ/NEQ must not be a jump target (NIL may be one — NIL_EQ is equivalent).
+		if op == .NIL && i+2 <= n && !jump_targets[i+1] {
+			next := Opcode(code[i+1])
+			fused: Maybe(Opcode)
+			#partial switch next {
+			case .EQ:  fused = .NIL_EQ
+			case .NEQ: fused = .NIL_NEQ
+			}
+			if f, ok2 := fused.?; ok2 {
+				code[i]   = u8(f)
+				code[i+1] = u8(Opcode.NOP)
+				i += 2
+				continue
+			}
 		}
 
 		// ── Constant folding: CONST a; CONST b; ARITH_OP → CONST result ────────
@@ -372,8 +423,11 @@ instr_size :: proc(code: []u8, pos: int) -> int {
 	     .ADD_LOCALS, .MUL_LOCALS, .SUB_LOCALS, .DIV_LOCALS, .MOD_LOCALS,
 	     .LT_LOCALS, .LTE_LOCALS, .GT_LOCALS, .GTE_LOCALS,
 	     .ARRAY_GET, .ARRAY_SET, .SLICE_SET,
-	     .RETURN_LOCAL, .RETURN_CONST:
+	     .RETURN_LOCAL, .RETURN_CONST,
+	     .MOD_LOCAL_LOCAL_EQ_ZERO:
 		return 3
+	case .SQUARE_I64, .SQUARE_F64:
+		return 2
 	case .LT_LOCAL_CONST, .LTE_LOCAL_CONST, .SUB_LOCAL_CONST,
 	     .GT_LOCAL_CONST, .GTE_LOCAL_CONST, .EQ_LOCAL_CONST:
 		return 4
