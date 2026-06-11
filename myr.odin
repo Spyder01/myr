@@ -1,8 +1,11 @@
 package myr
 
 import "core:fmt"
+import "core:mem/virtual"
+import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:time"
 import bc "backend/bytecode"
 import "backend/bytecode/vm"
 import "parser"
@@ -52,37 +55,41 @@ main :: proc() {
 // ---- commands ----
 
 cmd_run :: proc(args: []string) {
-	file := ""
-	dump := false
+	file      := ""
+	dump      := false
+	show_time := false
 	for arg in args {
 		switch arg {
-		case "--dump": dump = true
-		case "--help", "-h": print_command_help("run"); return
-		case: file = arg
+		case "--dump":        dump = true
+		case "--time":        show_time = true
+		case "--help", "-h":  print_command_help("run"); return
+		case:                 file = arg
 		}
 	}
 	if file == "" {
 		fmt.eprintln("error: 'myr run' requires a file")
-		fmt.eprintln("       usage: myr run [--dump] <file.myr>")
+		fmt.eprintln("       usage: myr run [--dump] [--time] <file.myr>")
 		os.exit(1)
 	}
-	run_file(file, dump = dump, execute = true)
+	run_file(file, dump = dump, execute = true, show_time = show_time)
 }
 
 cmd_check :: proc(args: []string) {
-	file := ""
+	file      := ""
+	show_time := false
 	for arg in args {
 		switch arg {
-		case "--help", "-h": print_command_help("check"); return
-		case: file = arg
+		case "--time":        show_time = true
+		case "--help", "-h":  print_command_help("check"); return
+		case:                 file = arg
 		}
 	}
 	if file == "" {
 		fmt.eprintln("error: 'myr check' requires a file")
-		fmt.eprintln("       usage: myr check <file.myr>")
+		fmt.eprintln("       usage: myr check [--time] <file.myr>")
 		os.exit(1)
 	}
-	run_file(file, dump = false, execute = false)
+	run_file(file, dump = false, execute = false, show_time = show_time)
 }
 
 cmd_dump :: proc(args: []string) {
@@ -103,7 +110,7 @@ cmd_dump :: proc(args: []string) {
 
 // ---- core pipeline ----
 
-run_file :: proc(file: string, dump: bool, execute: bool) {
+run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = false) {
 	source_bytes, err := os.read_entire_file_from_path(file, context.allocator)
 	if err != os.ERROR_NONE {
 		fmt.eprintfln("error: could not read '%s'", file)
@@ -112,9 +119,13 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	defer delete(source_bytes)
 	source := string(source_bytes)
 
+	compile_start := time.tick_now()
+
+	t0 := time.tick_now()
 	p   := parser.new_parser(source)
 	ast := parser.parse_program(&p)
 	defer parser.ast_destroy(&ast)
+	t_parse := time.tick_since(t0)
 
 	if len(p.errors) > 0 {
 		for &e in p.errors {
@@ -125,8 +136,9 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	}
 	delete(p.errors)
 
-	// Name resolution
+	t0 = time.tick_now()
 	nrr := nr.resolve_program(&ast)
+	t_nr := time.tick_since(t0)
 	if nrr.error_count > 0 {
 		for i in 0..<int(nrr.error_count) {
 			e := nrr.errors[i]
@@ -138,8 +150,9 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	}
 	defer nr.nr_result_destroy(&nrr)
 
-	// Type checking
+	t0 = time.tick_now()
 	tcr := tc.typecheck(&ast, &nrr)
+	t_tc := time.tick_since(t0)
 	if tcr.error_count > 0 {
 		for i in 0..<int(tcr.error_count) {
 			e := tcr.errors[i]
@@ -158,7 +171,9 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	}
 	defer tc.tc_result_destroy(&tcr)
 
+	t0 = time.tick_now()
 	fn, comp_errors := bc.compile(&ast, tcr.types, tcr.type_table[:])
+	t_bc := time.tick_since(t0)
 	if len(comp_errors) > 0 {
 		for e in comp_errors {
 			line, col := parser.offset_to_line_col(source, e.span.start)
@@ -168,18 +183,35 @@ run_file :: proc(file: string, dump: bool, execute: bool) {
 	}
 	defer bc.function_free(fn)
 
+	bc.peephole_optimize(fn)
+	t_compile_total := time.tick_since(compile_start)
+
 	if dump {
 		bc.disassemble_all(fn)
 		fmt.println()
 	}
 
+	if show_time {
+		fmt.eprintfln("  parse:    %v", t_parse)
+		fmt.eprintfln("  name-res: %v", t_nr)
+		fmt.eprintfln("  typecheck:%v", t_tc)
+		fmt.eprintfln("  bytecode: %v", t_bc)
+		fmt.eprintfln("  compile:  %v  (total)", t_compile_total)
+	}
+
 	if !execute do return
 
+	t0 = time.tick_now()
 	machine := vm.new_vm()
 	defer vm.destroy_vm(&machine)
 	if vm_err := vm.vm_interpret(&machine, fn); vm_err != nil {
 		fmt.eprintfln("%s: runtime error: %v", file, vm_err)
 		os.exit(1)
+	}
+	t_run := time.tick_since(t0)
+
+	if show_time {
+		fmt.eprintfln("  run:      %v", t_run)
 	}
 }
 
