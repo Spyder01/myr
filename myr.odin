@@ -1,6 +1,8 @@
 package myr
 
 import "core:fmt"
+import "core:mem/virtual"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -181,6 +183,7 @@ run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = fals
 	}
 	defer bc.function_free(fn)
 
+	bc.peephole_optimize(fn)
 	t_compile_total := time.tick_since(compile_start)
 
 	if dump {

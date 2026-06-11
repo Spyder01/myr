@@ -73,13 +73,32 @@ Opcode :: enum u8 {
 	PRINT,
 	INPUT,
 
-	// Superinstructions (peephole-fused, not yet wired in VM)
+	// Superinstructions — peephole-fused
 	NOP,
-	ADD_LOCALS,
-	MUL_LOCALS,
-	LT_LOCAL_CONST,
-	LTE_LOCAL_CONST,
-	SUB_LOCAL_CONST,
+
+	// binary op with two locals (3 bytes: a b)
+	ADD_LOCALS, MUL_LOCALS, SUB_LOCALS, DIV_LOCALS, MOD_LOCALS,
+	LT_LOCALS, LTE_LOCALS, GT_LOCALS, GTE_LOCALS,
+
+	// binary op with local and constant (4 bytes: slot hi lo)
+	LT_LOCAL_CONST, LTE_LOCAL_CONST, SUB_LOCAL_CONST,
+	GT_LOCAL_CONST, GTE_LOCAL_CONST, EQ_LOCAL_CONST,
+
+	// in-place increment/decrement of a local (2 bytes: slot) — no stack traffic
+	INC_LOCAL,
+	DEC_LOCAL,
+
+	// combined conditional jump + unconditional pop (3 bytes: hi lo)
+	JUMP_IF_FALSE_POP,
+	JUMP_IF_TRUE_POP,
+
+	// store and discard: SET_LOCAL + POP fused (2 bytes: slot)
+	SET_LOCAL_POP,
+
+	// return without a push: GET_LOCAL s; RETURN n → RETURN_LOCAL s n (3 bytes: slot n)
+	RETURN_LOCAL,
+	// return a constant: CONST c; RETURN n → RETURN_CONST c n (3 bytes: const_idx n)
+	RETURN_CONST,
 
 	// Type-specific arithmetic — emitted when both operands have a known type.
 	// Skips the union switch in the VM handler.

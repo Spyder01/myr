@@ -39,6 +39,10 @@ EnumLayout :: struct {
 	variants:    map[string]EnumVariantLayout,
 }
 
+InlineFnInfo :: struct {
+	decl: parser.FunctionDecl,
+}
+
 Compiler :: struct {
 	bc:                ByteCodeCompiler,
 	ast:               ^parser.AST,
@@ -50,13 +54,18 @@ Compiler :: struct {
 	enum_layouts:      map[string]EnumLayout,
 	tc_types:          []tc.TypeId,
 	tc_type_table:     []tc.TypeInfo,
-	generic_templates:        map[string]parser.FunctionDecl, // name → template for generic functions
-	generic_struct_templates: map[string]parser.StructDecl,  // name → template for generic structs
-	generic_emitted:          map[string]bool,                // mangled names already compiled
-	type_subst:               map[string]string,              // active during generic instantiation: T → "int"
-	global_slots:             map[string]u16,                 // name → runtime slot index (shared via root)
-	global_count:             u16,                            // next slot to assign (root only)
-	root:                     ^Compiler,                      // nil for root; points to root for child compilers
+	generic_templates:        map[string]parser.FunctionDecl,
+	generic_struct_templates: map[string]parser.StructDecl,
+	generic_emitted:          map[string]bool,
+	type_subst:               map[string]string,
+	global_slots:             map[string]u16,
+	global_count:             u16,
+	root:                     ^Compiler,
+	// inlining
+	inline_fns:         map[string]InlineFnInfo, // shared via root
+	inline_fn_name:     string,                  // non-empty when inlining (prevents recursion)
+	inline_result_slot: int,                     // stack slot holding the return value
+	inline_patches:     [dynamic]int,            // JUMP offsets to patch at inline exit
 }
 
 new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
@@ -75,6 +84,8 @@ new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_tabl
 		generic_emitted          = make(map[string]bool),
 		type_subst               = make(map[string]string),
 		global_slots             = make(map[string]u16),
+		inline_fns               = make(map[string]InlineFnInfo),
+		inline_patches           = make([dynamic]int),
 	}
 }
 
@@ -86,6 +97,8 @@ compiler_destroy :: proc(c: ^Compiler) {
 	delete(c.generic_emitted)
 	delete(c.type_subst)
 	delete(c.global_slots)
+	delete(c.inline_fns)
+	delete(c.inline_patches)
 }
 
 // assign_global_slot returns the runtime slot for a global name, allocating one if new.
@@ -172,6 +185,65 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 	}
 }
 
+emit_inline_call :: proc(c: ^Compiler, fn_info: InlineFnInfo, args: []parser.ExpressionIdx, span: lexer.Span) {
+	// Reserve result slot at the bottom of the inline area.
+	result_slot := 0
+	for local in c.bc.locals { result_slot += local.slots }
+	emit(&c.bc, .NIL, span)
+	add_local(&c.bc, "__inline_result__")
+
+	// Evaluate each arg and register it as a named local (param binding).
+	// Pass full type metadata so field access on pointer/struct params resolves correctly.
+	for i in 0..<len(fn_info.decl.params) {
+		compile_expr(c, args[i])
+		param       := fn_info.decl.params[i]
+		ptr_inner   := type_ann_ptr_inner(c, param.type)
+		struct_name := type_ann_struct_name(c, param.type)
+		enum_name   := type_ann_enum_name(c, param.type)
+		add_local(&c.bc, param.name.data, 1, struct_name, ptr_inner, enum_name)
+	}
+
+	// Save inline context, set new context.
+	saved_name    := c.inline_fn_name
+	saved_slot    := c.inline_result_slot
+	saved_patches := c.inline_patches
+	c.inline_fn_name    = fn_info.decl.name.data
+	c.inline_result_slot = result_slot
+	c.inline_patches    = make([dynamic]int)
+
+	// Compile the body. compile_fn_body removes body locals without emitting POPs;
+	// our inline-return handler already did the cleanup at each return site.
+	compile_fn_body(c, fn_info.decl.body)
+
+	// Fallthrough handler: reached end of body without an explicit return.
+	// Dead code for functions that always return explicitly, but harmless.
+	{
+		emit(&c.bc, .NIL, span)
+		emit(&c.bc, .SET_LOCAL, span)
+		emit_byte(&c.bc, u8(result_slot), span)
+		emit(&c.bc, .POP, span)
+		total := 0
+		for local in c.bc.locals { total += local.slots }
+		for _ in 0..<(total - (result_slot + 1)) { emit(&c.bc, .POP, span) }
+		patch, _ := emit_jump(&c.bc, .JUMP, span)
+		append(&c.inline_patches, int(patch))
+	}
+
+	// Patch all return-site JUMPs to the current position.
+	for patch in c.inline_patches { patch_jump(&c.bc, u16(patch)) }
+
+	// Restore inline context.
+	delete(c.inline_patches)
+	c.inline_fn_name    = saved_name
+	c.inline_result_slot = saved_slot
+	c.inline_patches    = saved_patches
+
+	// Remove param locals and result local from bc.locals without emitting POPs.
+	// (Stack cleanup was done at each return site.)
+	for _ in 0..<(1 + len(fn_info.decl.params)) { pop(&c.bc.locals) }
+	// Result value is now on the stack at result_slot; stack_top = result_slot + 1.
+}
+
 compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string, span: lexer.Span) {
 	// Compute total slot count for arity: struct and enum params occupy N slots each.
 	total_param_slots := 0
@@ -239,12 +311,15 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		type_subst               = child_subst,
 		global_slots             = c.global_slots,
 		root                     = root_c,
+		inline_fns               = c.inline_fns,
+		inline_patches           = make([dynamic]int),
 	}
 	compile_fn_body(&child, d.body)
 	emit(&child.bc, .RETURN, span)
 	emit_byte(&child.bc, 1, span)
 	c.errors      = child.errors
 	c.error_count = child.error_count
+	delete(child.inline_patches)
 
 	// get compiled function
 	fn := compiler_end(&child.bc)
@@ -253,6 +328,85 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 	emit_constant(&c.bc, fn, span)
 	emit(&c.bc, .DEFINE_GLOBAL, span)
 	emit_byte(&c.bc, u8(assign_global_slot(c, emit_name)), span)
+
+	// Register in inline_fns if eligible:
+	//   non-generic, all 1-slot params, 1-slot return, no tail expression, not recursive
+	if len(d.type_params) == 0 && len(d.params) <= 8 {
+		if _, has_tail := d.body.result.?; !has_tail {
+			eligible := true
+			for param in d.params {
+				if type_ann_struct_name(c, param.type) != "" || type_ann_enum_name(c, param.type) != "" {
+					eligible = false
+					break
+				}
+			}
+			// Exclude functions that return multi-slot types (struct/enum return values):
+			// the inline return handler only stores the top stack slot.
+			if eligible {
+				if ret_idx, has_ret := d.return_type.?; has_ret {
+					if type_ann_struct_name(c, ret_idx) != "" || type_ann_enum_name(c, ret_idx) != "" {
+						eligible = false
+					}
+				}
+			}
+			if eligible && body_calls_self(c.ast, d.body, emit_name) {
+				eligible = false
+			}
+			if eligible {
+				root_c.inline_fns[emit_name] = InlineFnInfo{decl = d}
+			}
+		}
+	}
+}
+
+// body_calls_self returns true if any CallExpression in the body directly calls `name`.
+// Used to exclude recursive functions from inlining.
+body_calls_self :: proc(ast: ^parser.AST, block: parser.BlockExpression, name: string) -> bool {
+	for stmt_idx in block.stmts {
+		if stmt_calls(ast, stmt_idx, name) { return true }
+	}
+	return false
+}
+
+stmt_calls :: proc(ast: ^parser.AST, idx: parser.StatementIdx, name: string) -> bool {
+	node := ast.nodes[idx]
+	#partial switch s in node.(parser.Statement) {
+	case parser.ExpressionStatement: return expr_calls(ast, s.expr, name)
+	case parser.ReturnStatement:
+		if val, ok := s.value.?; ok { return expr_calls(ast, val, name) }
+	case parser.LetStatement:        return expr_calls(ast, s.value, name)
+	case parser.ForStatement:
+		if cond, ok := s.condition.?; ok {
+			if expr_calls(ast, cond, name) { return true }
+		}
+		return body_calls_self(ast, s.body, name)
+	}
+	return false
+}
+
+expr_calls :: proc(ast: ^parser.AST, idx: parser.ExpressionIdx, name: string) -> bool {
+	node := ast.nodes[idx]
+	#partial switch e in node.(parser.Expression) {
+	case parser.CallExpression:
+		callee_node := ast.nodes[e.callee]
+		if expr, ok := callee_node.(parser.Expression); ok {
+			if id, ok2 := expr.(parser.IdentExpression); ok2 {
+				if lexer.Token(id).data == name { return true }
+			}
+		}
+		for arg in e.args { if expr_calls(ast, arg, name) { return true } }
+	case parser.BinaryExpression:
+		return expr_calls(ast, e.left, name) || expr_calls(ast, e.right, name)
+	case parser.UnaryExpression:
+		return expr_calls(ast, e.operand, name)
+	case parser.IfExpression:
+		if expr_calls(ast, e.condition, name) { return true }
+		if body_calls_self(ast, e.then_block, name) { return true }
+		if else_block, ok := e.else_block.?; ok {
+			return body_calls_self(ast, else_block, name)
+		}
+	}
+	return false
 }
 
 // ---- blocks ----
@@ -395,6 +549,23 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 		}
 
 	case parser.ReturnStatement:
+		if c.inline_fn_name != "" {
+			// Inline return: stash result at result_slot, pop locals above it, jump to end.
+			if val, ok := s.value.?; ok {
+				compile_expr(c, val)
+			} else {
+				emit(&c.bc, .NIL, span)
+			}
+			emit(&c.bc, .SET_LOCAL, span)
+			emit_byte(&c.bc, u8(c.inline_result_slot), span)
+			emit(&c.bc, .POP, span)
+			total := 0
+			for local in c.bc.locals { total += local.slots }
+			for _ in 0..<(total - (c.inline_result_slot + 1)) { emit(&c.bc, .POP, span) }
+			patch, _ := emit_jump(&c.bc, .JUMP, span)
+			append(&c.inline_patches, int(patch))
+			return
+		}
 		if val, ok := s.value.?; ok {
 			compile_expr(c, val)
 			emit(&c.bc, .RETURN, span)
@@ -476,8 +647,7 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 	if cond, ok := s.condition.?; ok {
 		has_condition = true
 		compile_expr(c, cond)
-		exit_jump, _ = emit_jump(&c.bc, .JUMP_IF_FALSE, span)
-		emit(&c.bc, .POP, span)
+		exit_jump, _ = emit_jump(&c.bc, .JUMP_IF_FALSE_POP, span)
 	}
 
 	compile_block(c, s.body)
@@ -498,7 +668,6 @@ compile_for :: proc(c: ^Compiler, s: parser.ForStatement, span: lexer.Span) {
 
 	if has_condition {
 		patch_jump(&c.bc, exit_jump)
-		emit(&c.bc, .POP, span)
 	}
 
 	// break jumps land here — after the condition POP, before init cleanup
@@ -628,6 +797,16 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 					}
 					emit(&c.bc, .INPUT, span)
 					return
+				}
+				// Try inlining direct calls to eligible functions.
+				if c.inline_fn_name == "" {
+					root_c := c if c.root == nil else c.root
+					if fn_info, ok := root_c.inline_fns[fn_name]; ok {
+						if len(e.args) == len(fn_info.decl.params) {
+							emit_inline_call(c, fn_info, e.args, span)
+							return
+						}
+					}
 				}
 				// Generic function call: emit the instantiation into the root chunk
 				// on first use, then call it by its mangled name.
@@ -842,8 +1021,7 @@ compile_assignment :: proc(c: ^Compiler, e: parser.BinaryExpression, span: lexer
 
 compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
 	compile_expr(c, e.condition)
-	then_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
-	emit(&c.bc, .POP, span)   // pop condition (true path)
+	then_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE_POP, span)
 
 	compile_block(c, e.then_block)
 	if _, has_result := e.then_block.result.?; !has_result {
@@ -853,16 +1031,16 @@ compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
 	if else_block, ok := e.else_block.?; ok {
 		else_jump, _ := emit_jump(&c.bc, .JUMP, span)
 		patch_jump(&c.bc, then_jump)
-		emit(&c.bc, .POP, span)   // pop condition (false path)
 		compile_block(c, else_block)
 		if _, has_result := else_block.result.?; !has_result {
 			emit(&c.bc, .NIL, span)
 		}
 		patch_jump(&c.bc, else_jump)
 	} else {
+		else_jump, _ := emit_jump(&c.bc, .JUMP, span)
 		patch_jump(&c.bc, then_jump)
-		emit(&c.bc, .POP, span)   // pop condition (no-else path)
 		emit(&c.bc, .NIL, span)
+		patch_jump(&c.bc, else_jump)
 	}
 }
 
@@ -936,8 +1114,7 @@ compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span)
 			emit_byte(&c.bc, u8(subj_slot), span)
 			emit_constant(&c.bc, parse_literal(lexer.Token(pat)), span)
 			emit(&c.bc, .EQ, span)
-			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
-			emit(&c.bc, .POP, span) // pop true
+			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE_POP, span)
 
 			compile_expr(c, arm.body)
 			// Block bodies with no tail expression leave no value on the stack; push NIL.
@@ -955,7 +1132,6 @@ compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span)
 			append(&arm_end_jumps, jmp)
 
 			patch_jump(&c.bc, next_arm_jump)
-			emit(&c.bc, .POP, span) // pop false
 
 		case parser.EnumLiteralExpression:
 			// Enum variant: discriminant check + field bindings
@@ -973,8 +1149,7 @@ compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span)
 			emit_byte(&c.bc, u8(subj_slot), span)
 			emit_constant(&c.bc, i64(variant_layout.discriminant), span)
 			emit(&c.bc, .EQ, span)
-			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE, span)
-			emit(&c.bc, .POP, span) // pop true
+			next_arm_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE_POP, span)
 
 			c.bc.scope_depth += 1
 			for field in pat.fields {
@@ -1021,7 +1196,6 @@ compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span)
 			append(&arm_end_jumps, jmp)
 
 			patch_jump(&c.bc, next_arm_jump)
-			emit(&c.bc, .POP, span) // pop false
 
 		case:
 			compiler_error(c, "unsupported match pattern kind", span)

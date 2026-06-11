@@ -55,20 +55,20 @@ destroy_vm :: proc(vm: ^VM) {
 	for s in vm.char_cache { delete(s) }
 }
 
-vm_push :: proc(vm: ^VM, val: Value) -> Maybe(VMError) {
+vm_push :: #force_inline proc(vm: ^VM, val: Value) -> Maybe(VMError) {
 	if vm.stack_top >= STACK_MAX do return .STACK_OVERFLOW
 	vm.stack[vm.stack_top] = val
 	vm.stack_top += 1
 	return nil
 }
 
-vm_pop :: proc(vm: ^VM) -> (Value, Maybe(VMError)) {
+vm_pop :: #force_inline proc(vm: ^VM) -> (Value, Maybe(VMError)) {
 	if vm.stack_top == 0 do return Nil{}, .STACK_UNDERFLOW
 	vm.stack_top -= 1
 	return vm.stack[vm.stack_top], nil
 }
 
-vm_peek :: proc(vm: ^VM, dist: u16 = 0) -> (Value, Maybe(VMError)) {
+vm_peek :: #force_inline proc(vm: ^VM, dist: u16 = 0) -> (Value, Maybe(VMError)) {
 	if vm.stack_top == 0 || dist >= vm.stack_top do return Nil{}, .STACK_UNDERFLOW
 	return vm.stack[vm.stack_top - 1 - dist], nil
 }
@@ -77,30 +77,31 @@ current_frame :: proc(vm: ^VM) -> ^CallFrame {
 	return &vm.frames[vm.frame_count - 1]
 }
 
-read_byte :: proc(frame: ^CallFrame) -> u8 {
+read_byte :: #force_inline proc(frame: ^CallFrame) -> u8 {
 	b := frame.function.chunk.code[frame.ip]
 	frame.ip += 1
 	return b
 }
 
-read_short :: proc(frame: ^CallFrame) -> u16 {
+read_short :: #force_inline proc(frame: ^CallFrame) -> u16 {
 	hi := u16(read_byte(frame)) << 8
 	lo := u16(read_byte(frame))
 	return hi | lo
 }
 
-read_constant :: proc(frame: ^CallFrame) -> Value {
+read_constant :: #force_inline proc(frame: ^CallFrame) -> Value {
 	idx := read_byte(frame)
 	return frame.function.chunk.constants[idx]
 }
 
-read_constant_long :: proc(frame: ^CallFrame) -> Value {
+read_constant_long :: #force_inline proc(frame: ^CallFrame) -> Value {
 	idx := read_short(frame)
 	return frame.function.chunk.constants[idx]
 }
 
 vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 	frame := current_frame(vm)
+	sp    := vm.stack_top        // cached stack pointer — only written back at CALL / final RETURN
 	for {
 		op := Opcode(read_byte(frame))
 		#partial switch op {
@@ -108,163 +109,147 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 		case .CONST:
 			val := read_constant(frame)
 			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
-			if err := vm_push(vm, val); err != nil do return err
+			vm.stack[sp] = val; sp += 1
 
 		case .CONST_LONG:
 			val := read_constant_long(frame)
 			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
-			if err := vm_push(vm, val); err != nil do return err
+			vm.stack[sp] = val; sp += 1
 
-		case .NIL:
-			if err := vm_push(vm, Nil{}); err != nil do return err
-
-		case .TRUE:
-			if err := vm_push(vm, true); err != nil do return err
-
-		case .FALSE:
-			if err := vm_push(vm, false); err != nil do return err
+		case .NIL:   vm.stack[sp] = Nil{}; sp += 1
+		case .TRUE:  vm.stack[sp] = true;  sp += 1
+		case .FALSE: vm.stack[sp] = false; sp += 1
 
 		case .ADD:
-			b, err1 := vm_pop(vm); if err1 != nil do return err1
-			a, err2 := vm_pop(vm); if err2 != nil do return err2
-			#partial switch av in a {
+			b := vm.stack[sp-1]; sp -= 1
+			#partial switch av in vm.stack[sp-1] {
 			case i64:
 				bv, ok := b.(i64); if !ok do return .TYPE_ERROR
-				if err := vm_push(vm, av + bv); err != nil do return err
+				vm.stack[sp-1] = av + bv
 			case f64:
 				bv, ok := b.(f64); if !ok do return .TYPE_ERROR
-				if err := vm_push(vm, av + bv); err != nil do return err
+				vm.stack[sp-1] = av + bv
 			case string:
 				bv, ok := b.(string); if !ok do return .TYPE_ERROR
 				tmp := strings.concatenate({av, bv})
 				interned := string_pool_intern(&vm.strings, tmp)
 				if raw_data(tmp) != raw_data(interned) { delete(tmp) }
-				if err := vm_push(vm, interned); err != nil do return err
+				vm.stack[sp-1] = interned
 			case: return .TYPE_ERROR
 			}
 
-		case .SUB:  if err := vm_binary_op(vm, .SUB);  err != nil do return err
-		case .MUL:  if err := vm_binary_op(vm, .MUL);  err != nil do return err
-		case .DIV:  if err := vm_binary_op(vm, .DIV);  err != nil do return err
-		case .MOD:  if err := vm_binary_op(vm, .MOD);  err != nil do return err
-		case .SHL:  if err := vm_binary_op(vm, .SHL);  err != nil do return err
-		case .SHR:  if err := vm_binary_op(vm, .SHR);  err != nil do return err
-		case .BAND: if err := vm_binary_op(vm, .BAND); err != nil do return err
-		case .BOR:  if err := vm_binary_op(vm, .BOR);  err != nil do return err
-		case .BXOR: if err := vm_binary_op(vm, .BXOR); err != nil do return err
+		case .SUB:  vm.stack_top = sp; if err := vm_binary_op(vm, .SUB);  err != nil do return err; sp = vm.stack_top
+		case .MUL:  vm.stack_top = sp; if err := vm_binary_op(vm, .MUL);  err != nil do return err; sp = vm.stack_top
+		case .DIV:  vm.stack_top = sp; if err := vm_binary_op(vm, .DIV);  err != nil do return err; sp = vm.stack_top
+		case .MOD:  vm.stack_top = sp; if err := vm_binary_op(vm, .MOD);  err != nil do return err; sp = vm.stack_top
+		case .SHL:  vm.stack_top = sp; if err := vm_binary_op(vm, .SHL);  err != nil do return err; sp = vm.stack_top
+		case .SHR:  vm.stack_top = sp; if err := vm_binary_op(vm, .SHR);  err != nil do return err; sp = vm.stack_top
+		case .BAND: vm.stack_top = sp; if err := vm_binary_op(vm, .BAND); err != nil do return err; sp = vm.stack_top
+		case .BOR:  vm.stack_top = sp; if err := vm_binary_op(vm, .BOR);  err != nil do return err; sp = vm.stack_top
+		case .BXOR: vm.stack_top = sp; if err := vm_binary_op(vm, .BXOR); err != nil do return err; sp = vm.stack_top
 
 		case .BNOT:
-			a, err := vm_pop(vm); if err != nil do return err
-			av, ok := a.(i64); if !ok do return .TYPE_ERROR
-			if err2 := vm_push(vm, ~av); err2 != nil do return err2
+			av, ok := vm.stack[sp-1].(i64); if !ok do return .TYPE_ERROR
+			vm.stack[sp-1] = ~av
 
 		case .NEGATE:
-			a, err := vm_pop(vm); if err != nil do return err
-			#partial switch av in a {
-			case i64: if err2 := vm_push(vm, -av); err2 != nil do return err2
-			case f64: if err2 := vm_push(vm, -av); err2 != nil do return err2
+			#partial switch av in vm.stack[sp-1] {
+			case i64: vm.stack[sp-1] = -av
+			case f64: vm.stack[sp-1] = -av
 			case:     return .TYPE_ERROR
 			}
 
 		case .EQ:
-			b, _ := vm_pop(vm); a, _ := vm_pop(vm)
-			if err := vm_push(vm, vm_values_equal(a, b)); err != nil do return err
+			b := vm.stack[sp-1]; sp -= 1
+			vm.stack[sp-1] = vm_values_equal(vm.stack[sp-1], b)
 
 		case .NEQ:
-			b, _ := vm_pop(vm); a, _ := vm_pop(vm)
-			if err := vm_push(vm, !vm_values_equal(a, b)); err != nil do return err
+			b := vm.stack[sp-1]; sp -= 1
+			vm.stack[sp-1] = !vm_values_equal(vm.stack[sp-1], b)
 
-		case .LT:  if err := vm_compare(vm, .LT);  err != nil do return err
-		case .LTE: if err := vm_compare(vm, .LTE); err != nil do return err
-		case .GT:  if err := vm_compare(vm, .GT);  err != nil do return err
-		case .GTE: if err := vm_compare(vm, .GTE); err != nil do return err
+		case .LT:  vm.stack_top = sp; if err := vm_compare(vm, .LT);  err != nil do return err; sp = vm.stack_top
+		case .LTE: vm.stack_top = sp; if err := vm_compare(vm, .LTE); err != nil do return err; sp = vm.stack_top
+		case .GT:  vm.stack_top = sp; if err := vm_compare(vm, .GT);  err != nil do return err; sp = vm.stack_top
+		case .GTE: vm.stack_top = sp; if err := vm_compare(vm, .GTE); err != nil do return err; sp = vm.stack_top
 
 		case .NOT:
-			a, err := vm_pop(vm); if err != nil do return err
-			if err2 := vm_push(vm, is_falsy(a)); err2 != nil do return err2
+			vm.stack[sp-1] = is_falsy(vm.stack[sp-1])
 
 		case .POP:
-			_, err := vm_pop(vm); if err != nil do return err
+			sp -= 1
 
 		case .PRINT:
-			a, err := vm_pop(vm); if err != nil do return err
-			print_value(a); fmt.println()
+			sp -= 1; print_value(vm.stack[sp]); fmt.println()
 
 		case .INPUT:
-			prompt, err := vm_pop(vm); if err != nil do return err
+			prompt := vm.stack[sp-1]; sp -= 1
 			if s, ok := prompt.(string); ok && len(s) > 0 { fmt.printf("%s", s) }
 			tmp := read_line(vm.stdin)
 			interned := string_pool_intern(&vm.strings, tmp)
 			if raw_data(tmp) != raw_data(interned) { delete(tmp) }
-			vm_push(vm, interned)
+			vm.stack[sp] = interned; sp += 1
 
 		case .DEFINE_GLOBAL:
 			slot := read_byte(frame)
-			top, _ := vm_peek(vm)
-			vm.globals[slot] = top
-			vm_pop(vm)
+			vm.globals[slot] = vm.stack[sp-1]; sp -= 1
 
 		case .GET_GLOBAL:
 			slot := read_byte(frame)
-			if err := vm_push(vm, vm.globals[slot]); err != nil do return err
+			vm.stack[sp] = vm.globals[slot]; sp += 1
 
 		case .SET_GLOBAL:
 			slot := read_byte(frame)
-			top, _ := vm_peek(vm)
-			vm.globals[slot] = top
+			vm.globals[slot] = vm.stack[sp-1]
 
 		case .GET_LOCAL:
 			slot := u16(read_byte(frame))
-			if err := vm_push(vm, vm.stack[frame.slots + slot]); err != nil do return err
+			vm.stack[sp] = vm.stack[frame.slots + slot]; sp += 1
 
 		case .SET_LOCAL:
 			slot := u16(read_byte(frame))
-			top, _ := vm_peek(vm)
-			vm.stack[frame.slots + slot] = top
+			vm.stack[frame.slots + slot] = vm.stack[sp-1]
 
 		case .JUMP:
-			offset := read_short(frame)
-			frame.ip += int(offset)
+			frame.ip += int(read_short(frame))
 
 		case .JUMP_IF_FALSE:
 			offset := read_short(frame)
-			top, _ := vm_peek(vm)
-			if is_falsy(top) { frame.ip += int(offset) }
+			if is_falsy(vm.stack[sp-1]) { frame.ip += int(offset) }
 
 		case .JUMP_IF_TRUE:
 			offset := read_short(frame)
-			top, _ := vm_peek(vm)
-			if !is_falsy(top) { frame.ip += int(offset) }
+			if !is_falsy(vm.stack[sp-1]) { frame.ip += int(offset) }
 
 		case .LOOP:
-			offset := read_short(frame)
-			frame.ip -= int(offset)
+			frame.ip -= int(read_short(frame))
 
 		case .CALL:
 			arg_count := u16(read_byte(frame))
+			vm.stack_top = sp
 			if err := vm_call(vm, arg_count); err != nil do return err
 			frame = current_frame(vm)
+			sp = vm.stack_top
 
 		case .ADDR_LOCAL:
 			slot := int(read_byte(frame))
 			ptr: [^]Value = raw_data(vm.stack[frame.slots + u16(slot):])
-			if err := vm_push(vm, ptr); err != nil do return err
+			vm.stack[sp] = ptr; sp += 1
 
 		case .ARRAY_GET:
 			base_slot  := u16(read_byte(frame))
 			elem_slots := int(read_byte(frame))
-			idx_val, err := vm_pop(vm); if err != nil do return err
-			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
+			i, ok := vm.stack[sp-1].(i64); if !ok do return .TYPE_ERROR
+			sp -= 1
 			for s in 0..<elem_slots {
-				if push_err := vm_push(vm, vm.stack[frame.slots + base_slot + u16(int(i)*elem_slots + s)]); push_err != nil do return push_err
+				vm.stack[sp] = vm.stack[frame.slots + base_slot + u16(int(i)*elem_slots + s)]; sp += 1
 			}
 
 		case .ARRAY_SET:
 			base_slot  := u16(read_byte(frame))
 			elem_slots := int(read_byte(frame))
-			idx_val, err := vm_pop(vm); if err != nil do return err
-			i, ok := idx_val.(i64); if !ok do return .TYPE_ERROR
-			top := int(vm.stack_top)
+			i, ok := vm.stack[sp-1].(i64); if !ok do return .TYPE_ERROR
+			sp -= 1
+			top := int(sp)
 			for s in 0..<elem_slots {
 				vm.stack[frame.slots + base_slot + u16(int(i)*elem_slots + s)] = vm.stack[top - elem_slots + s]
 			}
@@ -272,40 +257,40 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			// The expression statement caller emits POPs via expr_slot_count.
 
 		case .MAKE_SLICE:
-			elem_slots      := int(read_byte(frame))
-			gf_val, err1    := vm_pop(vm); if err1 != nil do return err1
-			cap_val, err2   := vm_pop(vm); if err2 != nil do return err2
-			cap, ok1        := cap_val.(i64); if !ok1 do return .TYPE_ERROR
-			gf_raw, ok2     := gf_val.(i64);  if !ok2 do return .TYPE_ERROR
+			elem_slots  := int(read_byte(frame))
+			gf_val      := vm.stack[sp-1]; sp -= 1
+			cap_val     := vm.stack[sp-1]; sp -= 1
+			cap, ok1    := cap_val.(i64); if !ok1 do return .TYPE_ERROR
+			gf_raw, ok2 := gf_val.(i64);  if !ok2 do return .TYPE_ERROR
 			if gf_raw < 0 || gf_raw > 255 do return .TYPE_ERROR
 			if cap <= 0 { cap = 1 }
 			if cap > i64(max(u32)) do return .TYPE_ERROR
 			cap = i64(u32(cap))
-			gf := u8(gf_raw)
-			slots           := make([]Value, int(cap) * elem_slots)
+			gf    := u8(gf_raw)
+			slots := make([]Value, int(cap) * elem_slots)
 			append(&vm.heap_objects, slots)
 			ptr: [^]Value = raw_data(slots)
-			if err3 := vm_push(vm, ptr);        err3 != nil do return err3  // ptr
-			if err3 := vm_push(vm, i64(0));     err3 != nil do return err3  // len = 0
-			if err3 := vm_push(vm, cap);        err3 != nil do return err3  // cap
-			if err3 := vm_push(vm, i64(gf));    err3 != nil do return err3  // grow_factor (stored as i64, semantically u8)
+			vm.stack[sp] = ptr;     sp += 1  // ptr
+			vm.stack[sp] = i64(0);  sp += 1  // len = 0
+			vm.stack[sp] = cap;     sp += 1  // cap
+			vm.stack[sp] = i64(gf); sp += 1  // grow_factor
 
 		case .SLICE_GET:
-			elem_slots := int(read_byte(frame))
-			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
-			ptr_val, err2 := vm_pop(vm); if err2 != nil do return err2
-			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
-			ptr, ok2 := ptr_val.([^]Value); if !ok2 do return .TYPE_ERROR
+			elem_slots  := int(read_byte(frame))
+			idx_val     := vm.stack[sp-1]; sp -= 1
+			ptr_val     := vm.stack[sp-1]; sp -= 1
+			i, ok1      := idx_val.(i64);     if !ok1 do return .TYPE_ERROR
+			ptr, ok2    := ptr_val.([^]Value); if !ok2 do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
 			for s in 0..<elem_slots {
-				if push_err := vm_push(vm, ptr[int(i)*elem_slots + s]); push_err != nil do return push_err
+				vm.stack[sp] = ptr[int(i)*elem_slots + s]; sp += 1
 			}
 
 		case .SLICE_SET:
-			base_slot  := u16(read_byte(frame))
-			elem_slots := int(read_byte(frame))
-			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
-			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
+			base_slot   := u16(read_byte(frame))
+			elem_slots  := int(read_byte(frame))
+			i, ok1      := vm.stack[sp-1].(i64); if !ok1 do return .TYPE_ERROR
+			sp -= 1
 			ptr         := vm.stack[frame.slots + base_slot].([^]Value)
 			cap         := u32(vm.stack[frame.slots + base_slot + 2].(i64))
 			grow_factor := u8(vm.stack[frame.slots + base_slot + 3].(i64))
@@ -327,7 +312,7 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 				vm.stack[frame.slots + base_slot]     = ptr
 				vm.stack[frame.slots + base_slot + 2] = i64(new_cap)
 			}
-			top := int(vm.stack_top)
+			top := int(sp)
 			for s in 0..<elem_slots {
 				ptr[int(i)*elem_slots + s] = vm.stack[top - elem_slots + s]
 			}
@@ -338,211 +323,300 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			// Leave val on stack (peek contract — caller pops via expr_slot_count).
 
 		case .STR_LEN:
-			str_val, err1 := vm_pop(vm); if err1 != nil do return err1
-			s, ok := str_val.(string); if !ok do return .TYPE_ERROR
-			if push_err := vm_push(vm, i64(len(s))); push_err != nil do return push_err
+			s, ok := vm.stack[sp-1].(string); if !ok do return .TYPE_ERROR
+			vm.stack[sp-1] = i64(len(s))
 
 		case .STR_GET:
-			idx_val, err1 := vm_pop(vm); if err1 != nil do return err1
-			str_val, err2 := vm_pop(vm); if err2 != nil do return err2
-			i, ok1 := idx_val.(i64); if !ok1 do return .TYPE_ERROR
-			s, ok2 := str_val.(string); if !ok2 do return .TYPE_ERROR
+			i, ok1 := vm.stack[sp-1].(i64);    if !ok1 do return .TYPE_ERROR
+			s, ok2 := vm.stack[sp-2].(string);  if !ok2 do return .TYPE_ERROR
 			if i < 0 || i >= i64(len(s)) do return .INDEX_OUT_OF_BOUNDS
-			if push_err := vm_push(vm, vm.char_cache[s[i]]); push_err != nil do return push_err
+			sp -= 2
+			vm.stack[sp] = vm.char_cache[s[i]]; sp += 1
 
 		case .NEW:
 			n := int(read_byte(frame))
 			slots := make([]Value, n)
-			for i := n - 1; i >= 0; i -= 1 {
-				v, err := vm_pop(vm)
-				if err != nil { delete(slots); return err }
-				slots[i] = v
-			}
+			for i := n - 1; i >= 0; i -= 1 { sp -= 1; slots[i] = vm.stack[sp] }
 			append(&vm.heap_objects, slots)
 			ptr: [^]Value = raw_data(slots)
-			if err := vm_push(vm, ptr); err != nil do return err
+			vm.stack[sp] = ptr; sp += 1
 
 		case .HEAP_GET:
-			offset := int(read_byte(frame))
-			pv, err := vm_pop(vm); if err != nil do return err
-			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			offset   := int(read_byte(frame))
+			ptr, ok  := vm.stack[sp-1].([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
-			if err2 := vm_push(vm, ptr[offset]); err2 != nil do return err2
+			sp -= 1
+			vm.stack[sp] = ptr[offset]; sp += 1
 
 		case .HEAP_SET:
-			offset := int(read_byte(frame))
-			pv, err1 := vm_pop(vm); if err1 != nil do return err1
-			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			offset  := int(read_byte(frame))
+			ptr, ok := vm.stack[sp-1].([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
-			val, err2 := vm_peek(vm); if err2 != nil do return err2
-			ptr[offset] = val
+			sp -= 1
+			ptr[offset] = vm.stack[sp-1]
 
 		case .HEAP_LOAD:
-			n := int(read_byte(frame))
-			pv, err := vm_pop(vm); if err != nil do return err
-			ptr, ok := pv.([^]Value); if !ok do return .TYPE_ERROR
+			n       := int(read_byte(frame))
+			ptr, ok := vm.stack[sp-1].([^]Value); if !ok do return .TYPE_ERROR
 			if ptr == nil do return .NULL_DEREF
-			for i in 0..<n {
-				if err2 := vm_push(vm, ptr[i]); err2 != nil do return err2
-			}
+			sp -= 1
+			for i in 0..<n { vm.stack[sp] = ptr[i]; sp += 1 }
 
 		case .NOP:
 			// nothing
 
 		case .ADD_LOCALS:
-			a := u16(read_byte(frame))
-			b := u16(read_byte(frame))
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + a].(i64)
 			bv, ok2 := vm.stack[frame.slots + b].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
-			if err := vm_push(vm, av + bv); err != nil do return err
+			vm.stack[sp] = av + bv; sp += 1
 
 		case .MUL_LOCALS:
-			a := u16(read_byte(frame))
-			b := u16(read_byte(frame))
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + a].(i64)
 			bv, ok2 := vm.stack[frame.slots + b].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
-			if err := vm_push(vm, av * bv); err != nil do return err
+			vm.stack[sp] = av * bv; sp += 1
 
 		case .LT_LOCAL_CONST:
-			slot := u16(read_byte(frame))
-			hi   := u16(read_byte(frame))
-			lo   := u16(read_byte(frame))
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
-			if err := vm_push(vm, av < bv); err != nil do return err
+			vm.stack[sp] = av < bv; sp += 1
 
 		case .LTE_LOCAL_CONST:
-			slot := u16(read_byte(frame))
-			hi   := u16(read_byte(frame))
-			lo   := u16(read_byte(frame))
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
-			if err := vm_push(vm, av <= bv); err != nil do return err
+			vm.stack[sp] = av <= bv; sp += 1
 
 		case .SUB_LOCAL_CONST:
-			slot := u16(read_byte(frame))
-			hi   := u16(read_byte(frame))
-			lo   := u16(read_byte(frame))
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
 			av, ok1 := vm.stack[frame.slots + slot].(i64)
 			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
 			if !ok1 || !ok2 do return .TYPE_ERROR
-			if err := vm_push(vm, av - bv); err != nil do return err
+			vm.stack[sp] = av - bv; sp += 1
+
+		case .GT_LOCAL_CONST:
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + slot].(i64)
+			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av > bv; sp += 1
+
+		case .GTE_LOCAL_CONST:
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + slot].(i64)
+			bv, ok2 := frame.function.chunk.constants[(hi<<8)|lo].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av >= bv; sp += 1
+
+		case .EQ_LOCAL_CONST:
+			slot := u16(read_byte(frame)); hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			lv := vm.stack[frame.slots + slot]
+			cv := frame.function.chunk.constants[(hi<<8)|lo]
+			vm.stack[sp] = vm_values_equal(lv, cv); sp += 1
+
+		case .SUB_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av - bv; sp += 1
+
+		case .DIV_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack[sp] = av / bv; sp += 1
+
+		case .MOD_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if bv == 0 do return .DIVISION_BY_ZERO
+			vm.stack[sp] = av % bv; sp += 1
+
+		case .LT_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av < bv; sp += 1
+
+		case .LTE_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av <= bv; sp += 1
+
+		case .GT_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av > bv; sp += 1
+
+		case .GTE_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			vm.stack[sp] = av >= bv; sp += 1
+
+		case .INC_LOCAL:
+			slot := u16(read_byte(frame))
+			v, ok := vm.stack[frame.slots + slot].(i64)
+			if !ok do return .TYPE_ERROR
+			vm.stack[frame.slots + slot] = v + 1
+
+		case .DEC_LOCAL:
+			slot := u16(read_byte(frame))
+			v, ok := vm.stack[frame.slots + slot].(i64)
+			if !ok do return .TYPE_ERROR
+			vm.stack[frame.slots + slot] = v - 1
+
+		case .JUMP_IF_FALSE_POP:
+			hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			offset := (hi << 8) | lo
+			cond := vm.stack[sp-1]; sp -= 1
+			if is_falsy(cond) {
+				frame.ip += int(offset)
+			}
+
+		case .JUMP_IF_TRUE_POP:
+			hi := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			offset := (hi << 8) | lo
+			cond := vm.stack[sp-1]; sp -= 1
+			if !is_falsy(cond) {
+				frame.ip += int(offset)
+			}
+
+		case .SET_LOCAL_POP:
+			slot := u16(read_byte(frame))
+			vm.stack[frame.slots + slot] = vm.stack[sp-1]; sp -= 1
 
 		case .RETURN:
 			n := int(read_byte(frame))
 			if n == 0 {
 				vm.frame_count -= 1
 				if vm.frame_count == 0 { vm.stack_top = 0; return nil }
-				vm.stack_top = vm.frames[vm.frame_count].slots
+				sp = vm.frames[vm.frame_count].slots
 				frame = current_frame(vm)
 			} else if n == 1 {
-				ret := vm.stack[vm.stack_top - 1]
+				ret := vm.stack[sp - 1]
 				vm.frame_count -= 1
 				if vm.frame_count == 0 {
-					vm.stack[0] = ret
-					vm.stack_top = 1
-					return nil
+					vm.stack[0] = ret; vm.stack_top = 1; return nil
 				}
-				vm.stack_top = vm.frames[vm.frame_count].slots
-				vm.stack[vm.stack_top] = ret
-				vm.stack_top += 1
+				sp = vm.frames[vm.frame_count].slots
+				vm.stack[sp] = ret; sp += 1
 				frame = current_frame(vm)
 			} else {
 				tmp: [256]Value
-				for i := n - 1; i >= 0; i -= 1 {
-					v, pop_err := vm_pop(vm)
-					if pop_err != nil do return pop_err
-					tmp[i] = v
-				}
+				for i := n - 1; i >= 0; i -= 1 { sp -= 1; tmp[i] = vm.stack[sp] }
 				vm.frame_count -= 1
 				if vm.frame_count == 0 {
 					for i in 0..<n { vm.stack[i] = tmp[i] }
-					vm.stack_top = u16(n)
-					return nil
+					sp = u16(n); vm.stack_top = sp; return nil
 				}
-				vm.stack_top = vm.frames[vm.frame_count].slots
-				for i in 0..<n {
-					if push_err := vm_push(vm, tmp[i]); push_err != nil do return push_err
-				}
+				sp = vm.frames[vm.frame_count].slots
+				for i in 0..<n { vm.stack[sp] = tmp[i]; sp += 1 }
 				frame = current_frame(vm)
 			}
 
-		// ---- type-specific arithmetic ----
+		case .RETURN_LOCAL:
+			slot  := u16(read_byte(frame))
+			ret_n := int(read_byte(frame))
+			ret   := vm.stack[frame.slots + slot]
+			vm.frame_count -= 1
+			if vm.frame_count == 0 {
+				vm.stack[0] = ret; vm.stack_top = 1; return nil
+			}
+			sp = vm.frames[vm.frame_count].slots
+			if ret_n == 1 { vm.stack[sp] = ret; sp += 1 }
+			frame = current_frame(vm)
+
+		case .RETURN_CONST:
+			c_idx := u16(read_byte(frame))
+			ret_n := int(read_byte(frame))
+			ret   := frame.function.chunk.constants[c_idx]
+			vm.frame_count -= 1
+			if vm.frame_count == 0 {
+				vm.stack[0] = ret; vm.stack_top = 1; return nil
+			}
+			sp = vm.frames[vm.frame_count].slots
+			if ret_n == 1 { vm.stack[sp] = ret; sp += 1 }
+			frame = current_frame(vm)
+
+		// ---- type-specific arithmetic (pop b, overwrite a in-place) ----
 
 		case .ADD_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av + bv
+			bv := vm.stack[sp-1].(i64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(i64) + bv
 		case .SUB_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av - bv
+			bv := vm.stack[sp-1].(i64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(i64) - bv
 		case .MUL_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av * bv
+			bv := vm.stack[sp-1].(i64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(i64) * bv
 		case .DIV_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			if bv == 0 do return .DIVISION_BY_ZERO
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av / bv
+			bv := vm.stack[sp-1].(i64); if bv == 0 do return .DIVISION_BY_ZERO
+			sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) / bv
 		case .MOD_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			if bv == 0 do return .DIVISION_BY_ZERO
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av % bv
+			bv := vm.stack[sp-1].(i64); if bv == 0 do return .DIVISION_BY_ZERO
+			sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) % bv
 
 		case .ADD_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av + bv
+			bv := vm.stack[sp-1].(f64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(f64) + bv
 		case .SUB_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av - bv
+			bv := vm.stack[sp-1].(f64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(f64) - bv
 		case .MUL_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av * bv
+			bv := vm.stack[sp-1].(f64); sp -= 1
+			vm.stack[sp-1] = vm.stack[sp-1].(f64) * bv
 		case .DIV_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			if bv == 0 do return .DIVISION_BY_ZERO
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av / bv
+			bv := vm.stack[sp-1].(f64); if bv == 0 do return .DIVISION_BY_ZERO
+			sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(f64) / bv
 
 		case .ADD_STR:
-			bv, _ := vm_pop(vm); av, _ := vm_pop(vm)
-			a, _ := av.(string); b, _ := bv.(string)
+			b, _ := vm.stack[sp-1].(string); sp -= 1
+			a, _ := vm.stack[sp-1].(string); sp -= 1
 			tmp := strings.concatenate({a, b})
 			interned := string_pool_intern(&vm.strings, tmp)
 			if raw_data(tmp) != raw_data(interned) { delete(tmp) }
-			if err := vm_push(vm, interned); err != nil do return err
+			vm.stack[sp] = interned; sp += 1
 
 		case .LT_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av < bv
+			bv := vm.stack[sp-1].(i64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) < bv
 		case .LTE_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av <= bv
+			bv := vm.stack[sp-1].(i64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) <= bv
 		case .GT_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av > bv
+			bv := vm.stack[sp-1].(i64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) > bv
 		case .GTE_I64:
-			bv := vm.stack[vm.stack_top-1].(i64); av := vm.stack[vm.stack_top-2].(i64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av >= bv
+			bv := vm.stack[sp-1].(i64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(i64) >= bv
 
 		case .LT_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av < bv
+			bv := vm.stack[sp-1].(f64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(f64) < bv
 		case .LTE_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av <= bv
+			bv := vm.stack[sp-1].(f64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(f64) <= bv
 		case .GT_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av > bv
+			bv := vm.stack[sp-1].(f64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(f64) > bv
 		case .GTE_F64:
-			bv := vm.stack[vm.stack_top-1].(f64); av := vm.stack[vm.stack_top-2].(f64)
-			vm.stack_top -= 1; vm.stack[vm.stack_top-1] = av >= bv
+			bv := vm.stack[sp-1].(f64); sp -= 1; vm.stack[sp-1] = vm.stack[sp-1].(f64) >= bv
 
 		case .NEGATE_I64:
-			vm.stack[vm.stack_top-1] = -vm.stack[vm.stack_top-1].(i64)
+			vm.stack[sp-1] = -vm.stack[sp-1].(i64)
 		case .NEGATE_F64:
-			vm.stack[vm.stack_top-1] = -vm.stack[vm.stack_top-1].(f64)
+			vm.stack[sp-1] = -vm.stack[sp-1].(f64)
 		}
 	}
 }
@@ -559,7 +633,7 @@ vm_interpret :: proc(vm: ^VM, fn: ^Function) -> Maybe(VMError) {
 	return vm_run(vm)
 }
 
-is_falsy :: proc(val: Value) -> bool {
+is_falsy :: #force_inline proc(val: Value) -> bool {
 	switch v in val {
 	case bool:      return !v
 	case Nil:       return true
@@ -572,7 +646,7 @@ is_falsy :: proc(val: Value) -> bool {
 	return true
 }
 
-read_line :: proc(src: io.Reader) -> string {
+read_line :: #force_inline proc(src: io.Reader) -> string {
 	r := src if src.data != nil else io.Reader(os.to_reader(os.stdin))
 	b := strings.builder_make()
 	buf := [1]byte{}
@@ -600,7 +674,7 @@ print_value :: proc(val: Value) {
 	}
 }
 
-vm_values_equal :: proc(a, b: Value) -> bool {
+vm_values_equal :: #force_inline proc(a, b: Value) -> bool {
 	if as, ok := a.(string); ok {
 		if bs, ok2 := b.(string); ok2 {
 			return as == bs
@@ -610,7 +684,7 @@ vm_values_equal :: proc(a, b: Value) -> bool {
 	return bc.values_equal(a, b)
 }
 
-vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+vm_binary_op :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	b, err1 := vm_pop(vm); if err1 != nil do return err1
 	a, err2 := vm_pop(vm); if err2 != nil do return err2
 	#partial switch av in a {
@@ -646,7 +720,7 @@ vm_binary_op :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	return nil
 }
 
-vm_compare :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+vm_compare :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	b, _ := vm_pop(vm)
 	a, _ := vm_pop(vm)
 	#partial switch av in a {
@@ -671,7 +745,7 @@ vm_compare :: proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	return nil
 }
 
-vm_call :: proc(vm: ^VM, arg_count: u16) -> Maybe(VMError) {
+vm_call :: #force_inline proc(vm: ^VM, arg_count: u16) -> Maybe(VMError) {
 	callee := vm.stack[vm.stack_top - 1 - arg_count]
 	fn, ok := callee.(^Function)
 	if !ok do return .CALL_NON_FUNCTION
