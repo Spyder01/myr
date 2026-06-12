@@ -4,13 +4,17 @@ import "../../lexer"
 
 Nil :: struct{}
 
+// FnRef is a function-table index. It replaces raw ^Function pointers in
+// runtime values so bytecode is position-independent and serialisable.
+FnRef :: distinct u16
+
 Value :: union {
 	i64,
 	f64,
 	bool,
 	string,
 	Nil,
-	^Function,
+	FnRef,
 	[^]Value, // heap pointer: base of a contiguous heap-allocated Value slice
 }
 
@@ -61,11 +65,14 @@ Opcode :: enum u8 {
 	HEAP_SET,   // 1-byte: offset — pop ^Value (top), ptr[offset] = stack_top below it
 	HEAP_LOAD,  // 1-byte: N  — pop ^Value, push ptr[0..N-1] (full deref)
 	ADDR_LOCAL, // 1-byte: slot — push a raw pointer to frame[slot] (stack reference)
-	ARRAY_GET,  // 2-bytes: base_slot, elem_slots — pop index i, push frame[base_slot + i*elem_slots .. +elem_slots]
-	ARRAY_SET,  // 2-bytes: base_slot, elem_slots — pop index i and elem_slots values, write frame[base_slot + i*elem_slots]
-	MAKE_SLICE, // 1-byte: elem_slots — pop grow_factor, pop cap, alloc heap, push [ptr, len=0, cap, grow_factor]
-	SLICE_GET,  // 1-byte: elem_slots — pop index, pop ptr, push ptr[i*elem_slots .. +elem_slots]
-	SLICE_SET,  // 2-bytes: base_slot, elem_slots — pop index, grow if needed (doubling), write frame[base_slot]..+elem_slots (peek, leave val)
+	ARRAY_GET,            // 2-bytes: base_slot, elem_slots — pop index i, push frame[base_slot + i*elem_slots .. +elem_slots]
+	ARRAY_SET,            // 2-bytes: base_slot, elem_slots — pop index i and elem_slots values, write frame[base_slot + i*elem_slots]
+	ARRAY_GET_STACK,      // 2-bytes: total_slots, elem_slots — pop index and total_slots array from stack, push elem_slots element
+	ARRAY_SET_CHAINED,    // 3-bytes: base_slot, outer_elem_slots, inner_elem_slots — stack: [val(inner_elem_slots), i, j] write frame[base_slot + i*outer + j*inner]
+	MAKE_SLICE,      // 1-byte: elem_slots — pop grow_factor, pop cap, alloc heap, push [ptr, len=0, cap, grow_factor]
+	SLICE_GET,       // 1-byte: elem_slots — pop index, pop ptr, push ptr[i*elem_slots .. +elem_slots]
+	SLICE_SET,       // 2-bytes: base_slot, elem_slots — pop index, grow if needed (doubling), write frame[base_slot]..+elem_slots (peek, leave val)
+	SLICE_GET_STACK, // 1-byte: elem_slots — pop index, pop Slice (ptr len cap gf) from stack, push ptr[i*elem_slots .. +elem_slots]
 	STR_LEN,    // no operands — pop string, push i64 byte-length
 	STR_GET,    // no operands — pop index (i64), pop string, push byte at index as i64
 
@@ -94,6 +101,9 @@ Opcode :: enum u8 {
 
 	// store and discard: SET_LOCAL + POP fused (2 bytes: slot)
 	SET_LOCAL_POP,
+
+	// push a function ref by table index: LOAD_FN hi lo (3 bytes)
+	LOAD_FN,
 
 	// return without a push: GET_LOCAL s; RETURN n → RETURN_LOCAL s n (3 bytes: slot n)
 	RETURN_LOCAL,
@@ -147,13 +157,13 @@ chunk_write :: proc(chunk: ^Chunk, byte: u8, span: lexer.Span) -> Maybe(ByteCode
 
 values_equal :: proc(a, b: Value) -> bool {
     switch av in a {
-    case i64:       if bv, ok := b.(i64);    ok do return av == bv
-    case f64:       if bv, ok := b.(f64);    ok do return av == bv
-    case bool:      if bv, ok := b.(bool);   ok do return av == bv
-    case string:    if bv, ok := b.(string); ok do return av == bv
-    case Nil:       _, ok := b.(Nil);            return ok
-    case ^Function: return false
-    case [^]Value:  if bv, ok := b.([^]Value); ok do return av == bv
+    case i64:    if bv, ok := b.(i64);    ok do return av == bv
+    case f64:    if bv, ok := b.(f64);    ok do return av == bv
+    case bool:   if bv, ok := b.(bool);   ok do return av == bv
+    case string: if bv, ok := b.(string); ok do return av == bv
+    case Nil:    _, ok := b.(Nil);            return ok
+    case FnRef:  if bv, ok := b.(FnRef);  ok do return av == bv
+    case [^]Value: if bv, ok := b.([^]Value); ok do return av == bv
     }
     return false
 }
@@ -190,5 +200,25 @@ new_function :: proc(name: string, arity: u8) -> ^Function {
 function_free :: proc(fn: ^Function) {
 	chunk_free(&fn.chunk)
 	free(fn)
+}
+
+// Module is the compilation unit: a flat table of all functions.
+// Index 0 is always the top-level __main__ entry point.
+Module :: struct {
+	functions: [dynamic]^Function,
+}
+
+new_module :: proc() -> ^Module {
+	m := new(Module)
+	m.functions = make([dynamic]^Function)
+	return m
+}
+
+module_free :: proc(m: ^Module) {
+	for fn in m.functions {
+		if fn != nil { function_free(fn) }
+	}
+	delete(m.functions)
+	free(m)
 }
 

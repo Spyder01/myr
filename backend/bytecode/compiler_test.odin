@@ -6,7 +6,7 @@ import "../../parser"
 
 // ---- helpers ----
 
-compile_source :: proc(source: string) -> (^Function, []CompilerError) {
+compile_source :: proc(source: string) -> (^Module, []CompilerError) {
 	p   := parser.new_parser(source)
 	ast := parser.parse_program(&p)
 	defer parser.ast_destroy(&ast)
@@ -18,41 +18,39 @@ compile_source :: proc(source: string) -> (^Function, []CompilerError) {
 
 @(test)
 test_compile_no_errors :: proc(t: ^testing.T) {
-	fn, errs := compile_source("function main() { }")
-	defer if fn != nil do function_free(fn)
+	m, errs := compile_source("function main() { }")
+	defer if m != nil do module_free(m)
 	testing.expect_value(t, len(errs), 0)
 }
 
 @(test)
 test_compile_produces_function :: proc(t: ^testing.T) {
-	fn, errs := compile_source("function main() { }")
-	defer if fn != nil do function_free(fn)
+	m, errs := compile_source("function main() { }")
+	defer if m != nil do module_free(m)
 	testing.expect(t, len(errs) == 0, "expected no errors")
-	testing.expect(t, fn != nil, "expected a function")
+	testing.expect(t, m != nil, "expected a module")
 }
 
 @(test)
 test_compile_empty_function_has_return :: proc(t: ^testing.T) {
-	fn, _ := compile_source("function main() { }")
-	defer if fn != nil do function_free(fn)
-	// top-level chunk should end with RETURN <slot_count>
+	m, _ := compile_source("function main() { }")
+	defer if m != nil do module_free(m)
+	// top-level __main__ chunk (index 0) should end with RETURN
+	fn   := m.functions[0]
 	last := fn.chunk.code[len(fn.chunk.code) - 2]
 	testing.expect_value(t, Opcode(last), Opcode.RETURN)
 }
 
 @(test)
 test_compile_literal_in_constant_pool :: proc(t: ^testing.T) {
-	fn, _ := compile_source("function main() { return 42 }")
-	defer if fn != nil do function_free(fn)
-	// main function is stored as a constant in the top-level chunk
+	m, _ := compile_source("function main() { return 42 }")
+	defer if m != nil do module_free(m)
+	// main is at m.functions[1]; look for 42 in its constant pool
 	found := false
-	for c in fn.chunk.constants {
-		if fn_val, ok := c.(^Function); ok {
-			for v in fn_val.chunk.constants {
-				if i, ok2 := v.(i64); ok2 && i == 42 {
-					found = true
-				}
-			}
+	for fn in m.functions {
+		if fn == nil { continue }
+		for v in fn.chunk.constants {
+			if i, ok := v.(i64); ok && i == 42 { found = true }
 		}
 	}
 	testing.expect(t, found, "42 should be in main's constant pool")
@@ -60,29 +58,27 @@ test_compile_literal_in_constant_pool :: proc(t: ^testing.T) {
 
 @(test)
 test_compile_true_in_constant_pool :: proc(t: ^testing.T) {
-	fn, _ := compile_source("function main() { return true }")
-	defer if fn != nil do function_free(fn)
+	m, _ := compile_source("function main() { return true }")
+	defer if m != nil do module_free(m)
 	found := false
-	for c in fn.chunk.constants {
-		if fn_val, ok := c.(^Function); ok {
-			for v in fn_val.chunk.constants {
-				if b, ok2 := v.(bool); ok2 && b do found = true
-			}
+	for fn in m.functions {
+		if fn == nil { continue }
+		for v in fn.chunk.constants {
+			if b, ok := v.(bool); ok && b { found = true }
 		}
 	}
-	testing.expect(t, found, "expected bool true in main's constant pool")
+	testing.expect(t, found, "expected bool true in a function's constant pool")
 }
 
 @(test)
 test_compile_add_uses_add_opcode :: proc(t: ^testing.T) {
-	fn, _ := compile_source("function main() { return 1 + 2 }")
-	defer if fn != nil do function_free(fn)
+	m, _ := compile_source("function main() { return 1 + 2 }")
+	defer if m != nil do module_free(m)
 	found := false
-	for c in fn.chunk.constants {
-		if fn_val, ok := c.(^Function); ok {
-			for byte in fn_val.chunk.code {
-				if Opcode(byte) == .ADD do found = true
-			}
+	for fn in m.functions {
+		if fn == nil { continue }
+		for b in fn.chunk.code {
+			if Opcode(b) == .ADD { found = true }
 		}
 	}
 	testing.expect(t, found, "expected ADD opcode in main")
@@ -101,17 +97,16 @@ test_compile_constant_dedup :: proc(t: ^testing.T) {
 
 @(test)
 test_compile_function_count :: proc(t: ^testing.T) {
-	fn, _ := compile_source(`
+	m, _ := compile_source(`
 		function foo() { }
 		function bar() { }
 		function main() { }
 	`)
-	defer if fn != nil do function_free(fn)
-	count := 0
-	for c in fn.chunk.constants {
-		if _, ok := c.(^Function); ok do count += 1
-	}
-	testing.expect_value(t, count, 3)
+	defer if m != nil do module_free(m)
+	// module.functions has __main__ (idx 0) + foo + bar + main = 4 entries
+	non_nil := 0
+	for fn in m.functions { if fn != nil { non_nil += 1 } }
+	testing.expect_value(t, non_nil, 4)
 }
 
 // ---- structs ----
@@ -122,7 +117,7 @@ test_compile_struct_decl_no_errors :: proc(t: ^testing.T) {
 		struct Point { x: float, y: float }
 		function main() { }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect_value(t, len(errs), 0)
 }
 
@@ -132,7 +127,7 @@ test_compile_struct_literal_no_errors :: proc(t: ^testing.T) {
 		struct Point { x: float, y: float }
 		function main() { let p = Point{x = 1.0, y = 2.0} }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect_value(t, len(errs), 0)
 }
 
@@ -142,7 +137,7 @@ test_compile_struct_field_access_no_errors :: proc(t: ^testing.T) {
 		struct Point { x: float, y: float }
 		function main() { let p = Point{x = 1.0, y = 2.0} return p.x }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect_value(t, len(errs), 0)
 }
 
@@ -152,7 +147,7 @@ test_compile_struct_field_write_no_errors :: proc(t: ^testing.T) {
 		struct Point { x: float, y: float }
 		function main() { let p = Point{x = 1.0, y = 2.0} p.x = 99.0 }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect_value(t, len(errs), 0)
 }
 
@@ -163,7 +158,7 @@ test_compile_struct_chained_access_no_errors :: proc(t: ^testing.T) {
 		struct Rect { origin: Vec2, size: Vec2 }
 		function main() { let r = Rect{origin = Vec2{x = 1.0, y = 2.0}, size = Vec2{x = 3.0, y = 4.0}} return r.origin.x }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect_value(t, len(errs), 0)
 }
 
@@ -172,6 +167,6 @@ test_compile_struct_unknown_type_errors :: proc(t: ^testing.T) {
 	fn, errs := compile_source(`
 		function main() { let p = NoSuchStruct{x = 1.0} }
 	`)
-	defer if fn != nil do function_free(fn)
+	defer if fn != nil do module_free(fn)
 	testing.expect(t, len(errs) > 0, "expected error for undefined struct")
 }

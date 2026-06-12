@@ -10,5 +10,7 @@ MAX_INTERN_LEN :: 64
 Value    :: bc.Value
 Nil      :: bc.Nil
 Function :: bc.Function
+FnRef    :: bc.FnRef
+Module   :: bc.Module
 Opcode   :: bc.Opcode
 HeapPtr  :: [^]bc.Value

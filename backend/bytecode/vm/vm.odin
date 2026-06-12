@@ -19,6 +19,7 @@ VM :: struct {
 	strings:      StringPool,
 	heap_objects: [dynamic][]Value,
 	char_cache:   [256]string,
+	functions:    []^Function,  // function table set by vm_interpret; indexed by FnRef
 	stack_top:    u16,
 	frame_count:  u8,
 	stdin:        io.Reader,
@@ -55,46 +56,46 @@ destroy_vm :: proc(vm: ^VM) {
 	for s in vm.char_cache { delete(s) }
 }
 
-vm_push :: #force_inline proc(vm: ^VM, val: Value) -> Maybe(VMError) {
+vm_push :: #force_inline proc "contextless" (vm: ^VM, val: Value) -> Maybe(VMError) {
 	if vm.stack_top >= STACK_MAX do return .STACK_OVERFLOW
 	vm.stack[vm.stack_top] = val
 	vm.stack_top += 1
 	return nil
 }
 
-vm_pop :: #force_inline proc(vm: ^VM) -> (Value, Maybe(VMError)) {
+vm_pop :: #force_inline proc "contextless" (vm: ^VM) -> (Value, Maybe(VMError)) {
 	if vm.stack_top == 0 do return Nil{}, .STACK_UNDERFLOW
 	vm.stack_top -= 1
 	return vm.stack[vm.stack_top], nil
 }
 
-vm_peek :: #force_inline proc(vm: ^VM, dist: u16 = 0) -> (Value, Maybe(VMError)) {
+vm_peek :: #force_inline proc "contextless" (vm: ^VM, dist: u16 = 0) -> (Value, Maybe(VMError)) {
 	if vm.stack_top == 0 || dist >= vm.stack_top do return Nil{}, .STACK_UNDERFLOW
 	return vm.stack[vm.stack_top - 1 - dist], nil
 }
 
-current_frame :: proc(vm: ^VM) -> ^CallFrame {
+current_frame :: #force_inline proc "contextless" (vm: ^VM) -> ^CallFrame {
 	return &vm.frames[vm.frame_count - 1]
 }
 
-read_byte :: #force_inline proc(frame: ^CallFrame) -> u8 {
+read_byte :: #force_inline proc "contextless" (frame: ^CallFrame) -> u8 {
 	b := frame.function.chunk.code[frame.ip]
 	frame.ip += 1
 	return b
 }
 
-read_short :: #force_inline proc(frame: ^CallFrame) -> u16 {
+read_short :: #force_inline proc "contextless" (frame: ^CallFrame) -> u16 {
 	hi := u16(read_byte(frame)) << 8
 	lo := u16(read_byte(frame))
 	return hi | lo
 }
 
-read_constant :: #force_inline proc(frame: ^CallFrame) -> Value {
+read_constant :: #force_inline proc "contextless" (frame: ^CallFrame) -> Value {
 	idx := read_byte(frame)
 	return frame.function.chunk.constants[idx]
 }
 
-read_constant_long :: #force_inline proc(frame: ^CallFrame) -> Value {
+read_constant_long :: #force_inline proc "contextless" (frame: ^CallFrame) -> Value {
 	idx := read_short(frame)
 	return frame.function.chunk.constants[idx]
 }
@@ -115,6 +116,10 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			val := read_constant_long(frame)
 			if s, ok := val.(string); ok { val = string_pool_intern(&vm.strings, s) }
 			vm.stack[sp] = val; sp += 1
+
+		case .LOAD_FN:
+			hi  := u16(read_byte(frame)); lo := u16(read_byte(frame))
+			vm.stack[sp] = FnRef((hi << 8) | lo); sp += 1
 
 		case .NIL:   vm.stack[sp] = Nil{}; sp += 1
 		case .TRUE:  vm.stack[sp] = true;  sp += 1
@@ -321,6 +326,46 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 				vm.stack[frame.slots + base_slot + 1] = i + 1
 			}
 			// Leave val on stack (peek contract — caller pops via expr_slot_count).
+
+		case .ARRAY_GET_STACK:
+			total_slots := int(read_byte(frame))
+			elem_slots  := int(read_byte(frame))
+			i, ok := vm.stack[sp-1].(i64); if !ok do return .TYPE_ERROR
+			sp -= 1
+			base := int(sp) - total_slots
+			for s in 0..<elem_slots {
+				vm.stack[base + s] = vm.stack[base + int(i)*elem_slots + s]
+			}
+			sp = u16(base + elem_slots)
+
+		case .ARRAY_SET_CHAINED:
+			base_slot        := u16(read_byte(frame))
+			outer_elem_slots := int(read_byte(frame))
+			inner_elem_slots := int(read_byte(frame))
+			j, ok1 := vm.stack[sp-1].(i64); if !ok1 do return .TYPE_ERROR
+			sp -= 1
+			i, ok2 := vm.stack[sp-1].(i64); if !ok2 do return .TYPE_ERROR
+			sp -= 1
+			dest := int(base_slot) + int(i)*outer_elem_slots + int(j)*inner_elem_slots
+			top  := int(sp)
+			for s in 0..<inner_elem_slots {
+				vm.stack[frame.slots + u16(dest + s)] = vm.stack[top - inner_elem_slots + s]
+			}
+			// Leave inner_elem_slots values on stack (peek contract — caller emits POP)
+
+		case .SLICE_GET_STACK:
+			elem_slots := int(read_byte(frame))
+			j, ok1     := vm.stack[sp-1].(i64); if !ok1 do return .TYPE_ERROR
+			sp -= 1          // pop index
+			sp -= 1          // pop grow_factor
+			sp -= 1          // pop cap
+			sp -= 1          // pop len
+			ptr, ok2   := vm.stack[sp-1].([^]Value); if !ok2 do return .TYPE_ERROR
+			sp -= 1          // pop ptr
+			if ptr == nil do return .NULL_DEREF
+			for s in 0..<elem_slots {
+				vm.stack[sp] = ptr[int(j)*elem_slots + s]; sp += 1
+			}
 
 		case .STR_LEN:
 			s, ok := vm.stack[sp-1].(string); if !ok do return .TYPE_ERROR
@@ -649,8 +694,10 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 	}
 }
 
-vm_interpret :: proc(vm: ^VM, fn: ^Function) -> Maybe(VMError) {
-	vm_push(vm, Value(fn))
+vm_interpret :: proc(vm: ^VM, module: ^Module) -> Maybe(VMError) {
+	vm.functions = module.functions[:]
+	fn := vm.functions[0]
+	vm_push(vm, Value(FnRef(0)))
 
 	frame := &vm.frames[0]
 	vm.frame_count = 1
@@ -661,14 +708,14 @@ vm_interpret :: proc(vm: ^VM, fn: ^Function) -> Maybe(VMError) {
 	return vm_run(vm)
 }
 
-is_falsy :: #force_inline proc(val: Value) -> bool {
+is_falsy :: #force_inline proc "contextless" (val: Value) -> bool {
 	switch v in val {
 	case bool:      return !v
 	case Nil:       return true
 	case i64:       return false
 	case f64:       return false
 	case string:    return false
-	case ^Function: return false
+	case FnRef: return false
 	case [^]Value:  return v == nil
 	}
 	return true
@@ -696,7 +743,7 @@ print_value :: proc(val: Value) {
 	case bool:     fmt.printf("%t", v)
 	case string:   fmt.printf("%s", v)
 	case Nil:      fmt.printf("nil")
-	case ^Function: fmt.printf("<fn %s>", v.name)
+	case FnRef: fmt.printf("<fn#%d>", int(v))
 	case [^]Value:
 		if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
 	}
@@ -712,7 +759,7 @@ vm_values_equal :: #force_inline proc(a, b: Value) -> bool {
 	return bc.values_equal(a, b)
 }
 
-vm_binary_op :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+vm_binary_op :: #force_inline proc "contextless" (vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	b, err1 := vm_pop(vm); if err1 != nil do return err1
 	a, err2 := vm_pop(vm); if err2 != nil do return err2
 	#partial switch av in a {
@@ -748,7 +795,7 @@ vm_binary_op :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	return nil
 }
 
-vm_compare :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
+vm_compare :: #force_inline proc "contextless" (vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	b, _ := vm_pop(vm)
 	a, _ := vm_pop(vm)
 	#partial switch av in a {
@@ -773,10 +820,11 @@ vm_compare :: #force_inline proc(vm: ^VM, op: Opcode) -> Maybe(VMError) {
 	return nil
 }
 
-vm_call :: #force_inline proc(vm: ^VM, arg_count: u16) -> Maybe(VMError) {
+vm_call :: #force_inline proc "contextless" (vm: ^VM, arg_count: u16) -> Maybe(VMError) {
 	callee := vm.stack[vm.stack_top - 1 - arg_count]
-	fn, ok := callee.(^Function)
+	ref, ok := callee.(FnRef)
 	if !ok do return .CALL_NON_FUNCTION
+	fn := vm.functions[ref]
 	if arg_count != u16(fn.arity) do return .WRONG_ARG_COUNT
 	if vm.frame_count >= FRAMES_MAX do return .STACK_OVERFLOW
 

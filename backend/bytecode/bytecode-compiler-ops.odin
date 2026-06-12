@@ -1,6 +1,7 @@
 package bytecode
 
 import "../../lexer"
+import "../../parser"
 
 ByteCodeCompilerError :: enum u8 {
     TOO_MANY_CONSTANTS,
@@ -10,14 +11,16 @@ ByteCodeCompilerError :: enum u8 {
 }
 
 Local :: struct {
-    name:             string,
-    depth:            u8,
-    slots:            int,    // 1 for scalars/pointers, N for flat structs/enums, N*elem_slots for arrays, 3 for slices
-    struct_type:      string, // "" for scalars/pointers/enums, struct name for flat struct locals
-    ptr_inner:        string, // "" unless this is a ^T pointer local; stores "T"
-    enum_type:        string, // "" unless this is a flat enum local; stores enum name
-    array_elem_slots: int,    // 0 = not an array; >0 = slots per element
-    slice_elem_slots: int,    // 0 = not a slice; >0 = slots per element (local occupies 3 slots: ptr, len, cap)
+    name:                  string,
+    depth:                 u8,
+    slots:                 int,              // 1 for scalars/pointers, N for flat structs/enums, N*elem_slots for arrays, 4 for slices
+    struct_type:           string,           // "" for scalars/pointers/enums, struct name for flat struct locals
+    ptr_inner:             string,           // "" unless this is a ^T pointer local; stores "T"
+    enum_type:             string,           // "" unless this is a flat enum local; stores enum name
+    array_elem_slots:      int,              // 0 = not an array; >0 = slots per element
+    array_elem_type_idx:   parser.TypeIdx,   // TypeIdx of the array's element type; parser.INVALID_IDX if not an array
+    slice_elem_slots:      int,              // 0 = not a slice; >0 = slots per element
+    slice_elem_type_idx:   parser.TypeIdx,   // TypeIdx of the slice's element type; parser.INVALID_IDX if not a slice
 }
 
 ByteCodeCompiler :: struct {
@@ -56,9 +59,9 @@ current_chunk :: proc(bc: ^ByteCodeCompiler) -> ^Chunk {
     return &bc.function.chunk
 }
 
-add_local :: proc(compiler: ^ByteCodeCompiler, name: string, slots: int = 1, struct_type: string = "", ptr_inner: string = "", enum_type: string = "", array_elem_slots: int = 0, slice_elem_slots: int = 0) -> Maybe(ByteCodeCompilerError) {
+add_local :: proc(compiler: ^ByteCodeCompiler, name: string, slots: int = 1, struct_type: string = "", ptr_inner: string = "", enum_type: string = "", array_elem_slots: int = 0, slice_elem_slots: int = 0, array_elem_type_idx: parser.TypeIdx = parser.TypeIdx(parser.INVALID_IDX), slice_elem_type_idx: parser.TypeIdx = parser.TypeIdx(parser.INVALID_IDX)) -> Maybe(ByteCodeCompilerError) {
     if len(compiler.locals) >= MAX_LOCAL_VARIABLE_COUNT do return .TOO_MANY_LOCAL_VARIABLES
-    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth, slots = slots, struct_type = struct_type, ptr_inner = ptr_inner, enum_type = enum_type, array_elem_slots = array_elem_slots, slice_elem_slots = slice_elem_slots})
+    append(&compiler.locals, Local{name = name, depth = compiler.scope_depth, slots = slots, struct_type = struct_type, ptr_inner = ptr_inner, enum_type = enum_type, array_elem_slots = array_elem_slots, array_elem_type_idx = array_elem_type_idx, slice_elem_slots = slice_elem_slots, slice_elem_type_idx = slice_elem_type_idx})
     return nil
 }
 

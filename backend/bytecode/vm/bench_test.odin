@@ -26,7 +26,7 @@ bench_interp :: proc(src: string, iters: int) -> time.Duration {
 
 	fn, errs := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	if len(errs) > 0 || fn == nil do return 0
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 
 	start := time.tick_now()
 	for _ in 0..<iters {
@@ -298,4 +298,57 @@ bench_slice_fill_sum :: proc(t: ^testing.T) {
 	`
 	dur := bench_interp(src, BENCH_ITERS)
 	bench_log(t, "slice fill + sum (64 elements)", dur, BENCH_ITERS)
+}
+
+@(test)
+bench_matmul_10x10 :: proc(t: ^testing.T) {
+	// Uses only two 10x10 matrices (200 local slots) to stay within STACK_MAX=256.
+	// Fills a and b via chained-write loops, then accumulates the full matmul sum
+	// as a scalar (avoids storing a third 100-slot result matrix).
+	// a[i][j] = i+j+1, b[i][j] = i+j+1  →  sum = Σ a[i][k]*b[k][j] over all i,j,k
+	src := `
+		function main() -> i64 {
+			let a: Array[Array[i64, 10], 10] = Array[Array[i64, 10], 10]{
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+			}
+			let b: Array[Array[i64, 10], 10] = Array[Array[i64, 10], 10]{
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+				Array[i64, 10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+			}
+			let sum: i64 = 0
+			for let i: i64 = 0; i < 10; i += 1 {
+				for let j: i64 = 0; j < 10; j += 1 {
+					a[i][j] = i + j + 1
+					b[i][j] = i + j + 1
+				}
+			}
+			for let i: i64 = 0; i < 10; i += 1 {
+				for let j: i64 = 0; j < 10; j += 1 {
+					for let k: i64 = 0; k < 10; k += 1 {
+						sum = sum + a[i][k] * b[k][j]
+					}
+				}
+			}
+			return sum
+		}
+	`
+	dur := bench_interp(src, BENCH_ITERS)
+	bench_log(t, "10x10 matmul (nested array write+read)", dur, BENCH_ITERS)
 }

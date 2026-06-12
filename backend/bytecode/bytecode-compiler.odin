@@ -61,6 +61,7 @@ Compiler :: struct {
 	global_slots:             map[string]u16,
 	global_count:             u16,
 	root:                     ^Compiler,
+	module:                   ^Module,
 	// inlining
 	inline_fns:         map[string]InlineFnInfo, // shared via root
 	inline_fn_name:     string,                  // non-empty when inlining (prevents recursion)
@@ -71,9 +72,12 @@ Compiler :: struct {
 new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
 	sl := new(map[string]StructLayout)
 	sl^ = make(map[string]StructLayout)
+	m := new_module()
+	append(&m.functions, nil) // index 0 reserved for __main__, filled in by compile
 	return Compiler{
 		bc                = new_bytecode_compiler("__main__", 0),
 		ast               = ast,
+		module            = m,
 		const_table       = make(map[string]Value),
 		struct_layouts    = sl,
 		enum_layouts      = make(map[string]EnumLayout),
@@ -112,7 +116,7 @@ assign_global_slot :: proc(c: ^Compiler, name: string) -> u16 {
 	return slot
 }
 
-compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Function, []CompilerError) {
+compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Module, []CompilerError) {
 	c := new_compiler(ast, tc_types, tc_type_table)
 
 	for node in ast.nodes {
@@ -153,10 +157,12 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 	if c.error_count > 0 {
 		fn := compiler_end(&c.bc)
 		function_free(fn)
+		module_free(c.module)
 		return nil, errors
 	}
 
-	return compiler_end(&c.bc), errors
+	c.module.functions[0] = compiler_end(&c.bc)
+	return c.module, errors
 }
 
 // ---- declarations ----
@@ -311,6 +317,7 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		type_subst               = child_subst,
 		global_slots             = c.global_slots,
 		root                     = root_c,
+		module                   = c.module,
 		inline_fns               = c.inline_fns,
 		inline_patches           = make([dynamic]int),
 	}
@@ -321,11 +328,13 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 	c.error_count = child.error_count
 	delete(child.inline_patches)
 
-	// get compiled function
-	fn := compiler_end(&child.bc)
-
-	// emit function as a constant in parent, bind to emit_name
-	emit_constant(&c.bc, fn, span)
+	// get compiled function, register in module, push FnRef, bind to global slot
+	fn      := compiler_end(&child.bc)
+	fn_idx  := u16(len(c.module.functions))
+	append(&c.module.functions, fn)
+	emit(&c.bc, .LOAD_FN, span)
+	emit_byte(&c.bc, u8(fn_idx >> 8), span)
+	emit_byte(&c.bc, u8(fn_idx & 0xFF), span)
 	emit(&c.bc, .DEFINE_GLOBAL, span)
 	emit_byte(&c.bc, u8(assign_global_slot(c, emit_name)), span)
 
@@ -501,15 +510,17 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 			emit(&c.bc, .DEFINE_GLOBAL, span)
 			emit_byte(&c.bc, u8(assign_global_slot(c, s.name.data)), span)
 		} else {
-			slice_es := expr_slice_elem_slots(c, s.value)
+			slice_es       := expr_slice_elem_slots(c, s.value)
+			slice_type_idx := expr_slice_elem_type_idx(c, s.value)
 			if slice_es > 0 {
-				add_local(&c.bc, s.name.data, 4, "", "", "", 0, slice_es)
+				add_local(&c.bc, s.name.data, 4, "", "", "", 0, slice_es, slice_elem_type_idx = slice_type_idx)
 				break
 			}
 			struct_type      := expr_struct_type(c, s.value)
 			ptr_inner        := expr_ptr_inner(c, s.value)
 			enum_type        := expr_enum_type(c, s.value)
 			array_elem_slots := expr_array_elem_slots(c, s.value)
+			array_type_idx   := expr_array_elem_type_idx(c, s.value)
 			if struct_type == "" && ptr_inner == "" && enum_type == "" && array_elem_slots == 0 {
 				if ann_idx, has_ann := s.type.?; has_ann {
 					struct_type = type_ann_struct_name(c, ann_idx)
@@ -521,6 +532,7 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 							if ty, ok := c.ast.nodes[int(ann_idx)].(parser.Type); ok {
 								if at, ok2 := ty.(parser.ArrayType); ok2 {
 									array_elem_slots = type_slot_count(c, at.elem)
+									array_type_idx   = at.elem
 								}
 							}
 						}
@@ -545,7 +557,7 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 					slots = layout.total_slots
 				}
 			}
-			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner, enum_type, array_elem_slots)
+			add_local(&c.bc, s.name.data, slots, struct_type, ptr_inner, enum_type, array_elem_slots, 0, array_type_idx)
 		}
 
 	case parser.ReturnStatement:
@@ -1733,7 +1745,9 @@ expr_slot_count :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 }
 
 // expr_array_elem_slots returns the slots-per-element for an array expression,
-// or 0 if the expression is not a known array local.
+// or 0 if the expression is not an array (scalar, struct, or slice).
+// For IndexExpression a[i] where a is Array[Array[T,N],M], returns type_slot_count(T)
+// because a[i] is Array[T,N] whose elements are T-sized.
 expr_array_elem_slots :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 	node := c.ast.nodes[int(idx)]
 	expr, ok := node.(parser.Expression)
@@ -1741,15 +1755,105 @@ expr_array_elem_slots :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> int {
 	if ale, ok2 := expr.(parser.ArrayLiteralExpression); ok2 {
 		return type_slot_count(c, ale.elem_type)
 	}
-	id, ok2 := expr.(parser.IdentExpression)
-	if !ok2 { return 0 }
-	name := lexer.Token(id).data
-	for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
-		if c.bc.locals[i].name == name {
-			return c.bc.locals[i].array_elem_slots
+	if id, ok2 := expr.(parser.IdentExpression); ok2 {
+		name := lexer.Token(id).data
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			if c.bc.locals[i].name == name {
+				return c.bc.locals[i].array_elem_slots
+			}
+		}
+		return 0
+	}
+	// IndexExpression: a[i] — check if the element of a is itself an array.
+	if ie, ok2 := expr.(parser.IndexExpression); ok2 {
+		return index_expr_array_elem_slots(c, ie)
+	}
+	return 0
+}
+
+// index_expr_array_elem_slots returns the array_elem_slots for the RESULT of an IndexExpression,
+// i.e. for a[i] it returns the elem_slots of a's element type IF that element type is an Array.
+@private
+index_expr_array_elem_slots :: proc(c: ^Compiler, ie: parser.IndexExpression) -> int {
+	eti := index_expr_elem_type_idx(c, ie)
+	if u32(eti) == parser.INVALID_IDX { return 0 }
+	if elem_ty, ok := c.ast.nodes[int(eti)].(parser.Type); ok {
+		if eat, ok2 := elem_ty.(parser.ArrayType); ok2 {
+			return type_slot_count(c, eat.elem)
 		}
 	}
 	return 0
+}
+
+// index_expr_elem_type_idx returns the TypeIdx of the element type of the outer container
+// being indexed (e.g. for a[i] where a:Array[Array[int,3],3], returns TypeIdx(Array[int,3])).
+@private
+index_expr_elem_type_idx :: proc(c: ^Compiler, ie: parser.IndexExpression) -> parser.TypeIdx {
+	obj_node := c.ast.nodes[int(ie.object)]
+	obj_expr, ok := obj_node.(parser.Expression)
+	if !ok { return parser.TypeIdx(parser.INVALID_IDX) }
+	if id, ok2 := obj_expr.(parser.IdentExpression); ok2 {
+		name := lexer.Token(id).data
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			loc := c.bc.locals[i]
+			if loc.name != name { continue }
+			if loc.array_elem_slots > 0 { return loc.array_elem_type_idx }
+			if loc.slice_elem_slots > 0 { return loc.slice_elem_type_idx }
+			return parser.TypeIdx(parser.INVALID_IDX)
+		}
+	}
+	if ale, ok2 := obj_expr.(parser.ArrayLiteralExpression); ok2 {
+		return ale.elem_type
+	}
+	return parser.TypeIdx(parser.INVALID_IDX)
+}
+
+// expr_array_elem_type_idx returns the TypeIdx of the element type if idx is an array expression,
+// or INVALID_IDX if the expression is not a known array.
+expr_array_elem_type_idx :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> parser.TypeIdx {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok { return parser.TypeIdx(parser.INVALID_IDX) }
+	if ale, ok2 := expr.(parser.ArrayLiteralExpression); ok2 {
+		return ale.elem_type
+	}
+	if id, ok2 := expr.(parser.IdentExpression); ok2 {
+		name := lexer.Token(id).data
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			if c.bc.locals[i].name == name { return c.bc.locals[i].array_elem_type_idx }
+		}
+		return parser.TypeIdx(parser.INVALID_IDX)
+	}
+	if ie, ok2 := expr.(parser.IndexExpression); ok2 {
+		eti := index_expr_elem_type_idx(c, ie)
+		if u32(eti) == parser.INVALID_IDX { return parser.TypeIdx(parser.INVALID_IDX) }
+		// If the element type is itself an array, return its inner element TypeIdx.
+		if elem_ty, ok3 := c.ast.nodes[int(eti)].(parser.Type); ok3 {
+			if eat, ok4 := elem_ty.(parser.ArrayType); ok4 {
+				return eat.elem
+			}
+		}
+	}
+	return parser.TypeIdx(parser.INVALID_IDX)
+}
+
+// expr_slice_elem_type_idx returns the TypeIdx of the element type if idx is a slice expression,
+// or INVALID_IDX otherwise.
+expr_slice_elem_type_idx :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> parser.TypeIdx {
+	node := c.ast.nodes[int(idx)]
+	expr, ok := node.(parser.Expression)
+	if !ok { return parser.TypeIdx(parser.INVALID_IDX) }
+	if sle, ok2 := expr.(parser.StructLiteralExpression); ok2 {
+		if sle.type_name.data != "Slice" || len(sle.type_args) == 0 { return parser.TypeIdx(parser.INVALID_IDX) }
+		return sle.type_args[0]
+	}
+	if id, ok2 := expr.(parser.IdentExpression); ok2 {
+		name := lexer.Token(id).data
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			if c.bc.locals[i].name == name { return c.bc.locals[i].slice_elem_type_idx }
+		}
+	}
+	return parser.TypeIdx(parser.INVALID_IDX)
 }
 
 build_struct_layout :: proc(c: ^Compiler, d: parser.StructDecl) -> StructLayout {
@@ -2318,7 +2422,11 @@ compile_index_expression :: proc(c: ^Compiler, e: parser.IndexExpression, span: 
 	obj_expr, ok := obj_node.(parser.Expression)
 	if !ok { compiler_error(c, "index: object is not an expression", span); emit(&c.bc, .NIL, span); return }
 	id, is_ident := obj_expr.(parser.IdentExpression)
-	if !is_ident { compiler_error(c, "index: only local array/slice indexing is supported", span); emit(&c.bc, .NIL, span); return }
+	if !is_ident {
+		// Chained indexing: a[i][j] — object is itself an IndexExpression.
+		compile_chained_index(c, e, obj_expr, span)
+		return
+	}
 	name := lexer.Token(id).data
 	slot, _, found := resolve_local(&c.bc, name)
 	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); emit(&c.bc, .NIL, span); return }
@@ -2351,6 +2459,91 @@ compile_index_expression :: proc(c: ^Compiler, e: parser.IndexExpression, span: 
 	emit_byte(&c.bc, u8(elem_slots), span)
 }
 
+// compile_chained_index handles a[i][j] where the object is not a plain identifier.
+// Supports two-level chained indexing on Array[Array[T,N],M], Slice[Array[T,N]],
+// Slice[Slice[T]], and Array[Slice[T],M].
+@private
+compile_chained_index :: proc(c: ^Compiler, e: parser.IndexExpression, obj_expr: parser.Expression, span: lexer.Span) {
+	// e.object must be an IndexExpression (the inner a[i])
+	inner_ie, is_inner_ie := obj_expr.(parser.IndexExpression)
+	if !is_inner_ie {
+		compiler_error(c, "index: only local array/slice indexing is supported", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+
+	// Resolve the base local (must be ident for now; array-literal objects are also handled)
+	base_node := c.ast.nodes[int(inner_ie.object)]
+	base_expr, ok := base_node.(parser.Expression)
+	if !ok {
+		compiler_error(c, "index: base of chained index is not an expression", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+
+	inner_total := 0        // slots that a[i] pushes onto the stack
+	outer_type_idx := parser.TypeIdx(parser.INVALID_IDX) // element type of the base container
+
+	if base_id, ok2 := base_expr.(parser.IdentExpression); ok2 {
+		name := lexer.Token(base_id).data
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			loc := c.bc.locals[i]
+			if loc.name != name { continue }
+			if loc.array_elem_slots > 0 {
+				inner_total    = loc.array_elem_slots
+				outer_type_idx = loc.array_elem_type_idx
+			} else if loc.slice_elem_slots > 0 {
+				inner_total    = loc.slice_elem_slots
+				outer_type_idx = loc.slice_elem_type_idx
+			}
+			break
+		}
+	} else if base_ale, ok2 := base_expr.(parser.ArrayLiteralExpression); ok2 {
+		inner_total    = type_slot_count(c, base_ale.elem_type)
+		outer_type_idx = base_ale.elem_type
+	}
+
+	if inner_total == 0 || u32(outer_type_idx) == parser.INVALID_IDX {
+		compiler_error(c, "index: cannot determine element type for chained indexing", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+
+	// Determine whether the inner result is an array or a slice.
+	inner_is_array := false
+	inner_is_slice := false
+	inner_elem_slots := 0
+
+	if elem_ty, ok3 := c.ast.nodes[int(outer_type_idx)].(parser.Type); ok3 {
+		if eat, ok4 := elem_ty.(parser.ArrayType); ok4 {
+			inner_is_array   = true
+			inner_elem_slots = type_slot_count(c, eat.elem)
+		} else if gt, ok4 := elem_ty.(parser.GenericType); ok4 && gt.name.data == "Slice" {
+			inner_is_slice   = true
+			if len(gt.args) > 0 { inner_elem_slots = type_slot_count(c, gt.args[0]) }
+		}
+	}
+
+	if !inner_is_array && !inner_is_slice {
+		compiler_error(c, "index: inner element type is not indexable", span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+
+	// Emit: compile a[i], compile j, then stack-based indexing opcode.
+	compile_expr(c, e.object)
+	compile_expr(c, e.index)
+
+	if inner_is_array {
+		emit(&c.bc, .ARRAY_GET_STACK, span)
+		emit_byte(&c.bc, u8(inner_total), span)
+		emit_byte(&c.bc, u8(inner_elem_slots), span)
+	} else {
+		emit(&c.bc, .SLICE_GET_STACK, span)
+		emit_byte(&c.bc, u8(inner_elem_slots), span)
+	}
+}
+
 // compile_index_set writes one element into a local array or slice.
 // Precondition: the value is already on the stack (from compile_assignment).
 compile_index_set :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.Span) {
@@ -2358,7 +2551,48 @@ compile_index_set :: proc(c: ^Compiler, e: parser.IndexExpression, span: lexer.S
 	obj_expr, ok := obj_node.(parser.Expression)
 	if !ok { compiler_error(c, "index assign: object is not an expression", span); return }
 	id, is_ident := obj_expr.(parser.IdentExpression)
-	if !is_ident { compiler_error(c, "index assign: only local array/slice indexing is supported", span); return }
+	if !is_ident {
+		// Chained assignment: c[i][j] = val where obj_expr is IndexExpression
+		inner_ie, is_ie := obj_expr.(parser.IndexExpression)
+		if !is_ie { compiler_error(c, "index assign: only local array/slice indexing is supported", span); return }
+		// Base must be a plain ident
+		base_node := c.ast.nodes[int(inner_ie.object)]
+		base_expr, ok2 := base_node.(parser.Expression)
+		if !ok2 { compiler_error(c, "index assign: chained base is not an expression", span); return }
+		base_id, ok3 := base_expr.(parser.IdentExpression)
+		if !ok3 { compiler_error(c, "index assign: chained base must be a local variable", span); return }
+		name := lexer.Token(base_id).data
+		base_slot, _, found := resolve_local(&c.bc, name)
+		if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); return }
+		// Get outer_elem_slots and inner_elem_type_idx from the local
+		outer_elem_slots := 0
+		outer_type_idx   := parser.TypeIdx(parser.INVALID_IDX)
+		for i := len(c.bc.locals) - 1; i >= 0; i -= 1 {
+			if c.bc.locals[i].name == name {
+				outer_elem_slots = c.bc.locals[i].array_elem_slots
+				outer_type_idx   = c.bc.locals[i].array_elem_type_idx
+				break
+			}
+		}
+		if outer_elem_slots == 0 { compiler_error(c, fmt.tprintf("'%s' is not a 2D array", name), span); return }
+		// Determine inner_elem_slots from the outer element type
+		inner_elem_slots := 1
+		if u32(outer_type_idx) != parser.INVALID_IDX {
+			if elem_ty, ok4 := c.ast.nodes[int(outer_type_idx)].(parser.Type); ok4 {
+				if eat, ok5 := elem_ty.(parser.ArrayType); ok5 {
+					inner_elem_slots = type_slot_count(c, eat.elem)
+				}
+			}
+		}
+		// val already on stack; compile outer index then inner index
+		compile_expr(c, inner_ie.index)  // i
+		compile_expr(c, e.index)         // j
+		emit(&c.bc, .ARRAY_SET_CHAINED, span)
+		emit_byte(&c.bc, u8(base_slot), span)
+		emit_byte(&c.bc, u8(outer_elem_slots), span)
+		emit_byte(&c.bc, u8(inner_elem_slots), span)
+		return
+	}
 	name := lexer.Token(id).data
 	slot, _, found := resolve_local(&c.bc, name)
 	if !found { compiler_error(c, fmt.tprintf("undefined variable '%s'", name), span); return }

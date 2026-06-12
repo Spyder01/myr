@@ -4,13 +4,10 @@ import "../../lexer"
 
 // peephole_optimize fuses common instruction sequences into superinstructions,
 // recurses into nested functions, then compacts all NOP padding bytes.
-peephole_optimize :: proc(fn: ^Function) {
-	for val in fn.chunk.constants {
-		if nested, ok := val.(^Function); ok {
-			peephole_optimize(nested)
-		}
+peephole_optimize :: proc(module: ^Module) {
+	for fn in module.functions {
+		if fn != nil { peephole_optimize_chunk(&fn.chunk) }
 	}
-	peephole_optimize_chunk(&fn.chunk)
 }
 
 @private
@@ -286,27 +283,35 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 		}
 
 		// ── GET_LOCAL s; RETURN n → RETURN_LOCAL s n; NOP ──────────────────────
+		// Only safe when n == 1 (single-slot scalar return). Multi-slot returns
+		// (structs, enums) push several GET_LOCALs before RETURN n; fusing the
+		// last GET_LOCAL would discard all but the last slot.
 		if op == .GET_LOCAL && i+4 <= n && Opcode(code[i+2]) == .RETURN {
-			slot := code[i+1]
 			ret_n := code[i+3]
-			code[i]   = u8(Opcode.RETURN_LOCAL)
-			code[i+1] = slot
-			code[i+2] = ret_n
-			code[i+3] = u8(Opcode.NOP)
-			i += 4
-			continue
+			if ret_n == 1 {
+				slot := code[i+1]
+				code[i]   = u8(Opcode.RETURN_LOCAL)
+				code[i+1] = slot
+				code[i+2] = ret_n
+				code[i+3] = u8(Opcode.NOP)
+				i += 4
+				continue
+			}
 		}
 
 		// ── CONST c; RETURN n → RETURN_CONST c n; NOP ──────────────────────────
+		// Same guard: only fuse for single-slot returns.
 		if op == .CONST && i+4 <= n && Opcode(code[i+2]) == .RETURN {
-			c_idx := code[i+1]
 			ret_n := code[i+3]
-			code[i]   = u8(Opcode.RETURN_CONST)
-			code[i+1] = c_idx
-			code[i+2] = ret_n
-			code[i+3] = u8(Opcode.NOP)
-			i += 4
-			continue
+			if ret_n == 1 {
+				c_idx := code[i+1]
+				code[i]   = u8(Opcode.RETURN_CONST)
+				code[i+1] = c_idx
+				code[i+2] = ret_n
+				code[i+3] = u8(Opcode.NOP)
+				i += 4
+				continue
+			}
 		}
 
 		i += instr_size(code[:], i)
@@ -323,25 +328,42 @@ compact_nops :: proc(chunk: ^Chunk) {
 	spans := &chunk.spans
 	n     := len(code)
 
-	// bail early if there is nothing to remove
+	// bail early if there is nothing to remove.
+	// Scan instruction-by-instruction: an operand byte that happens to equal
+	// NOP's opcode value must NOT be mistaken for a real NOP instruction.
 	has_nop := false
-	for b in code { if Opcode(b) == .NOP { has_nop = true; break } }
+	{
+		j := 0
+		for j < n {
+			if Opcode(code[j]) == .NOP { has_nop = true; break }
+			j += instr_size(code[:], j)
+		}
+	}
 	if !has_nop { return }
 
-	// Pass 1: build old→new and new→old position maps
+	// Pass 1: build old→new and new→old position maps.
+	// Instruction-level scan: all bytes of a multi-byte instruction are mapped
+	// as a unit, preventing operand bytes from being misidentified as NOPs.
 	old_to_new := make([]int, n + 1)
 	defer delete(old_to_new)
 	new_to_old := make([]int, n)      // max possible size; actual used = total_new
 	defer delete(new_to_old)
 
 	new_pos := 0
-	for old in 0..<n {
-		if Opcode(code[old]) == .NOP {
-			old_to_new[old] = -1      // filled in below
-		} else {
-			old_to_new[old] = new_pos
-			new_to_old[new_pos] = old
-			new_pos += 1
+	{
+		old := 0
+		for old < n {
+			sz := instr_size(code[:], old)
+			if Opcode(code[old]) == .NOP {
+				old_to_new[old] = -1  // filled in by backward resolve below
+			} else {
+				for k in 0..<sz {
+					old_to_new[old + k] = new_pos + k
+					new_to_old[new_pos + k] = old + k
+				}
+				new_pos += sz
+			}
+			old += sz
 		}
 	}
 	old_to_new[n] = new_pos          // end-of-code sentinel
@@ -356,13 +378,20 @@ compact_nops :: proc(chunk: ^Chunk) {
 
 	total_new := new_pos
 
-	// Pass 2: copy non-NOP bytes into fresh arrays
+	// Pass 2: copy non-NOP instructions into fresh arrays (instruction-level).
 	new_code  := make([dynamic]u8,         0, total_new)
 	new_spans := make([dynamic]lexer.Span, 0, total_new)
-	for old in 0..<n {
-		if Opcode(code[old]) != .NOP {
-			append(&new_code,  code[old])
-			append(&new_spans, spans[old])
+	{
+		old := 0
+		for old < n {
+			sz := instr_size(code[:], old)
+			if Opcode(code[old]) != .NOP {
+				for k in 0..<sz {
+					append(&new_code,  code[old + k])
+					append(&new_spans, spans[old + k])
+				}
+			}
+			old += sz
 		}
 	}
 
@@ -422,14 +451,18 @@ instr_size :: proc(code: []u8, pos: int) -> int {
 	     .JUMP_IF_FALSE_POP, .JUMP_IF_TRUE_POP,
 	     .ADD_LOCALS, .MUL_LOCALS, .SUB_LOCALS, .DIV_LOCALS, .MOD_LOCALS,
 	     .LT_LOCALS, .LTE_LOCALS, .GT_LOCALS, .GTE_LOCALS,
-	     .ARRAY_GET, .ARRAY_SET, .SLICE_SET,
+	     .ARRAY_GET, .ARRAY_SET, .ARRAY_GET_STACK, .SLICE_SET,
 	     .RETURN_LOCAL, .RETURN_CONST,
-	     .MOD_LOCAL_LOCAL_EQ_ZERO:
+	     .MOD_LOCAL_LOCAL_EQ_ZERO,
+	     .LOAD_FN:
 		return 3
+	case .SLICE_GET_STACK:
+		return 2
 	case .SQUARE_I64, .SQUARE_F64:
 		return 2
 	case .LT_LOCAL_CONST, .LTE_LOCAL_CONST, .SUB_LOCAL_CONST,
-	     .GT_LOCAL_CONST, .GTE_LOCAL_CONST, .EQ_LOCAL_CONST:
+	     .GT_LOCAL_CONST, .GTE_LOCAL_CONST, .EQ_LOCAL_CONST,
+	     .ARRAY_SET_CHAINED:
 		return 4
 	}
 	return 1

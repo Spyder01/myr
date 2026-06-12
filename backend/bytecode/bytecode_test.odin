@@ -82,10 +82,9 @@ test_values_equal_different_types :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_values_equal_functions_never_equal :: proc(t: ^testing.T) {
-	fn := new_function("foo", 0)
-	defer function_free(fn)
-	testing.expect(t, !values_equal(Value(fn), Value(fn)), "functions are never equal")
+test_values_equal_functions_same_index :: proc(t: ^testing.T) {
+	testing.expect(t,  values_equal(Value(FnRef(1)), Value(FnRef(1))), "same FnRef should be equal")
+	testing.expect(t, !values_equal(Value(FnRef(1)), Value(FnRef(2))), "different FnRef should not be equal")
 }
 
 // ---- chunk_add_constant ----

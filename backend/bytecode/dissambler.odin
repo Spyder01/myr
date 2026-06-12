@@ -10,15 +10,12 @@ disassemble_chunk :: proc(chunk: ^Chunk, name: string) {
     }
 }
 
-// disassemble_all disassembles a function and every nested function reachable
-// through its constant pool, recursively. This is the right call for --dump.
-disassemble_all :: proc(fn: ^Function) {
-    disassemble_chunk(&fn.chunk, fn.name)
-    for constant in fn.chunk.constants {
-        if nested, ok := constant.(^Function); ok {
-            fmt.println()
-            disassemble_all(nested)
-        }
+// disassemble_all disassembles every function in the module's flat table.
+disassemble_all :: proc(module: ^Module) {
+    for fn, i in module.functions {
+        if fn == nil { continue }
+        disassemble_chunk(&fn.chunk, fn.name)
+        if i < len(module.functions) - 1 { fmt.println() }
     }
 }
 
@@ -89,9 +86,12 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .ADDR_LOCAL:   return byte_instruction("ADDR_LOCAL",     chunk, offset)
     case .MAKE_SLICE:   return byte_instruction("MAKE_SLICE",     chunk, offset)
     case .SLICE_GET:    return byte_instruction("SLICE_GET",      chunk, offset)
-    case .ARRAY_GET:    return two_byte_instruction("ARRAY_GET",  chunk, offset)
-    case .ARRAY_SET:    return two_byte_instruction("ARRAY_SET",  chunk, offset)
-    case .SLICE_SET:    return two_byte_instruction("SLICE_SET",  chunk, offset)
+    case .ARRAY_GET:       return two_byte_instruction("ARRAY_GET",       chunk, offset)
+    case .ARRAY_SET:       return two_byte_instruction("ARRAY_SET",       chunk, offset)
+    case .ARRAY_GET_STACK:   return two_byte_instruction("ARRAY_GET_STACK",   chunk, offset)
+    case .ARRAY_SET_CHAINED: return three_byte_instruction("ARRAY_SET_CHAINED", chunk, offset)
+    case .SLICE_SET:         return two_byte_instruction("SLICE_SET",           chunk, offset)
+    case .SLICE_GET_STACK: return byte_instruction("SLICE_GET_STACK",     chunk, offset)
 
     // Superinstructions — _LOCALS (3 bytes: opcode a b)
     case .ADD_LOCALS:   return two_byte_instruction("ADD_LOCALS",   chunk, offset)
@@ -118,6 +118,13 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .JUMP_IF_TRUE_POP:  return jump_instruction("JUMP_IF_TRUE_POP",  1, chunk, offset)
     // SET_LOCAL_POP (2 bytes: opcode slot)
     case .SET_LOCAL_POP: return byte_instruction("SET_LOCAL_POP", chunk, offset)
+    // LOAD_FN (3 bytes: opcode hi lo) — push FnRef(idx) onto the stack
+    case .LOAD_FN:
+        hi  := u16(chunk.code[offset+1]) << 8
+        lo  := u16(chunk.code[offset+2])
+        idx := hi | lo
+        fmt.printf("%-16s %4d\n", "LOAD_FN", idx)
+        return offset + 3
     // RETURN_LOCAL (3 bytes: opcode slot n), RETURN_CONST (3 bytes: opcode const_idx n)
     case .RETURN_LOCAL:  return two_byte_instruction("RETURN_LOCAL",  chunk, offset)
     case .RETURN_CONST:  return const_return_instruction("RETURN_CONST", chunk, offset)
@@ -235,7 +242,7 @@ print_value :: proc(val: Value) {
     case bool:      fmt.printf("%t", v)
     case string:    fmt.printf("\"%s\"", v)
     case Nil:       fmt.printf("nil")
-    case ^Function: fmt.printf("<fn %s>", v.name)
+    case FnRef:     fmt.printf("<fn#%d>", int(v))
     case [^]Value:
         if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
     }

@@ -10,23 +10,26 @@ import "../../../lexer"
 
 dummy_span :: proc() -> lexer.Span { return {} }
 
-// build a function using the compiler and extract it
-build_fn :: proc(name: string, build: proc(^bc.ByteCodeCompiler)) -> ^Function {
+// build a single-function module using the compiler
+build_fn :: proc(name: string, build: proc(^bc.ByteCodeCompiler)) -> ^bc.Module {
 	comp := bc.new_bytecode_compiler(name, 0)
 	build(&comp)
-	return bc.compiler_end(&comp)
+	fn := bc.compiler_end(&comp)
+	m  := bc.new_module()
+	append(&m.functions, fn)
+	return m
 }
 
-run :: proc(fn: ^Function) -> Maybe(VMError) {
+run :: proc(m: ^bc.Module) -> Maybe(VMError) {
 	vm := new_vm()
 	defer destroy_vm(&vm)
-	return vm_interpret(&vm, fn)
+	return vm_interpret(&vm, m)
 }
 
-run_top :: proc(fn: ^Function) -> Value {
+run_top :: proc(m: ^bc.Module) -> Value {
 	vm := new_vm()
 	defer destroy_vm(&vm)
-	vm_interpret(&vm, fn)
+	vm_interpret(&vm, m)
 	if vm.stack_top == 0 do return Nil{}
 	return vm.stack[vm.stack_top - 1]
 }
@@ -95,7 +98,7 @@ test_run_add_ints :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	result := run_top(fn)
 	testing.expect_value(t, result.(i64), i64(3))
 }
@@ -110,7 +113,7 @@ test_run_sub :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(7))
 }
 
@@ -124,7 +127,7 @@ test_run_mul :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(20))
 }
 
@@ -137,7 +140,7 @@ test_run_negate :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(-5))
 }
 
@@ -151,7 +154,7 @@ test_run_type_error :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.TYPE_ERROR))
 }
 
@@ -167,7 +170,7 @@ test_run_div :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(5))
 }
 
@@ -181,7 +184,7 @@ test_run_division_by_zero :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.DIVISION_BY_ZERO))
 }
 
@@ -197,7 +200,7 @@ test_run_lt_true :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(bool), true)
 }
 
@@ -211,7 +214,7 @@ test_run_lt_false :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(bool), false)
 }
 
@@ -225,7 +228,7 @@ test_run_eq_true :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(bool), true)
 }
 
@@ -239,7 +242,7 @@ test_run_true :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(bool), true)
 }
 
@@ -252,7 +255,7 @@ test_run_not :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(bool), false)
 }
 
@@ -266,7 +269,7 @@ test_run_nil :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	result := run_top(fn)
 	_, ok := result.(Nil)
 	testing.expect(t, ok, "expected Nil value")
@@ -290,7 +293,7 @@ test_run_define_get_global :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(42))
 }
 
@@ -298,17 +301,17 @@ test_run_define_get_global :: proc(t: ^testing.T) {
 test_run_undefined_global :: proc(t: ^testing.T) {
 	// Globals are now slot-indexed: an uninitialized slot holds nil (zero Value),
 	// not an error. Verify that reading slot 0 without a prior DEFINE_GLOBAL returns nil.
-	fn := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
+	m := build_fn("test", proc(c: ^bc.ByteCodeCompiler) {
 		span := dummy_span()
 		bc.emit(c, .GET_GLOBAL, span)
 		bc.emit_byte(c, 0, span)       // slot 0, never defined
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(m)
 	vm := new_vm()
 	defer destroy_vm(&vm)
-	vm_interpret(&vm, fn)
+	vm_interpret(&vm, m)
 	testing.expect(t, vm.stack[0] == nil, "uninitialized global slot should be nil")
 }
 
@@ -432,7 +435,7 @@ test_run_pop :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	// after POP, only the first constant (1) remains
 	testing.expect_value(t, run_top(fn).(i64), i64(1))
 }
@@ -450,7 +453,7 @@ test_new_pushes_ptr :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	val := run_top(fn)
 	_, ok := val.([^]Value)
 	testing.expect(t, ok, "NEW must push a [^]Value onto the stack")
@@ -469,7 +472,7 @@ test_heap_get_offset_0 :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(10))
 }
 
@@ -486,7 +489,7 @@ test_heap_get_offset_1 :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(20))
 }
 
@@ -504,7 +507,7 @@ test_heap_load_top_slot :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(20))
 }
 
@@ -523,7 +526,7 @@ test_heap_load_first_slot :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(10))
 }
 
@@ -555,7 +558,7 @@ test_heap_set_write :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(99))
 }
 
@@ -578,7 +581,7 @@ test_heap_set_leaves_value_on_stack :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(77))
 }
 
@@ -593,7 +596,7 @@ test_heap_get_null_deref :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
 }
 
@@ -609,7 +612,7 @@ test_heap_set_null_deref :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
 }
 
@@ -624,7 +627,7 @@ test_heap_load_null_deref :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run(fn), Maybe(VMError)(.NULL_DEREF))
 }
 
@@ -649,7 +652,7 @@ test_enum_stack_circle_discriminant :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(0))
 }
 
@@ -666,7 +669,7 @@ test_enum_stack_circle_field_value :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(f64), f64(5.0))
 }
 
@@ -683,7 +686,7 @@ test_enum_stack_circle_padding_is_nil :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	_, is_nil := run_top(fn).(Nil)
 	testing.expect(t, is_nil, "padding slot must be nil")
 }
@@ -701,7 +704,7 @@ test_enum_stack_rect_discriminant :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(1))
 }
 
@@ -718,7 +721,7 @@ test_enum_stack_rect_first_field :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(f64), f64(10.0))
 }
 
@@ -735,7 +738,7 @@ test_enum_stack_rect_second_field :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(f64), f64(4.0))
 }
 
@@ -756,7 +759,7 @@ test_enum_stack_two_variants_distinct_discriminants :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(1))
 }
 
@@ -782,7 +785,7 @@ test_enum_stack_reassign_updates_discriminant :: proc(t: ^testing.T) {
 		bc.emit(c, .RETURN, span)
 		bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(1))
 }
 
@@ -848,7 +851,7 @@ test_vm_match_first_arm_fires :: proc(t: ^testing.T) {
 		bc.emit(c, .NIL, span)
 		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(77))
 }
 
@@ -890,7 +893,7 @@ test_vm_match_second_arm_fires :: proc(t: ^testing.T) {
 		bc.emit(c, .NIL, span)
 		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(42))
 }
 
@@ -928,7 +931,7 @@ test_vm_match_two_field_bindings :: proc(t: ^testing.T) {
 		bc.emit(c, .NIL, span)
 		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	testing.expect_value(t, run_top(fn).(i64), i64(10))
 }
 
@@ -970,7 +973,7 @@ test_vm_match_no_arm_produces_nil :: proc(t: ^testing.T) {
 		bc.emit(c, .NIL, span)
 		bc.emit(c, .RETURN, span); bc.emit_byte(c, 1, span)
 	})
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 	_, is_nil := run_top(fn).(Nil)
 	testing.expect(t, is_nil, "unmatched match must produce nil")
 }

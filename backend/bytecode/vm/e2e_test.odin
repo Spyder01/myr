@@ -27,7 +27,7 @@ run_source :: proc(source: string, stdin_data: string = "") -> (Value, Maybe(VME
 
 	fn, errs := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	if len(errs) > 0 || fn == nil do return Nil{}, nil
-	defer bc.function_free(fn)
+	defer bc.module_free(fn)
 
 	machine := new_vm()
 	defer destroy_vm(&machine)
@@ -2524,7 +2524,7 @@ test_e2e_str_char_eq :: proc(t: ^testing.T) {
 		}
 	`)
 	testing.expect_value(t, err, Maybe(VMError)(nil))
-	testing.expect_value(t, val, Value(true))
+	testing.expect_value(t, val, Value(bool(true)))
 }
 
 @test
@@ -2566,7 +2566,7 @@ test_e2e_str_traverse :: proc(t: ^testing.T) {
 		}
 	`)
 	testing.expect_value(t, err, Maybe(VMError)(nil))
-	testing.expect_value(t, val, Value(true))
+	testing.expect_value(t, val, Value(bool(true)))
 }
 
 @test
@@ -2618,4 +2618,61 @@ test_e2e_slice_fill_and_read_via_len :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Maybe(VMError)(nil))
 	// sum of 0+1+2+3+4+5 = 15
 	testing.expect_value(t, val, Value(i64(15)))
+}
+
+// ---- nested arrays: Array[Array[T, N], M] ----
+
+@test
+test_e2e_nested_array_read :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> i64 {
+			let mat: Array[Array[i64, 3], 2] = Array[Array[i64, 3], 2]{
+				Array[i64, 3]{1, 2, 3},
+				Array[i64, 3]{4, 5, 6}
+			}
+			return mat[1][2]
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(i64(6)))
+}
+
+@test
+test_e2e_nested_array_sum :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> i64 {
+			let mat: Array[Array[i64, 3], 2] = Array[Array[i64, 3], 2]{
+				Array[i64, 3]{1, 2, 3},
+				Array[i64, 3]{4, 5, 6}
+			}
+			let sum: i64 = 0
+			for let r: i64 = 0; r < 2; r += 1 {
+				for let c: i64 = 0; c < 3; c += 1 {
+					sum = sum + mat[r][c]
+				}
+			}
+			return sum
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	// 1+2+3+4+5+6 = 21
+	testing.expect_value(t, val, Value(i64(21)))
+}
+
+// ---- Slice[Array[T, N]] ----
+
+@test
+test_e2e_slice_of_array_read :: proc(t: ^testing.T) {
+	val, err := run_source(`
+		function main() -> i64 {
+			let s = Slice[Array[i64, 3]]{cap = 4}
+			let row0 = Array[i64, 3]{10, 20, 30}
+			let row1 = Array[i64, 3]{40, 50, 60}
+			s[0] = row0
+			s[1] = row1
+			return s[1][2]
+		}
+	`)
+	testing.expect_value(t, err, Maybe(VMError)(nil))
+	testing.expect_value(t, val, Value(i64(60)))
 }

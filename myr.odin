@@ -172,7 +172,7 @@ run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = fals
 	defer tc.tc_result_destroy(&tcr)
 
 	t0 = time.tick_now()
-	fn, comp_errors := bc.compile(&ast, tcr.types, tcr.type_table[:])
+	module, comp_errors := bc.compile(&ast, tcr.types, tcr.type_table[:])
 	t_bc := time.tick_since(t0)
 	if len(comp_errors) > 0 {
 		for e in comp_errors {
@@ -181,13 +181,13 @@ run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = fals
 		}
 		os.exit(1)
 	}
-	defer bc.function_free(fn)
+	defer bc.module_free(module)
 
-	bc.peephole_optimize(fn)
+	bc.peephole_optimize(module)
 	t_compile_total := time.tick_since(compile_start)
 
 	if dump {
-		bc.disassemble_all(fn)
+		bc.disassemble_all(module)
 		fmt.println()
 	}
 
@@ -204,7 +204,7 @@ run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = fals
 	t0 = time.tick_now()
 	machine := vm.new_vm()
 	defer vm.destroy_vm(&machine)
-	if vm_err := vm.vm_interpret(&machine, fn); vm_err != nil {
+	if vm_err := vm.vm_interpret(&machine, module); vm_err != nil {
 		fmt.eprintfln("%s: runtime error: %v", file, vm_err)
 		os.exit(1)
 	}
