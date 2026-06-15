@@ -4,13 +4,12 @@ import "core:fmt"
 import "core:mem/virtual"
 import "core:mem"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:time"
 import bc "backend/bytecode"
-import "backend/bytecode/vm"
+import "embed"
 import "parser"
-import nr "tree-walkers/nameresolution"
-import tc "tree-walkers/typechecker"
 
 VERSION :: "0.1.0"
 
@@ -111,108 +110,71 @@ cmd_dump :: proc(args: []string) {
 // ---- core pipeline ----
 
 run_file :: proc(file: string, dump: bool, execute: bool, show_time: bool = false) {
-	source_bytes, err := os.read_entire_file_from_path(file, context.allocator)
-	if err != os.ERROR_NONE {
+	source_bytes, read_err := os.read_entire_file_from_path(file, context.allocator)
+	if read_err != os.ERROR_NONE {
 		fmt.eprintfln("error: could not read '%s'", file)
 		os.exit(1)
 	}
 	defer delete(source_bytes)
 	source := string(source_bytes)
 
+	state := embed.myr_new()
+	defer embed.myr_free(&state)
+	embed.myr_register(&state, "print", cli_print_native)
+
+	source_dir := filepath.dir(file)
+	if source_dir == "" { source_dir = "." }
+	source_file := filepath.base(file)
+
 	compile_start := time.tick_now()
+	compile_errors := embed.myr_compile(&state, source, source_dir, source_file)
+	t_compile := time.tick_since(compile_start)
 
-	t0 := time.tick_now()
-	p   := parser.new_parser(source)
-	ast := parser.parse_program(&p)
-	defer parser.ast_destroy(&ast)
-	t_parse := time.tick_since(t0)
-
-	if len(p.errors) > 0 {
-		for &e in p.errors {
-			fmt.eprintln(parser.decode_parser_error_message(&e, source))
-		}
-		delete(p.errors)
-		os.exit(1)
-	}
-	delete(p.errors)
-
-	t0 = time.tick_now()
-	nrr := nr.resolve_program(&ast)
-	t_nr := time.tick_since(t0)
-	if nrr.error_count > 0 {
-		for i in 0..<int(nrr.error_count) {
-			e := nrr.errors[i]
-			line, col := parser.offset_to_line_col(source, e.span.start)
+	if compile_errors != nil {
+		for e in compile_errors {
+			line, col := parser.offset_to_line_col(source, e.offset)
 			fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
 		}
-		nr.nr_result_destroy(&nrr)
+		delete(compile_errors)
 		os.exit(1)
 	}
-	defer nr.nr_result_destroy(&nrr)
-
-	t0 = time.tick_now()
-	tcr := tc.typecheck(&ast, &nrr)
-	t_tc := time.tick_since(t0)
-	if tcr.error_count > 0 {
-		for i in 0..<int(tcr.error_count) {
-			e := tcr.errors[i]
-			line, col := parser.offset_to_line_col(source, e.span.start)
-			if e.message != "" {
-				fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
-			} else {
-				exp := tc.type_id_name(e.expected, tcr.type_table[:])
-				got := tc.type_id_name(e.found, tcr.type_table[:])
-				fmt.eprintfln("%s:%d:%d: error: type mismatch: expected '%s', got '%s'",
-					file, line, col, exp, got)
-			}
-		}
-		tc.tc_result_destroy(&tcr)
-		os.exit(1)
-	}
-	defer tc.tc_result_destroy(&tcr)
-
-	t0 = time.tick_now()
-	module, comp_errors := bc.compile(&ast, tcr.types, tcr.type_table[:])
-	t_bc := time.tick_since(t0)
-	if len(comp_errors) > 0 {
-		for e in comp_errors {
-			line, col := parser.offset_to_line_col(source, e.span.start)
-			fmt.eprintfln("%s:%d:%d: error: %s", file, line, col, e.message)
-		}
-		os.exit(1)
-	}
-	defer bc.module_free(module)
-
-	bc.peephole_optimize(module)
-	t_compile_total := time.tick_since(compile_start)
 
 	if dump {
-		bc.disassemble_all(module)
+		bc.disassemble_all(state.module)
 		fmt.println()
 	}
 
-	if show_time {
-		fmt.eprintfln("  parse:    %v", t_parse)
-		fmt.eprintfln("  name-res: %v", t_nr)
-		fmt.eprintfln("  typecheck:%v", t_tc)
-		fmt.eprintfln("  bytecode: %v", t_bc)
-		fmt.eprintfln("  compile:  %v  (total)", t_compile_total)
-	}
+	if show_time { fmt.eprintfln("  compile:  %v", t_compile) }
 
 	if !execute do return
 
-	t0 = time.tick_now()
-	machine := vm.new_vm()
-	defer vm.destroy_vm(&machine)
-	if vm_err := vm.vm_interpret(&machine, module); vm_err != nil {
+	t0 := time.tick_now()
+	if vm_err := embed.myr_run(&state); vm_err != nil {
 		fmt.eprintfln("%s: runtime error: %v", file, vm_err)
 		os.exit(1)
 	}
 	t_run := time.tick_since(t0)
 
-	if show_time {
-		fmt.eprintfln("  run:      %v", t_run)
+	if show_time { fmt.eprintfln("  run:      %v", t_run) }
+}
+
+// cli_print_native is the default print implementation for the CLI.
+// Each argument is printed on its own line, matching the original PRINT opcode behaviour.
+cli_print_native :: proc(args: []bc.Value) -> bc.Value {
+	for arg in args {
+		switch v in arg {
+		case i64:       fmt.printf("%d", v)
+		case f64:       fmt.printf("%g", v)
+		case bool:      fmt.printf("%t", v)
+		case string:    fmt.printf("%s", v)
+		case bc.Nil:    fmt.printf("nil")
+		case bc.FnRef:  fmt.printf("<fn#%d>", int(v))
+		case [^]bc.Value:
+			if v == nil { fmt.printf("nil") } else { fmt.printf("<ptr>") }
+		}
+		fmt.println()
 	}
+	return bc.Nil{}
 }
 
 // ---- help ----

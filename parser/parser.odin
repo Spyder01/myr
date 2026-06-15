@@ -229,6 +229,26 @@ parse_type :: proc(p: ^Parser) -> TypeIdx {
 		return TypeIdx(len(p.ast.nodes) - 1)
 	}
 	tok := expect(p, .IDENT)
+	if peek(p) == .DOT {
+		// module-qualified type: math.Vec or math.Vec[T]
+		advance(p)
+		name := expect(p, .IDENT)
+		type_args: []TypeIdx = nil
+		if peek(p) == .LEFT_BRACKET {
+			advance(p)
+			args := make([dynamic]TypeIdx)
+			for peek(p) != .RIGHT_BRACKET && peek(p) != .EOF {
+				append_elem(&args, parse_type(p))
+				if peek(p) != .RIGHT_BRACKET { expect(p, .COMMA) }
+			}
+			expect(p, .RIGHT_BRACKET)
+			type_args = args[:]
+		}
+		qt := QualifiedType{module = tok, name = name, type_args = type_args}
+		append_elem(&p.ast.nodes, Node(Type(qt)))
+		append_elem(&p.ast.spans, tok.span)
+		return TypeIdx(len(p.ast.nodes) - 1)
+	}
 	if peek(p) == .LEFT_BRACKET {
 		if tok.data == "Array" {
 			return parse_array_type(p, tok)
@@ -767,10 +787,20 @@ parse_match_pattern :: proc(p: ^Parser) -> ExpressionIdx {
 		return ExpressionIdx(len(p.ast.nodes) - 1)
 	}
 
-	// Enum pattern: EnumName.VariantName { field, ... }
+	// Enum pattern: EnumName.VariantName { ... } or module.EnumName.VariantName { ... }
 	enum_name    := expect(p, .IDENT)
 	expect(p, .DOT)
 	variant_name := expect(p, .IDENT)
+	module_tok:  lexer.Token
+	has_module := false
+	if peek(p) == .DOT {
+		// module-qualified: the first two idents were module.Enum; the variant follows.
+		advance(p)
+		module_tok   = enum_name
+		enum_name    = variant_name
+		variant_name = expect(p, .IDENT)
+		has_module   = true
+	}
 	expect(p, .LEFT_BRACE)
 	fields := make([dynamic]StructLiteralField)
 	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
@@ -789,6 +819,8 @@ parse_match_pattern :: proc(p: ^Parser) -> ExpressionIdx {
 		enum_name    = enum_name,
 		variant_name = variant_name,
 		fields       = fields[:],
+		module       = module_tok,
+		has_module   = has_module,
 	}
 	append_elem(&p.ast.nodes, Node(Expression(pattern)))
 	append_elem(&p.ast.spans, enum_name.span)
@@ -857,13 +889,23 @@ parse_index :: proc(p: ^Parser, object: ExpressionIdx, op: lexer.Token) -> Expre
 @private
 parse_field_access :: proc(p: ^Parser, object: ExpressionIdx, op: lexer.Token) -> ExpressionIdx {
 	field := expect(p, .IDENT)
-	// Enum literal: EnumName.VariantName { field = value, ... }
-	// Detected when the object is a plain identifier followed immediately by a brace.
+	// A brace after a dotted name introduces a literal (struct or enum).
+	// One dot  `A.B {`   → EnumName.Variant or module.Struct (disambiguated downstream).
+	// Two dots `A.B.C {` → module.EnumName.Variant (always a qualified enum literal).
 	if peek(p) == .LEFT_BRACE && !p.no_struct_lit {
 		obj_node := p.ast.nodes[int(object)]
 		if obj_expr, ok := obj_node.(Expression); ok {
-			if id, ok2 := obj_expr.(IdentExpression); ok2 {
-				return parse_enum_literal(p, lexer.Token(id), field)
+			#partial switch obj in obj_expr {
+			case IdentExpression:
+				return parse_enum_literal(p, lexer.Token(obj), field)
+			case FieldAccessExpression:
+				// object is `A.B`; require A to be a plain identifier → module.B.field
+				inner := p.ast.nodes[int(obj.object)]
+				if inner_expr, ok2 := inner.(Expression); ok2 {
+					if mod, ok3 := inner_expr.(IdentExpression); ok3 {
+						return parse_enum_literal(p, obj.field, field, lexer.Token(mod), true)
+					}
+				}
 			}
 		}
 	}
@@ -874,7 +916,7 @@ parse_field_access :: proc(p: ^Parser, object: ExpressionIdx, op: lexer.Token) -
 }
 
 @private
-parse_enum_literal :: proc(p: ^Parser, enum_name: lexer.Token, variant_name: lexer.Token) -> ExpressionIdx {
+parse_enum_literal :: proc(p: ^Parser, enum_name: lexer.Token, variant_name: lexer.Token, module: lexer.Token = {}, has_module := false) -> ExpressionIdx {
 	expect(p, .LEFT_BRACE)
 	fields := make([dynamic]StructLiteralField)
 	for peek(p) != .RIGHT_BRACE && peek(p) != .EOF {
@@ -887,7 +929,7 @@ parse_enum_literal :: proc(p: ^Parser, enum_name: lexer.Token, variant_name: lex
 		}
 	}
 	expect(p, .RIGHT_BRACE)
-	expr := EnumLiteralExpression{enum_name = enum_name, variant_name = variant_name, fields = fields[:]}
+	expr := EnumLiteralExpression{enum_name = enum_name, variant_name = variant_name, fields = fields[:], module = module, has_module = has_module}
 	append_elem(&p.ast.nodes, Node(Expression(expr)))
 	append_elem(&p.ast.spans, enum_name.span)
 	return ExpressionIdx(len(p.ast.nodes) - 1)
@@ -950,7 +992,13 @@ parse_import_declarations :: proc(p: ^Parser) {
 	expect(p, .IMPORT)
 	path := expect(p, .STRING)
 
-	decl := ImportDecl(path)
+	decl := ImportDecl{path = path}
+	// `as` is a contextual keyword: it lexes as an identifier.
+	if peek(p) == .IDENT && peek_token(p).data == "as" {
+		advance(p)
+		decl.alias     = expect(p, .IDENT)
+		decl.has_alias = true
+	}
 
 	append_elem(&p.ast.nodes, Node(Declaration(decl)))
 	append_elem(&p.ast.spans, path.span)

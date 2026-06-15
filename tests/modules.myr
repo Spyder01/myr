@@ -1,0 +1,28 @@
+// Module system integration fixture. tests/ is one module (this program); math/ and
+// shapes/ are imported module directories. Covers qualified calls, aliasing, and
+// module-qualified struct/enum types + match patterns.
+import "math" as m
+import "shapes"
+
+function main() {
+    // qualified calls via alias; math/ internals call each other unqualified
+    print(m.add(3, 4))            // 7
+    print(m.square(5))            // 25
+    print(m.sum_of_squares(3, 4)) // 25
+
+    // qualified struct type, literal, and field access
+    let v: shapes.Vec = shapes.Vec{x = 3, y = 4}
+    print(v.x)                    // 3
+    print(v.y)                    // 4
+
+    // struct-returning qualified call
+    let w = shapes.make_vec(10, 20)
+    print(w.x)                    // 10
+
+    // qualified enum literal + match pattern
+    let c = shapes.Color.Red{v = 99}
+    match c {
+        shapes.Color.Red  {v} => { print(v) }   // 99
+        shapes.Color.Blue {v} => { print(v) }
+    }
+}

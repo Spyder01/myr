@@ -30,9 +30,12 @@ nr_result_destroy :: proc(r: ^NRResult) {
 Scope :: map[string]DefIdx
 
 NameResolver :: struct {
-	ast:    ^parser.AST,
-	scopes: [dynamic]Scope,
-	result: NRResult,
+	ast:            ^parser.AST,
+	scopes:         [dynamic]Scope, // scopes[0] = builtins; scopes[1..] = locals
+	module_tops:    [dynamic]Scope, // module_tops[k] = top-level symbols of module k
+	table:          ^parser.ModuleTable,
+	current_module: parser.ModuleId,
+	result:         NRResult,
 }
 
 @private
@@ -51,10 +54,27 @@ nr_define :: proc(nr: ^NameResolver, name: string, idx: DefIdx) {
 	nr.scopes[len(nr.scopes) - 1][name] = idx
 }
 
+// nr_lookup resolves a bare (unqualified) name. Lookup order enforces module
+// isolation: locals (inner→outer) → the current module's own top-level symbols →
+// builtins. Other modules' symbols are deliberately NOT consulted, so a bare
+// cross-module reference is "undefined" — access must be qualified (math.add).
 @private
 nr_lookup :: proc(nr: ^NameResolver, name: string) -> (DefIdx, bool) {
-	for i := len(nr.scopes) - 1; i >= 0; i -= 1 {
+	// locals
+	for i := len(nr.scopes) - 1; i >= 1; i -= 1 {
 		if idx, ok := nr.scopes[i][name]; ok {
+			return idx, true
+		}
+	}
+	// current module's top-level symbols
+	if int(nr.current_module) < len(nr.module_tops) {
+		if idx, ok := nr.module_tops[nr.current_module][name]; ok {
+			return idx, true
+		}
+	}
+	// builtins (scopes[0])
+	if len(nr.scopes) > 0 {
+		if idx, ok := nr.scopes[0][name]; ok {
 			return idx, true
 		}
 	}
@@ -68,47 +88,79 @@ nr_error :: proc(nr: ^NameResolver, span: lexer.Span, msg: string) {
 	nr.result.error_count += 1
 }
 
-resolve_program :: proc(ast: ^parser.AST) -> NRResult {
+resolve_program :: proc(ast: ^parser.AST, table: ^parser.ModuleTable = nil) -> NRResult {
+	// When no module table is supplied (single-file programs, unit tests), behave as
+	// one main module with no imports.
+	local_table: parser.ModuleTable
+	use_table := table
+	if use_table == nil {
+		local_table = parser.module_table_init()
+		use_table = &local_table
+	}
+	defer if table == nil { parser.module_table_destroy(&local_table) }
+
+	module_count := len(use_table.names)
 	nr := NameResolver{
-		ast    = ast,
-		scopes = make([dynamic]Scope),
+		ast         = ast,
+		scopes      = make([dynamic]Scope),
+		module_tops = make([dynamic]Scope, module_count),
+		table       = use_table,
 		result = NRResult{
 			resolutions = make(map[parser.ExpressionIdx]DefIdx),
 		},
 	}
+	for i in 0..<module_count { nr.module_tops[i] = make(Scope) }
 	defer {
 		for scope in nr.scopes { delete(scope) }
 		delete(nr.scopes)
+		for scope in nr.module_tops { delete(scope) }
+		delete(nr.module_tops)
 	}
 
-	nr_enter_scope(&nr)
-
-	// Register VM built-ins so they don't produce "undefined" errors.
+	// scopes[0] is the universal builtins scope, visible from every module.
 	// INVALID_DEF tells the type checker there is no backing AST node for these names.
+	nr_enter_scope(&nr)
 	nr_define(&nr, "print", INVALID_DEF)
 	nr_define(&nr, "input", INVALID_DEF)
 
-	// Pass 1: register all top-level names so bodies can reference them in any order
+	// Pass 1: register every top-level name into its OWNING module's scope so bodies
+	// can reference module-mates in any order while staying isolated from other modules.
+	// A name defined twice in the same module is an error — a directory is one module,
+	// so this usually means two independent programs were merged into one.
 	for node, i in ast.nodes {
 		decl, ok := node.(parser.Declaration)
 		if !ok do continue
+		mod := parser.module_of(use_table, i)
+		name: string
+		name_tok: lexer.Token
 		switch d in decl {
-		case parser.FunctionDecl: nr_define(&nr, d.name.data, DefIdx(i))
-		case parser.StructDecl:   nr_define(&nr, d.name.data, DefIdx(i))
-		case parser.EnumDecl:     nr_define(&nr, d.name.data, DefIdx(i))
-		case parser.ConstDecl:    nr_define(&nr, d.name.data, DefIdx(i))
-		case parser.ImportDecl:
+		case parser.FunctionDecl: name = d.name.data; name_tok = d.name
+		case parser.StructDecl:   name = d.name.data; name_tok = d.name
+		case parser.EnumDecl:     name = d.name.data; name_tok = d.name
+		case parser.ConstDecl:    name = d.name.data; name_tok = d.name
+		case parser.ImportDecl:   continue
 		}
+		if _, exists := nr.module_tops[mod][name]; exists {
+			if use_table.names[mod] == "" {
+				nr_error(&nr, name_tok.span, fmt.tprintf(
+					"duplicate definition of '%s' — a directory is one module; give each program its own directory", name))
+			} else {
+				nr_error(&nr, name_tok.span, fmt.tprintf(
+					"duplicate definition of '%s' in module '%s'", name, use_table.names[mod]))
+			}
+			continue // keep the first definition
+		}
+		nr.module_tops[mod][name] = DefIdx(i)
 	}
 
-	// Pass 2: resolve identifier references inside every declaration body
+	// Pass 2: resolve identifier references inside every declaration body, with
+	// current_module set so unqualified lookups stay within the owning module.
 	for node, i in ast.nodes {
 		decl, ok := node.(parser.Declaration)
 		if !ok do continue
+		nr.current_module = parser.module_of(use_table, i)
 		nr_resolve_decl(&nr, DefIdx(i), decl)
 	}
-
-	nr_exit_scope(&nr)
 
 	return nr.result
 }
@@ -225,6 +277,23 @@ nr_resolve_expr :: proc(nr: ^NameResolver, idx: parser.ExpressionIdx) {
 		}
 
 	case parser.FieldAccessExpression:
+		// Qualified module access: `alias.member` where `alias` is in scope as an
+		// import of the current module. Resolve the member in the target module's
+		// top-level scope and record it so the type checker can type the access.
+		obj_node := nr.ast.nodes[int(e.object)]
+		if obj_expr, ok := obj_node.(parser.Expression); ok {
+			if obj_id, is_id := obj_expr.(parser.IdentExpression); is_id {
+				alias := lexer.Token(obj_id).data
+				if mod, is_alias := nr.table.aliases[nr.current_module][alias]; is_alias {
+					if def, found := nr.module_tops[mod][e.field.data]; found {
+						nr.result.resolutions[idx] = def
+					} else {
+						nr_error(nr, e.field.span, fmt.tprintf("module '%s' has no member '%s'", alias, e.field.data))
+					}
+					return
+				}
+			}
+		}
 		nr_resolve_expr(nr, e.object)
 		// field name resolved by the type checker once struct type is known
 

@@ -18,6 +18,9 @@ Value :: union {
 	[^]Value, // heap pointer: base of a contiguous heap-allocated Value slice
 }
 
+// NativeFn is the signature for host-language functions callable from Myr.
+NativeFn :: #type proc(args: []Value) -> Value
+
 Opcode :: enum u8 {
 	CONST,
 	CONST_LONG,
@@ -79,6 +82,7 @@ Opcode :: enum u8 {
 	POP,
 	PRINT,
 	INPUT,
+	CALL_NATIVE, // 2-byte operand: slot arity — pop arity args, call natives[slot], push result
 
 	// Superinstructions — peephole-fused
 	NOP,
@@ -131,6 +135,15 @@ Opcode :: enum u8 {
 	LT_I64, LTE_I64, GT_I64, GTE_I64,
 	LT_F64, LTE_F64, GT_F64, GTE_F64,
 	NEGATE_I64, NEGATE_F64,
+
+	// Fused compare-and-branch (5 bytes: a b hi lo). Evaluate the comparison of two
+	// i64 locals and branch forward by the offset when the result is FALSE — i.e.
+	// <CMP>_LOCALS followed by JUMP_IF_FALSE_POP, collapsed into one dispatch. This is
+	// the head of essentially every loop and `if`. The 2-byte offset follows the two
+	// local operands and is relative to the end of the instruction.
+	BRANCH_LT_LOCALS, BRANCH_LTE_LOCALS, BRANCH_GT_LOCALS, BRANCH_GTE_LOCALS,
+	// MOD_LOCAL_LOCAL_EQ_ZERO followed by JUMP_IF_FALSE_POP: branch when a % b != 0.
+	BRANCH_MOD_LL_NZ,
 }
 
 

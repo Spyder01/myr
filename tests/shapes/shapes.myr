@@ -1,0 +1,11 @@
+struct Vec { x: i64, y: i64 }
+
+enum Color {
+    Red  { v: i64 },
+    Blue { v: i64 },
+}
+
+// Intra-module call (unqualified) — files in a directory are one unit.
+function make_vec(a: i64, b: i64) -> Vec {
+    return Vec{x = a, y = b}
+}

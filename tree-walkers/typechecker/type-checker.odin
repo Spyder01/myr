@@ -7,14 +7,25 @@ import nr "../nameresolution"
 
 // ---- entry point ----
 
-typecheck :: proc(ast: ^parser.AST, nrr: ^nr.NRResult) -> TypecheckResult {
-	tc := new_type_checker(ast, nrr)
+typecheck :: proc(ast: ^parser.AST, nrr: ^nr.NRResult, table: ^parser.ModuleTable = nil) -> TypecheckResult {
+	// When no module table is supplied (single-file programs, unit tests), treat
+	// everything as one main module with no imports.
+	local_table: parser.ModuleTable
+	use_table := table
+	if use_table == nil {
+		local_table = parser.module_table_init()
+		use_table = &local_table
+	}
+	defer if table == nil { parser.module_table_destroy(&local_table) }
+
+	tc := new_type_checker(ast, nrr, use_table)
 
 	// Pass 1: register all top-level declaration signatures.
 	for node, i in ast.nodes {
 		decl, ok := node.(parser.Declaration)
 		if !ok do continue
 
+		tc.current_module = parser.module_of(use_table, i)
 		register_decl(&tc, nr.DefIdx(i), decl)
 	}
 
@@ -23,6 +34,7 @@ typecheck :: proc(ast: ^parser.AST, nrr: ^nr.NRResult) -> TypecheckResult {
 		decl, ok := node.(parser.Declaration)
 		if !ok do continue
 
+		tc.current_module = parser.module_of(use_table, i)
 		check_decl(&tc, nr.DefIdx(i), decl)
 	}
 
@@ -57,9 +69,11 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 
 	case parser.StructDecl:
 		if len(d.type_params) > 0 { return }
+		// Names are module-mangled so same-named types in different modules don't collide.
+		mname := mangle_name(tc, d.name.data)
 		// Pre-register a stub so self-referential fields (e.g. next: ^Node) can resolve this struct.
 		st_id := TypeId(len(tc.type_table))
-		append(&tc.type_table, TypeInfo(StructType{name = d.name.data}))
+		append(&tc.type_table, TypeInfo(StructType{name = mname}))
 		tc.types[int(def)] = st_id
 
 		field_names := make([]string, len(d.fields))
@@ -70,7 +84,7 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 		}
 		// Patch the stub with the resolved field data.
 		tc.type_table[st_id] = TypeInfo(StructType{
-			name        = d.name.data,
+			name        = mname,
 			field_names = field_names,
 			field_types = field_types,
 		})
@@ -98,7 +112,7 @@ register_decl :: proc(tc: ^Typechecker, def: nr.DefIdx, decl: parser.Declaration
 			}
 		}
 		et_id := TypeId(len(tc.type_table))
-		append(&tc.type_table, TypeInfo(EnumType{name = d.name.data, variants = variants}))
+		append(&tc.type_table, TypeInfo(EnumType{name = mangle_name(tc, d.name.data), variants = variants}))
 		tc.types[int(def)] = et_id
 
 	case parser.ImportDecl:
@@ -352,8 +366,9 @@ infer_inner :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx) -> TypeId {
 	case parser.NewExpression:
 		// new T{...} — same field checks as struct literal, returns ^T
 		inner_id := UNKNOWN_TYPE
+		new_key := mangle_name(tc, e.type_name.data)
 		for info, i in tc.type_table {
-			if st, ok2 := info.(StructType); ok2 && st.name == e.type_name.data {
+			if st, ok2 := info.(StructType); ok2 && st.name == new_key {
 				inner_id = TypeId(i)
 				found_st := st
 				for lit_field in e.fields {
@@ -537,6 +552,35 @@ infer_call :: proc(tc: ^Typechecker, call_idx: parser.ExpressionIdx, e: parser.C
 	return fn.return_type
 }
 
+// ---- module helpers ----
+
+// mangle_name returns the type-table key for a name defined in, or referenced
+// unqualified within, the module currently being checked.
+@private
+mangle_name :: proc(tc: ^Typechecker, name: string) -> string {
+	return parser.mangle(tc.table, tc.current_module, name)
+}
+
+// resolve_module_alias maps an import namespace visible in the current module to
+// its target module id.
+@private
+resolve_module_alias :: proc(tc: ^Typechecker, alias: string) -> (parser.ModuleId, bool) {
+	if int(tc.current_module) >= len(tc.table.aliases) { return parser.MAIN_MODULE, false }
+	m, ok := tc.table.aliases[tc.current_module][alias]
+	return m, ok
+}
+
+// find_type_by_key scans the type table for a struct or enum stored under the
+// given (already-mangled) name, returning its id.
+@private
+find_type_by_key :: proc(tc: ^Typechecker, key: string) -> (TypeId, bool) {
+	for info, i in tc.type_table {
+		if st, ok := info.(StructType); ok && st.name == key { return TypeId(i), true }
+		if et, ok := info.(EnumType);   ok && et.name == key { return TypeId(i), true }
+	}
+	return UNKNOWN_TYPE, false
+}
+
 // ---- type table helpers ----
 
 @private
@@ -579,13 +623,19 @@ resolve_named_type :: proc(tc: ^Typechecker, type_idx: parser.TypeIdx) -> TypeId
 		case "f32", "f64", "float":                          return FLOAT_TYPE
 		case "str", "string":                                return STRING_TYPE
 		}
-		for info, i in tc.type_table {
-			if st, ok2 := info.(StructType); ok2 && st.name == name {
-				return TypeId(i)
-			}
-			if et, ok2 := info.(EnumType); ok2 && et.name == name {
-				return TypeId(i)
-			}
+		// Unqualified type names resolve within the current module.
+		if id, ok2 := find_type_by_key(tc, mangle_name(tc, name)); ok2 {
+			return id
+		}
+		return UNKNOWN_TYPE
+
+	case parser.QualifiedType:
+		// module.Vec — qualified generic types are not supported in Phase 1.
+		if len(t.type_args) > 0 { return UNKNOWN_TYPE }
+		target, ok2 := resolve_module_alias(tc, t.module.data)
+		if !ok2 { return UNKNOWN_TYPE }
+		if id, ok3 := find_type_by_key(tc, parser.mangle(tc.table, target, t.name.data)); ok3 {
+			return id
 		}
 		return UNKNOWN_TYPE
 
@@ -694,8 +744,9 @@ infer_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: par
 	}
 	struct_type_id := UNKNOWN_TYPE
 	found_st: StructType
+	key := mangle_name(tc, e.type_name.data)
 	for info, i in tc.type_table {
-		if st, ok := info.(StructType); ok && st.name == e.type_name.data {
+		if st, ok := info.(StructType); ok && st.name == key {
 			struct_type_id = TypeId(i)
 			found_st = st
 			break
@@ -722,8 +773,42 @@ infer_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: par
 	return struct_type_id
 }
 
+// infer_qualified_struct_literal handles a one-dot literal `mod.Struct{...}` that
+// turned out to name a module-qualified struct rather than an enum variant.
+@private
+infer_qualified_struct_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, target: parser.ModuleId, struct_name: string, fields: []parser.StructLiteralField) -> TypeId {
+	key := parser.mangle(tc.table, target, struct_name)
+	struct_type_id, found := find_type_by_key(tc, key)
+	if !found {
+		tc_error_msg(tc, tc.ast.spans[int(idx)], fmt.tprintf("undefined struct '%s'", struct_name))
+		return UNKNOWN_TYPE
+	}
+	st, _ := tc.type_table[int(struct_type_id)].(StructType)
+	for lit_field in fields {
+		field_found := false
+		for j in 0..<len(st.field_names) {
+			if st.field_names[j] == lit_field.name.data {
+				check(tc, lit_field.value, st.field_types[j])
+				field_found = true
+				break
+			}
+		}
+		if !field_found {
+			tc_error_msg(tc, tc.ast.spans[int(idx)],
+				fmt.tprintf("unknown field '%s' on struct '%s'", lit_field.name.data, struct_name))
+		}
+	}
+	return struct_type_id
+}
+
 @private
 infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.FieldAccessExpression) -> TypeId {
+	// Qualified module member (math.add, math.PI): name resolution recorded the target
+	// definition on this node, so its type is the type of that definition.
+	if def, is_qualified := tc.nr.resolutions[idx]; is_qualified {
+		return type_of_def(tc, def)
+	}
+
 	obj_type := infer(tc, e.object)
 	if obj_type == UNKNOWN_TYPE do return UNKNOWN_TYPE
 	info, ok := get_type_info(tc, obj_type)
@@ -767,10 +852,30 @@ infer_field_access :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parse
 
 @private
 infer_enum_literal :: proc(tc: ^Typechecker, idx: parser.ExpressionIdx, e: parser.EnumLiteralExpression) -> TypeId {
+	// Determine which module owns the enum, and its mangled key.
+	enum_key: string
+	if e.has_module {
+		// math.Color.Red{...}
+		target, ok := resolve_module_alias(tc, e.module.data)
+		if !ok {
+			tc_error_msg(tc, tc.ast.spans[int(idx)], fmt.tprintf("unknown module '%s'", e.module.data))
+			return UNKNOWN_TYPE
+		}
+		enum_key = parser.mangle(tc.table, target, e.enum_name.data)
+	} else {
+		// A one-dot literal `A.B{...}` is ambiguous: it is either an enum variant
+		// (A = enum) or a module-qualified struct (A = imported module, B = struct).
+		// If A names an import of the current module, treat it as a struct literal.
+		if target, is_mod := resolve_module_alias(tc, e.enum_name.data); is_mod {
+			return infer_qualified_struct_literal(tc, idx, target, e.variant_name.data, e.fields)
+		}
+		enum_key = mangle_name(tc, e.enum_name.data)
+	}
+
 	enum_type_id := UNKNOWN_TYPE
 	found_et: EnumType
 	for info, i in tc.type_table {
-		if et, ok := info.(EnumType); ok && et.name == e.enum_name.data {
+		if et, ok := info.(EnumType); ok && et.name == enum_key {
 			enum_type_id = TypeId(i)
 			found_et = et
 			break

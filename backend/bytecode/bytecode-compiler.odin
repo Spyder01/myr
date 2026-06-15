@@ -67,13 +67,22 @@ Compiler :: struct {
 	inline_fn_name:     string,                  // non-empty when inlining (prevents recursion)
 	inline_result_slot: int,                     // stack slot holding the return value
 	inline_patches:     [dynamic]int,            // JUMP offsets to patch at inline exit
+	// natives — name → slot index for CALL_NATIVE emission
+	native_slots:       map[string]u8,
+	// module membership: table is shared (built by the loader), current_module is the
+	// module owning the declaration currently being compiled. Names are mangled by
+	// module so symbols from different modules never collide in the global/layout maps.
+	module_table:       ^parser.ModuleTable,
+	current_module:     parser.ModuleId,
 }
 
-new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> Compiler {
+new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil, native_names: []string = nil, table: ^parser.ModuleTable = nil) -> Compiler {
 	sl := new(map[string]StructLayout)
 	sl^ = make(map[string]StructLayout)
 	m := new_module()
 	append(&m.functions, nil) // index 0 reserved for __main__, filled in by compile
+	native_slots := make(map[string]u8)
+	for name, i in native_names { native_slots[name] = u8(i) }
 	return Compiler{
 		bc                = new_bytecode_compiler("__main__", 0),
 		ast               = ast,
@@ -90,6 +99,8 @@ new_compiler :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_tabl
 		global_slots             = make(map[string]u16),
 		inline_fns               = make(map[string]InlineFnInfo),
 		inline_patches           = make([dynamic]int),
+		native_slots             = native_slots,
+		module_table             = table,
 	}
 }
 
@@ -103,6 +114,32 @@ compiler_destroy :: proc(c: ^Compiler) {
 	delete(c.global_slots)
 	delete(c.inline_fns)
 	delete(c.inline_patches)
+	delete(c.native_slots)
+}
+
+// c_mangle returns the module-qualified key for a name defined in, or referenced
+// unqualified within, the module currently being compiled. Identity for the main
+// module, so single-file programs are byte-for-byte unchanged.
+c_mangle :: proc(c: ^Compiler, name: string) -> string {
+	return parser.mangle(c.module_table, c.current_module, name)
+}
+
+// c_alias maps an import namespace visible in the current module to its target id.
+c_alias :: proc(c: ^Compiler, alias: string) -> (parser.ModuleId, bool) {
+	if c.module_table == nil { return parser.MAIN_MODULE, false }
+	if int(c.current_module) >= len(c.module_table.aliases) { return parser.MAIN_MODULE, false }
+	m, ok := c.module_table.aliases[c.current_module][alias]
+	return m, ok
+}
+
+// lookup_const finds a compile-time constant, trying the bare name (local consts and
+// main-module consts) before the module-qualified key (consts from other modules).
+lookup_const :: proc(c: ^Compiler, name: string) -> (Value, bool) {
+	if v, ok := c.const_table[name]; ok { return v, true }
+	if key := c_mangle(c, name); key != name {
+		if v, ok := c.const_table[key]; ok { return v, true }
+	}
+	return nil, false
 }
 
 // assign_global_slot returns the runtime slot for a global name, allocating one if new.
@@ -116,19 +153,30 @@ assign_global_slot :: proc(c: ^Compiler, name: string) -> u16 {
 	return slot
 }
 
-compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil) -> (^Module, []CompilerError) {
-	c := new_compiler(ast, tc_types, tc_type_table)
+compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []tc.TypeInfo = nil, native_names: []string = nil, table: ^parser.ModuleTable = nil) -> (^Module, []CompilerError) {
+	// When no module table is supplied (single-file programs, unit tests), treat
+	// everything as one main module with no imports.
+	local_table: parser.ModuleTable
+	use_table := table
+	if use_table == nil {
+		local_table = parser.module_table_init()
+		use_table = &local_table
+	}
+	defer if table == nil { parser.module_table_destroy(&local_table) }
 
-	for node in ast.nodes {
+	c := new_compiler(ast, tc_types, tc_type_table, native_names, use_table)
+
+	for node, i in ast.nodes {
 		if decl, ok := node.(parser.Declaration); ok {
+			c.current_module = parser.module_of(use_table, i)
 			if sd, ok2 := decl.(parser.StructDecl); ok2 {
 				if len(sd.type_params) > 0 {
 					c.generic_struct_templates[sd.name.data] = sd
 				} else {
-					c.struct_layouts^[sd.name.data] = build_struct_layout(&c, sd)
+					c.struct_layouts^[c_mangle(&c, sd.name.data)] = build_struct_layout(&c, sd)
 				}
 			} else if ed, ok2 := decl.(parser.EnumDecl); ok2 {
-				c.enum_layouts[ed.name.data] = build_enum_layout(&c, ed)
+				c.enum_layouts[c_mangle(&c, ed.name.data)] = build_enum_layout(&c, ed)
 			} else if fn, ok2 := decl.(parser.FunctionDecl); ok2 {
 				if len(fn.type_params) > 0 {
 					c.generic_templates[fn.name.data] = fn
@@ -139,9 +187,12 @@ compile :: proc(ast: ^parser.AST, tc_types: []tc.TypeId = nil, tc_type_table: []
 
 	for node, i in ast.nodes {
 		if _, is_decl := node.(parser.Declaration); is_decl {
+			c.current_module = parser.module_of(use_table, i)
 			compile_decl(&c, parser.DeclarationIdx(i))
 		}
 	}
+
+	c.current_module = parser.MAIN_MODULE
 
 	// call main — leave its return value on the stack so __main__ returns it
 	main_slot := assign_global_slot(&c, "main")
@@ -174,20 +225,20 @@ compile_decl :: proc(c: ^Compiler, idx: parser.DeclarationIdx) {
 	switch d in node.(parser.Declaration) {
 	case parser.FunctionDecl:
 		if len(d.type_params) > 0 { return } // generic — already instantiated in pre-scan
-		compile_function(c, d, d.name.data, span)
+		compile_function(c, d, c_mangle(c, d.name.data), span)
 	case parser.ConstDecl:
 		if val, ok := eval_const_expr(c, d.value, span); ok {
-			c.const_table[d.name.data] = val
+			c.const_table[c_mangle(c, d.name.data)] = val
 		}
 	case parser.ImportDecl:
 		// skip for now
 	case parser.StructDecl:
 		if len(d.type_params) > 0 { return }
 		layout := build_struct_layout(c, d)
-		c.struct_layouts^[d.name.data] = layout
+		c.struct_layouts^[c_mangle(c, d.name.data)] = layout
 	case parser.EnumDecl:
 		layout := build_enum_layout(c, d)
-		c.enum_layouts[d.name.data] = layout
+		c.enum_layouts[c_mangle(c, d.name.data)] = layout
 	}
 }
 
@@ -320,6 +371,8 @@ compile_function :: proc(c: ^Compiler, d: parser.FunctionDecl, emit_name: string
 		module                   = c.module,
 		inline_fns               = c.inline_fns,
 		inline_patches           = make([dynamic]int),
+		module_table             = c.module_table,
+		current_module           = c.current_module,
 	}
 	compile_fn_body(&child, d.body)
 	emit(&child.bc, .RETURN, span)
@@ -589,6 +642,14 @@ compile_stmt :: proc(c: ^Compiler, idx: parser.StatementIdx) {
 		}
 
 	case parser.ExpressionStatement:
+		// An `if` in statement position discards its value — compile it without the
+		// NIL result placeholders and trailing POP (a win in hot loops).
+		if inner, ok := c.ast.nodes[int(s.expr)].(parser.Expression); ok {
+			if ifx, is_if := inner.(parser.IfExpression); is_if {
+				compile_if_stmt(c, ifx, span)
+				break
+			}
+		}
 		compile_expr(c, s.expr)
 		n := expr_slot_count(c, s.expr)
 		for _ in 0..<n {
@@ -722,7 +783,7 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		tok := lexer.Token(e)
 		name := tok.data
 		// const table is checked first — inlined as an immediate value
-		if val, ok := c.const_table[name]; ok {
+		if val, ok := lookup_const(c, name); ok {
 			emit_constant(&c.bc, val, span)
 			return
 		}
@@ -734,8 +795,9 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 				emit_byte(&c.bc, u8(slot + s), span)
 			}
 		} else {
+			// module-level global: keyed by the owning module
 			emit(&c.bc, .GET_GLOBAL, span)
-			emit_byte(&c.bc, u8(assign_global_slot(c, name)), span)
+			emit_byte(&c.bc, u8(assign_global_slot(c, c_mangle(c, name))), span)
 		}
 
 	case parser.UnaryExpression:
@@ -791,8 +853,41 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 		// check for print builtin
 		callee_node := c.ast.nodes[e.callee]
 		if expr, ok := callee_node.(parser.Expression); ok {
+			// Module-qualified call: alias.fn(args) — resolve the alias to its target
+			// module and key the global slot by the target's mangled function name,
+			// so same-named functions in different modules don't collide.
+			if fa, fa_ok := expr.(parser.FieldAccessExpression); fa_ok {
+				obj_node := c.ast.nodes[int(fa.object)]
+				if obj_expr, oe_ok := obj_node.(parser.Expression); oe_ok {
+					if obj_id, id_ok := obj_expr.(parser.IdentExpression); id_ok {
+						alias := lexer.Token(obj_id).data
+						if target, is_mod := c_alias(c, alias); is_mod {
+							key := parser.mangle(c.module_table, target, fa.field.data)
+							emit(&c.bc, .GET_GLOBAL, span)
+							emit_byte(&c.bc, u8(assign_global_slot(c, key)), span)
+							total := 0
+							for arg in e.args {
+								compile_expr(c, arg)
+								total += expr_slot_count(c, arg)
+							}
+							emit(&c.bc, .CALL, span)
+							emit_byte(&c.bc, u8(total), span)
+							return
+						}
+					}
+				}
+			}
 			if id, ok2 := expr.(parser.IdentExpression); ok2 {
 				fn_name := lexer.Token(id).data
+				// Check registered natives first.
+				root_c := c if c.root == nil else c.root
+				if slot, ok := root_c.native_slots[fn_name]; ok {
+					for arg in e.args { compile_expr(c, arg) }
+					emit(&c.bc, .CALL_NATIVE, span)
+					emit_byte(&c.bc, slot, span)
+					emit_byte(&c.bc, u8(len(e.args)), span)
+					return
+				}
 				switch fn_name {
 				case "print":
 					for arg in e.args {
@@ -810,10 +905,10 @@ compile_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) {
 					emit(&c.bc, .INPUT, span)
 					return
 				}
-				// Try inlining direct calls to eligible functions.
+				// Try inlining direct calls to eligible functions (keyed by mangled name).
 				if c.inline_fn_name == "" {
 					root_c := c if c.root == nil else c.root
-					if fn_info, ok := root_c.inline_fns[fn_name]; ok {
+					if fn_info, ok := root_c.inline_fns[c_mangle(c, fn_name)]; ok {
 						if len(e.args) == len(fn_info.decl.params) {
 							emit_inline_call(c, fn_info, e.args, span)
 							return
@@ -1054,6 +1149,38 @@ compile_if :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
 		emit(&c.bc, .NIL, span)
 		patch_jump(&c.bc, else_jump)
 	}
+}
+
+// compile_if_stmt compiles an `if` whose value is discarded (statement position).
+// Unlike compile_if it pushes no result, so no NIL placeholders and no trailing POP
+// are emitted — branches run purely for their side effects.
+compile_if_stmt :: proc(c: ^Compiler, e: parser.IfExpression, span: lexer.Span) {
+	compile_expr(c, e.condition)
+	then_jump, _ := emit_jump(&c.bc, .JUMP_IF_FALSE_POP, span)
+	compile_block_void(c, e.then_block)
+	if else_block, ok := e.else_block.?; ok {
+		else_jump, _ := emit_jump(&c.bc, .JUMP, span)
+		patch_jump(&c.bc, then_jump)
+		compile_block_void(c, else_block)
+		patch_jump(&c.bc, else_jump)
+	} else {
+		patch_jump(&c.bc, then_jump)
+	}
+}
+
+// compile_block_void compiles a block whose value is discarded: its statements run,
+// and any tail result expression is evaluated then popped. Leaves the stack balanced.
+compile_block_void :: proc(c: ^Compiler, block: parser.BlockExpression) {
+	c.bc.scope_depth += 1
+	for stmt in block.stmts {
+		compile_stmt(c, stmt)
+	}
+	if result, ok := block.result.?; ok {
+		compile_expr(c, result)
+		n := expr_slot_count(c, result)
+		for _ in 0..<n { emit(&c.bc, .POP, {}) }
+	}
+	end_scope(c)
 }
 
 compile_match :: proc(c: ^Compiler, e: parser.MatchExpression, span: lexer.Span) {
@@ -1337,7 +1464,7 @@ eval_const_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx, span: lexer.Spa
 
 	case parser.IdentExpression:
 		name := lexer.Token(e).data
-		if val, ok := c.const_table[name]; ok {
+		if val, ok := lookup_const(c, name); ok {
 			return val, true
 		}
 		compiler_error(c, "undefined constant", span)
@@ -1411,7 +1538,7 @@ try_fold_expr :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> (Value, bool) 
 
 	case parser.IdentExpression:
 		name := lexer.Token(e).data
-		if val, ok := c.const_table[name]; ok { return val, true }
+		if val, ok := lookup_const(c, name); ok { return val, true }
 		return Nil{}, false
 
 	case parser.UnaryExpression:
@@ -1548,12 +1675,20 @@ type_ann_enum_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	ty, ok := node.(parser.Type)
 	if !ok do return ""
 	if _, is_ptr := ty.(parser.PointerType); is_ptr do return ""
+	if qt, is_q := ty.(parser.QualifiedType); is_q {
+		if target, ok2 := c_alias(c, qt.module.data); ok2 {
+			key := parser.mangle(c.module_table, target, qt.name.data)
+			if _, ok3 := c.enum_layouts[key]; ok3 { return key }
+		}
+		return ""
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
-	if _, ok3 := c.enum_layouts[name]; ok3 {
-		return name
+	key := c_mangle(c, name)
+	if _, ok3 := c.enum_layouts[key]; ok3 {
+		return key
 	}
 	return ""
 }
@@ -1564,7 +1699,17 @@ expr_enum_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	if !ok do return ""
 	#partial switch e in expr {
 	case parser.EnumLiteralExpression:
-		return e.enum_name.data
+		if e.has_module {
+			if target, ok := c_alias(c, e.module.data); ok {
+				return parser.mangle(c.module_table, target, e.enum_name.data)
+			}
+			return ""
+		}
+		// A one-dot `A.B{...}` where A is a module alias is a struct literal, not an enum.
+		if _, is_mod := c_alias(c, e.enum_name.data); is_mod {
+			return ""
+		}
+		return c_mangle(c, e.enum_name.data)
 	case parser.IdentExpression:
 		if name := local_enum_type(&c.bc, lexer.Token(e).data); name != "" {
 			return name
@@ -1587,24 +1732,54 @@ expr_enum_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	return ""
 }
 
-call_return_enum_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
+// resolve_callee_fn finds the FunctionDecl a call targets and the module that owns
+// it. Handles unqualified calls (resolved within the current module) and qualified
+// `alias.fn` calls (resolved within the aliased module).
+resolve_callee_fn :: proc(c: ^Compiler, e: parser.CallExpression) -> (decl: parser.FunctionDecl, mod: parser.ModuleId, ok: bool) {
 	callee_node := c.ast.nodes[e.callee]
-	expr, ok := callee_node.(parser.Expression)
-	if !ok do return ""
-	id, ok2 := expr.(parser.IdentExpression)
-	if !ok2 do return ""
-	fn_name := lexer.Token(id).data
-	for node in c.ast.nodes {
-		decl, ok3 := node.(parser.Declaration)
-		if !ok3 do continue
-		fn, ok4 := decl.(parser.FunctionDecl)
-		if !ok4 do continue
-		if fn.name.data != fn_name do continue
-		ret_idx, has_ret := fn.return_type.?
-		if !has_ret do return ""
-		return type_ann_enum_name(c, ret_idx)
+	expr, is_expr := callee_node.(parser.Expression)
+	if !is_expr { return {}, parser.MAIN_MODULE, false }
+
+	fn_name: string
+	target := c.current_module
+	#partial switch ce in expr {
+	case parser.IdentExpression:
+		fn_name = lexer.Token(ce).data
+	case parser.FieldAccessExpression:
+		obj := c.ast.nodes[int(ce.object)]
+		oe, oe_ok := obj.(parser.Expression)
+		if !oe_ok { return {}, parser.MAIN_MODULE, false }
+		oid, id_ok := oe.(parser.IdentExpression)
+		if !id_ok { return {}, parser.MAIN_MODULE, false }
+		tm, is_mod := c_alias(c, lexer.Token(oid).data)
+		if !is_mod { return {}, parser.MAIN_MODULE, false }
+		target  = tm
+		fn_name = ce.field.data
+	case:
+		return {}, parser.MAIN_MODULE, false
 	}
-	return ""
+
+	for node, i in c.ast.nodes {
+		decl3, ok3 := node.(parser.Declaration)
+		if !ok3 { continue }
+		fn, ok4 := decl3.(parser.FunctionDecl)
+		if !ok4 { continue }
+		if fn.name.data != fn_name { continue }
+		if parser.module_of(c.module_table, i) != target { continue }
+		return fn, target, true
+	}
+	return {}, parser.MAIN_MODULE, false
+}
+
+call_return_enum_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
+	fn, mod, found := resolve_callee_fn(c, e)
+	if !found { return "" }
+	ret_idx, has_ret := fn.return_type.?
+	if !has_ret { return "" }
+	saved := c.current_module
+	c.current_module = mod
+	defer c.current_module = saved
+	return type_ann_enum_name(c, ret_idx)
 }
 
 local_slice_elem_slots :: proc(bc: ^ByteCodeCompiler, name: string) -> int {
@@ -1662,14 +1837,23 @@ type_slot_count :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> int {
 	if at, ok2 := ty.(parser.ArrayType); ok2 {
 		return at.size * type_slot_count(c, at.elem)
 	}
+	if qt, is_q := ty.(parser.QualifiedType); is_q {
+		if target, ok2 := c_alias(c, qt.module.data); ok2 {
+			key := parser.mangle(c.module_table, target, qt.name.data)
+			if layout, ok3 := c.struct_layouts^[key]; ok3 { return layout.total_slots }
+			if layout, ok3 := c.enum_layouts[key];    ok3 { return layout.total_slots }
+		}
+		return 1
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return 1
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
-	if layout, ok3 := c.struct_layouts^[name]; ok3 {
+	key := c_mangle(c, name)
+	if layout, ok3 := c.struct_layouts^[key]; ok3 {
 		return layout.total_slots
 	}
-	if layout, ok3 := c.enum_layouts[name]; ok3 {
+	if layout, ok3 := c.enum_layouts[key]; ok3 {
 		return layout.total_slots
 	}
 	return 1
@@ -1686,12 +1870,20 @@ type_ann_struct_name :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 		if _, found := c.struct_layouts^[mangled]; found { return mangled }
 		return ""
 	}
+	if qt, is_q := ty.(parser.QualifiedType); is_q {
+		if target, ok2 := c_alias(c, qt.module.data); ok2 {
+			key := parser.mangle(c.module_table, target, qt.name.data)
+			if _, ok3 := c.struct_layouts^[key]; ok3 { return key }
+		}
+		return ""
+	}
 	named, ok2 := ty.(parser.NamedType)
 	if !ok2 do return ""
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
-	if _, ok3 := c.struct_layouts^[name]; ok3 {
-		return name
+	key := c_mangle(c, name)
+	if _, ok3 := c.struct_layouts^[key]; ok3 {
+		return key
 	}
 	return ""
 }
@@ -1711,10 +1903,20 @@ type_ann_ptr_inner :: proc(c: ^Compiler, type_idx: parser.TypeIdx) -> string {
 	if gt, ok3 := inner_ty.(parser.GenericType); ok3 {
 		return generic_struct_mangled_name(c, gt.name.data, gt.args)
 	}
+	if qt, is_q := inner_ty.(parser.QualifiedType); is_q {
+		if target, ok3 := c_alias(c, qt.module.data); ok3 {
+			return parser.mangle(c.module_table, target, qt.name.data)
+		}
+		return ""
+	}
 	named, ok3 := inner_ty.(parser.NamedType)
 	if !ok3 do return ""
 	name := lexer.Token(named).data
 	if subst, has := c.type_subst[name]; has { name = subst }
+	// Return the mangled key only if it names a known struct; otherwise the bare
+	// name (e.g. a generic type parameter not yet substituted).
+	key := c_mangle(c, name)
+	if _, ok3 := c.struct_layouts^[key]; ok3 { return key }
 	return name
 }
 
@@ -1908,12 +2110,55 @@ build_enum_layout :: proc(c: ^Compiler, d: parser.EnumDecl) -> EnumLayout {
 	return EnumLayout{total_slots = 1 + max_field_slots, variants = variants}
 }
 
+// compile_qualified_struct_literal emits a one-dot literal `mod.Struct{...}` that
+// named a module-qualified struct rather than an enum variant.
+compile_qualified_struct_literal :: proc(c: ^Compiler, target: parser.ModuleId, struct_name: string, fields: []parser.StructLiteralField, span: lexer.Span) {
+	key := parser.mangle(c.module_table, target, struct_name)
+	layout, ok := c.struct_layouts^[key]
+	if !ok {
+		compiler_error(c, fmt.tprintf("undefined struct '%s'", struct_name), span)
+		emit(&c.bc, .NIL, span)
+		return
+	}
+	field_map := make(map[string]parser.ExpressionIdx)
+	defer delete(field_map)
+	for field in fields { field_map[field.name.data] = field.value }
+	for name in layout.field_names {
+		val_idx, has_val := field_map[name]
+		if !has_val {
+			compiler_error(c, fmt.tprintf("missing field '%s' in struct literal", name), span)
+			emit(&c.bc, .NIL, span)
+			continue
+		}
+		compile_expr(c, val_idx)
+	}
+}
+
 // compile_enum_literal emits a stack-allocated enum value:
 //   slot 0: integer discriminant (variant index in declaration order)
 //   slots 1..N: field values in variant declaration order
 //   slots N+1..total-1: NIL padding so all variants occupy the same number of slots
 compile_enum_literal :: proc(c: ^Compiler, e: parser.EnumLiteralExpression, span: lexer.Span) {
-	layout, ok := c.enum_layouts[e.enum_name.data]
+	// Resolve which module owns the enum, mirroring the type checker.
+	enum_key: string
+	if e.has_module {
+		target, is_mod := c_alias(c, e.module.data)
+		if !is_mod {
+			compiler_error(c, fmt.tprintf("unknown module '%s'", e.module.data), span)
+			emit(&c.bc, .NIL, span)
+			return
+		}
+		enum_key = parser.mangle(c.module_table, target, e.enum_name.data)
+	} else {
+		// A one-dot literal `A.B{...}` is a module-qualified struct literal when A
+		// names an import of the current module; otherwise it's an enum variant.
+		if target, is_mod := c_alias(c, e.enum_name.data); is_mod {
+			compile_qualified_struct_literal(c, target, e.variant_name.data, e.fields, span)
+			return
+		}
+		enum_key = c_mangle(c, e.enum_name.data)
+	}
+	layout, ok := c.enum_layouts[enum_key]
 	if !ok {
 		compiler_error(c, fmt.tprintf("undefined enum '%s'", e.enum_name.data), span)
 		emit(&c.bc, .NIL, span)
@@ -1967,58 +2212,40 @@ find_field :: proc(layout: StructLayout, field_name: string) -> (offset: int, sl
 }
 
 call_return_struct_type :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
-	callee_node := c.ast.nodes[e.callee]
-	expr, ok := callee_node.(parser.Expression)
-	if !ok do return ""
-	id, ok2 := expr.(parser.IdentExpression)
-	if !ok2 do return ""
-	fn_name := lexer.Token(id).data
-	for node in c.ast.nodes {
-		decl, ok3 := node.(parser.Declaration)
-		if !ok3 do continue
-		fn, ok4 := decl.(parser.FunctionDecl)
-		if !ok4 do continue
-		if fn.name.data != fn_name do continue
-		ret_idx, has_ret := fn.return_type.?
-		if !has_ret do return ""
-		if len(fn.type_params) == 0 {
-			return type_ann_struct_name(c, ret_idx)
-		}
-		// Generic function: infer substitution from args, resolve return type with it.
-		saved := make(map[string]string)
-		for k, v in c.type_subst { saved[k] = v }
-		for tp in fn.type_params {
-			concrete := infer_type_param(c, fn, tp.data, e.args)
-			if concrete != "" { c.type_subst[tp.data] = concrete }
-		}
-		result := type_ann_struct_name(c, ret_idx)
-		clear(&c.type_subst)
-		for k, v in saved { c.type_subst[k] = v }
-		delete(saved)
-		return result
+	fn, mod, found := resolve_callee_fn(c, e)
+	if !found { return "" }
+	ret_idx, has_ret := fn.return_type.?
+	if !has_ret { return "" }
+	saved_mod := c.current_module
+	c.current_module = mod
+	defer c.current_module = saved_mod
+	if len(fn.type_params) == 0 {
+		return type_ann_struct_name(c, ret_idx)
 	}
-	return ""
+	// Generic function: infer substitution from args, resolve return type with it.
+	saved := make(map[string]string)
+	for k, v in c.type_subst { saved[k] = v }
+	for tp in fn.type_params {
+		concrete := infer_type_param(c, fn, tp.data, e.args)
+		if concrete != "" { c.type_subst[tp.data] = concrete }
+	}
+	result := type_ann_struct_name(c, ret_idx)
+	clear(&c.type_subst)
+	for k, v in saved { c.type_subst[k] = v }
+	delete(saved)
+	return result
 }
 
 // call_return_ptr_inner returns "T" if the callee's return type is ^T, or "".
 call_return_ptr_inner :: proc(c: ^Compiler, e: parser.CallExpression) -> string {
-	callee_node := c.ast.nodes[e.callee]
-	expr, ok := callee_node.(parser.Expression)
-	if !ok do return ""
-	id, ok2 := expr.(parser.IdentExpression)
-	if !ok2 do return ""
-	fn_name := lexer.Token(id).data
-	for node in c.ast.nodes {
-		decl, ok3 := node.(parser.Declaration)
-		if !ok3 do continue
-		fn, ok4 := decl.(parser.FunctionDecl)
-		if !ok4 do continue
-		if fn.name.data != fn_name do continue
-		ret_idx, has_ret := fn.return_type.?
-		if !has_ret do return ""
-		return type_ann_ptr_inner(c, ret_idx)
-	}
-	return ""
+	fn, mod, found := resolve_callee_fn(c, e)
+	if !found { return "" }
+	ret_idx, has_ret := fn.return_type.?
+	if !has_ret { return "" }
+	saved := c.current_module
+	c.current_module = mod
+	defer c.current_module = saved
+	return type_ann_ptr_inner(c, ret_idx)
 }
 
 expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
@@ -2032,7 +2259,17 @@ expr_struct_type :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 			mangled := generic_struct_mangled_name(c, e.type_name.data, e.type_args)
 			if _, ok := c.struct_layouts^[mangled]; ok { return mangled }
 		}
-		return e.type_name.data
+		return c_mangle(c, e.type_name.data)
+	case parser.EnumLiteralExpression:
+		// A one-dot `mod.Struct{...}` parsed as an enum literal is really a qualified
+		// struct literal when `mod` names an import of the current module.
+		if !e.has_module {
+			if target, is_mod := c_alias(c, e.enum_name.data); is_mod {
+				key := parser.mangle(c.module_table, target, e.variant_name.data)
+				if _, ok := c.struct_layouts^[key]; ok { return key }
+			}
+		}
+		return ""
 	case parser.IdentExpression:
 		return local_struct_type(&c.bc, lexer.Token(e).data)
 	case parser.FieldAccessExpression:
@@ -2059,7 +2296,7 @@ expr_ptr_inner :: proc(c: ^Compiler, idx: parser.ExpressionIdx) -> string {
 	expr, ok := node.(parser.Expression)
 	if !ok do return ""
 	if ne, ok2 := expr.(parser.NewExpression); ok2 {
-		return ne.type_name.data
+		return c_mangle(c, ne.type_name.data)
 	}
 	if id, ok2 := expr.(parser.IdentExpression); ok2 {
 		return local_ptr_inner(&c.bc, lexer.Token(id).data)
@@ -2082,6 +2319,8 @@ compile_struct_literal :: proc(c: ^Compiler, e: parser.StructLiteralExpression, 
 			return
 		}
 		struct_name = instantiate_generic_struct(c, tmpl, e.type_args)
+	} else {
+		struct_name = c_mangle(c, struct_name)
 	}
 	layout, ok := c.struct_layouts^[struct_name]
 	if !ok {
@@ -2314,7 +2553,7 @@ compile_field_set :: proc(c: ^Compiler, e: parser.FieldAccessExpression, span: l
 // compile_new_expr pushes all struct fields in layout order, then emits NEW N.
 // The VM allocates a heap slice of N Value slots, pops them, and pushes a ^Value pointer.
 compile_new_expr :: proc(c: ^Compiler, e: parser.NewExpression, span: lexer.Span) {
-	layout, ok := c.struct_layouts^[e.type_name.data]
+	layout, ok := c.struct_layouts^[c_mangle(c, e.type_name.data)]
 	if !ok {
 		compiler_error(c, fmt.tprintf("undefined struct '%s'", e.type_name.data), span)
 		emit(&c.bc, .NIL, span)

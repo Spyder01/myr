@@ -1,0 +1,11 @@
+function square(x: i64) -> i64 {
+    x * x
+}
+
+function add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+function sum_of_squares(a: i64, b: i64) -> i64 {
+    add(square(a), square(b))
+}

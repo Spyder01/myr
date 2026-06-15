@@ -46,6 +46,11 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .RETURN:       return byte_instruction("RETURN", chunk, offset)
     case .PRINT:        return simple_instruction("PRINT", offset)
     case .INPUT:        return simple_instruction("INPUT", offset)
+    case .CALL_NATIVE:
+        slot  := chunk.code[offset + 1]
+        arity := chunk.code[offset + 2]
+        fmt.printf("%-16s %4d %4d\n", "CALL_NATIVE", slot, arity)
+        return offset + 3
     case .EQ:           return simple_instruction("EQ", offset)
     case .NEQ:          return simple_instruction("NEQ", offset)
     case .LT:           return simple_instruction("LT", offset)
@@ -130,6 +135,12 @@ disassemble_instruction :: proc(chunk: ^Chunk, offset: int) -> int {
     case .RETURN_CONST:  return const_return_instruction("RETURN_CONST", chunk, offset)
     // MOD_LOCAL_LOCAL_EQ_ZERO (3 bytes: opcode slot_a slot_b)
     case .MOD_LOCAL_LOCAL_EQ_ZERO: return two_byte_instruction("MOD_LL_EQ_ZERO", chunk, offset)
+    // Compare-and-branch (5 bytes: opcode a b hi lo) — offset relative to op end
+    case .BRANCH_LT_LOCALS:  return branch_instruction("BR_LT_LOCALS",  chunk, offset)
+    case .BRANCH_LTE_LOCALS: return branch_instruction("BR_LTE_LOCALS", chunk, offset)
+    case .BRANCH_GT_LOCALS:  return branch_instruction("BR_GT_LOCALS",  chunk, offset)
+    case .BRANCH_GTE_LOCALS: return branch_instruction("BR_GTE_LOCALS", chunk, offset)
+    case .BRANCH_MOD_LL_NZ:  return branch_instruction("BR_MOD_LL_NZ",  chunk, offset)
     // SQUARE_I64 / SQUARE_F64 (2 bytes: opcode slot)
     case .SQUARE_I64: return byte_instruction("SQUARE_I64", chunk, offset)
     case .SQUARE_F64: return byte_instruction("SQUARE_F64", chunk, offset)
@@ -226,6 +237,19 @@ const_return_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> in
 }
 
 // jump instructions — print name + offset + resolved target address
+// branch_instruction prints a fused compare-and-branch: op a b hi lo (5 bytes).
+// The forward offset is relative to the instruction's end.
+branch_instruction :: proc(name: string, chunk: ^Chunk, offset: int) -> int {
+    a      := chunk.code[offset + 1]
+    b      := chunk.code[offset + 2]
+    hi     := u16(chunk.code[offset + 3]) << 8
+    lo     := u16(chunk.code[offset + 4])
+    jump   := u16(hi | lo)
+    target := offset + 5 + int(jump)
+    fmt.printf("%-16s %4d %4d  -> %d\n", name, a, b, target)
+    return offset + 5
+}
+
 jump_instruction :: proc(name: string, sign: int, chunk: ^Chunk, offset: int) -> int {
     hi     := u16(chunk.code[offset + 1]) << 8
     lo     := u16(chunk.code[offset + 2])

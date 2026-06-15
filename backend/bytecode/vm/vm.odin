@@ -20,6 +20,7 @@ VM :: struct {
 	heap_objects: [dynamic][]Value,
 	char_cache:   [256]string,
 	functions:    []^Function,  // function table set by vm_interpret; indexed by FnRef
+	natives:      []bc.NativeFn, // borrowed; set by caller before vm_interpret
 	stack_top:    u16,
 	frame_count:  u8,
 	stdin:        io.Reader,
@@ -185,6 +186,15 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 
 		case .PRINT:
 			sp -= 1; print_value(vm.stack[sp]); fmt.println()
+
+		case .CALL_NATIVE:
+			slot  := read_byte(frame)
+			arity := read_byte(frame)
+			base  := sp - u16(arity)
+			result := vm.natives[slot](vm.stack[int(base):int(sp)])
+			sp = base
+			vm.stack[sp] = result
+			sp += 1
 
 		case .INPUT:
 			prompt := vm.stack[sp-1]; sp -= 1
@@ -543,6 +553,49 @@ vm_run :: proc(vm: ^VM) -> Maybe(VMError) {
 			if !is_falsy(cond) {
 				frame.ip += int(offset)
 			}
+
+		// Fused compare-and-branch: read two local slots and a forward offset, then
+		// branch when the comparison is FALSE. No value is pushed or popped.
+		case .BRANCH_LT_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			offset := read_short(frame)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if !(av < bv) do frame.ip += int(offset)
+
+		case .BRANCH_LTE_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			offset := read_short(frame)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if !(av <= bv) do frame.ip += int(offset)
+
+		case .BRANCH_GT_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			offset := read_short(frame)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if !(av > bv) do frame.ip += int(offset)
+
+		case .BRANCH_GTE_LOCALS:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			offset := read_short(frame)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if !(av >= bv) do frame.ip += int(offset)
+
+		case .BRANCH_MOD_LL_NZ:
+			a := u16(read_byte(frame)); b := u16(read_byte(frame))
+			offset := read_short(frame)
+			av, ok1 := vm.stack[frame.slots + a].(i64)
+			bv, ok2 := vm.stack[frame.slots + b].(i64)
+			if !ok1 || !ok2 do return .TYPE_ERROR
+			if bv == 0 do return .DIVISION_BY_ZERO
+			if av % bv != 0 do frame.ip += int(offset)
 
 		case .SET_LOCAL_POP:
 			slot := u16(read_byte(frame))

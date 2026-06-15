@@ -98,6 +98,22 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 				if v, ok2 := chunk.constants[c_idx].(i64); ok2 && v == 0 {
 					a := code[i+1]
 					b := code[i+3]
+					// Compare-and-branch: the divisibility test followed by
+					// JUMP_IF_FALSE_POP becomes BRANCH_MOD_LL_NZ (branch when a%b != 0).
+					// Source spans 11 bytes (the 8-byte test + 3-byte jump).
+					if i+11 <= n && Opcode(code[i+8]) == .JUMP_IF_FALSE_POP &&
+					   !jump_targets[i+8] && !jump_targets[i+9] && !jump_targets[i+10] {
+						orig   := (u16(code[i+9]) << 8) | u16(code[i+10])
+						stored := orig + 6   // rebase offset from 11-byte source to 5-byte op end
+						code[i]   = u8(Opcode.BRANCH_MOD_LL_NZ)
+						code[i+1] = a
+						code[i+2] = b
+						code[i+3] = u8(stored >> 8)
+						code[i+4] = u8(stored & 0xFF)
+						for j in 5..<11 { code[i+j] = u8(Opcode.NOP) }
+						i += 11
+						continue
+					}
 					code[i]   = u8(Opcode.MOD_LOCAL_LOCAL_EQ_ZERO)
 					code[i+1] = a
 					code[i+2] = b
@@ -139,6 +155,25 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			case op3 == .LTE  || op3 == .LTE_I64: fused = .LTE_LOCALS
 			case op3 == .GT   || op3 == .GT_I64:  fused = .GT_LOCALS
 			case op3 == .GTE  || op3 == .GTE_I64: fused = .GTE_LOCALS
+			}
+			// Compare-and-branch: a relational <CMP>_LOCALS immediately followed by
+			// JUMP_IF_FALSE_POP collapses into a single BRANCH_<CMP>_LOCALS dispatch.
+			// Source spans 8 bytes (GET_LOCAL a; GET_LOCAL b; CMP; JUMP_IF_FALSE_POP).
+			if s, ok2 := fused.?; ok2 {
+				if br, is_rel := branch_of_locals(s); is_rel && i+8 <= n &&
+				   Opcode(code[i+5]) == .JUMP_IF_FALSE_POP &&
+				   !jump_targets[i+5] && !jump_targets[i+6] && !jump_targets[i+7] {
+					orig   := (u16(code[i+6]) << 8) | u16(code[i+7])
+					stored := orig + 3   // rebase offset from 8-byte source to 5-byte op end
+					code[i]   = u8(br)
+					code[i+1] = a
+					code[i+2] = b
+					code[i+3] = u8(stored >> 8)
+					code[i+4] = u8(stored & 0xFF)
+					for j in 5..<8 { code[i+j] = u8(Opcode.NOP) }
+					i += 8
+					continue
+				}
 			}
 			if s, ok2 := fused.?; ok2 {
 				code[i]   = u8(s)
@@ -426,6 +461,21 @@ compact_nops :: proc(chunk: ^Chunk) {
 			new_offset   := u16(new_ip_after - new_target)
 			new_code[ni + 1] = u8(new_offset >> 8)
 			new_code[ni + 2] = u8(new_offset & 0xFF)
+
+		case .BRANCH_LT_LOCALS, .BRANCH_LTE_LOCALS, .BRANCH_GT_LOCALS,
+		     .BRANCH_GTE_LOCALS, .BRANCH_MOD_LL_NZ:
+			// 5-byte op (a b hi lo); forward offset stored relative to the op's end,
+			// so the target is uniformly old_pos + 5 + offset.
+			old_pos    := new_to_old[ni]
+			old_hi     := u16(code[old_pos + 3])
+			old_lo     := u16(code[old_pos + 4])
+			old_offset := (old_hi << 8) | old_lo
+			old_target   := old_pos + 5 + int(old_offset)
+			new_ip_after := ni + 5
+			new_target   := old_to_new[old_target]
+			new_offset   := u16(new_target - new_ip_after)
+			new_code[ni + 3] = u8(new_offset >> 8)
+			new_code[ni + 4] = u8(new_offset & 0xFF)
 		}
 		ni += instr_size(new_code[:], ni)
 	}
@@ -435,6 +485,19 @@ compact_nops :: proc(chunk: ^Chunk) {
 	delete(chunk.spans)
 	chunk.code  = new_code
 	chunk.spans = new_spans
+}
+
+// branch_of_locals maps a relational <CMP>_LOCALS opcode to its fused
+// compare-and-branch form, or returns ok=false for non-relational ops.
+@private
+branch_of_locals :: proc(op: Opcode) -> (Opcode, bool) {
+	#partial switch op {
+	case .LT_LOCALS:  return .BRANCH_LT_LOCALS,  true
+	case .LTE_LOCALS: return .BRANCH_LTE_LOCALS, true
+	case .GT_LOCALS:  return .BRANCH_GT_LOCALS,  true
+	case .GTE_LOCALS: return .BRANCH_GTE_LOCALS, true
+	}
+	return .NOP, false
 }
 
 // instr_size returns the byte width of the instruction at code[pos].
@@ -454,7 +517,8 @@ instr_size :: proc(code: []u8, pos: int) -> int {
 	     .ARRAY_GET, .ARRAY_SET, .ARRAY_GET_STACK, .SLICE_SET,
 	     .RETURN_LOCAL, .RETURN_CONST,
 	     .MOD_LOCAL_LOCAL_EQ_ZERO,
-	     .LOAD_FN:
+	     .LOAD_FN,
+	     .CALL_NATIVE:
 		return 3
 	case .SLICE_GET_STACK:
 		return 2
@@ -464,6 +528,9 @@ instr_size :: proc(code: []u8, pos: int) -> int {
 	     .GT_LOCAL_CONST, .GTE_LOCAL_CONST, .EQ_LOCAL_CONST,
 	     .ARRAY_SET_CHAINED:
 		return 4
+	case .BRANCH_LT_LOCALS, .BRANCH_LTE_LOCALS, .BRANCH_GT_LOCALS,
+	     .BRANCH_GTE_LOCALS, .BRANCH_MOD_LL_NZ:
+		return 5  // op a b hi lo
 	}
 	return 1
 }

@@ -88,6 +88,8 @@ TypecheckResult :: struct {
 Typechecker :: struct {
 	ast:            ^parser.AST,
 	nr:             ^nr.NRResult,
+	table:          ^parser.ModuleTable,
+	current_module: parser.ModuleId,   // module owning the decl currently being checked
 	types:          []TypeId,          // one entry per ast.nodes element; UNKNOWN_TYPE = not checked
 	type_table:     [dynamic]TypeInfo,
 	current_fn_ret: TypeId,            // return type of function being checked
@@ -95,12 +97,13 @@ Typechecker :: struct {
 	errors:         [MAX_TYPE_ERRORS]TypeCheckerError,
 }
 
-new_type_checker :: proc(ast: ^parser.AST, nrr: ^nr.NRResult) -> Typechecker {
+new_type_checker :: proc(ast: ^parser.AST, nrr: ^nr.NRResult, table: ^parser.ModuleTable) -> Typechecker {
 	assert(nrr.error_count == 0, "type checking requires clean name resolution")
 
 	tc := Typechecker{
 		ast            = ast,
 		nr             = nrr,
+		table          = table,
 		types          = make([]TypeId, len(ast.nodes)),
 		type_table     = make([dynamic]TypeInfo),
 		current_fn_ret = VOID_TYPE,
@@ -136,11 +139,11 @@ type_id_name :: proc(id: TypeId, table: []TypeInfo) -> string {
 	case FnType:
 		return "function"
 	case StructType:
-		return t.name
+		return parser.demangle(t.name)
 	case PointerType:
 		return "pointer"
 	case EnumType:
-		return t.name
+		return parser.demangle(t.name)
 	}
 	return "unknown"
 }
