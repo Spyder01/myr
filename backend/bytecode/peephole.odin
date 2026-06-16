@@ -46,14 +46,14 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 		// where constants[c].(i64) == 1 and same slot — 8 bytes total
 		if op == .GET_LOCAL && i+8 <= n && Opcode(code[i+2]) == .CONST {
 			op4 := Opcode(code[i+4])
-			if (op4 == .ADD || op4 == .ADD_I64 || op4 == .SUB || op4 == .SUB_I64) &&
+			if (op4 == .ADD_I64 || op4 == .SUB_I64) &&   // typed only; bare op may be float in a generic body
 			   Opcode(code[i+5]) == .SET_LOCAL &&
 			   code[i+1] == code[i+6] &&
 			   Opcode(code[i+7]) == .POP {
 				c_idx := code[i+3]
 				if int(c_idx) < len(chunk.constants) {
 					if v, ok2 := chunk.constants[c_idx].(i64); ok2 && v == 1 {
-						is_inc := op4 == .ADD || op4 == .ADD_I64
+						is_inc := op4 == .ADD_I64
 						slot   := code[i+1]
 						code[i]   = u8(Opcode.INC_LOCAL if is_inc else Opcode.DEC_LOCAL)
 						code[i+1] = slot
@@ -69,7 +69,7 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 		// GET_LOCAL s; CONST_LONG hi lo; (ADD|SUB)_I64?; SET_LOCAL s; POP — 9 bytes
 		if op == .GET_LOCAL && i+9 <= n && Opcode(code[i+2]) == .CONST_LONG {
 			op5 := Opcode(code[i+5])
-			if (op5 == .ADD || op5 == .ADD_I64 || op5 == .SUB || op5 == .SUB_I64) &&
+			if (op5 == .ADD_I64 || op5 == .SUB_I64) &&   // typed only; bare op may be float in a generic body
 			   Opcode(code[i+6]) == .SET_LOCAL &&
 			   code[i+1] == code[i+7] &&
 			   Opcode(code[i+8]) == .POP {
@@ -77,7 +77,7 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 				c_idx := (hi << 8) | lo
 				if int(c_idx) < len(chunk.constants) {
 					if v, ok2 := chunk.constants[c_idx].(i64); ok2 && v == 1 {
-						is_inc := op5 == .ADD || op5 == .ADD_I64
+						is_inc := op5 == .ADD_I64
 						slot   := code[i+1]
 						code[i]   = u8(Opcode.INC_LOCAL if is_inc else Opcode.DEC_LOCAL)
 						code[i+1] = slot
@@ -91,7 +91,7 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 
 		// ── GET_LOCAL a; GET_LOCAL b; MOD_I64; CONST 0; EQ → MOD_LOCAL_LOCAL_EQ_ZERO a b ─
 		if op == .GET_LOCAL && i+8 <= n && Opcode(code[i+2]) == .GET_LOCAL &&
-		   (Opcode(code[i+4]) == .MOD_I64 || Opcode(code[i+4]) == .MOD) &&
+		   Opcode(code[i+4]) == .MOD_I64 &&   // typed only; bare .MOD may be float in a generic body
 		   Opcode(code[i+5]) == .CONST && Opcode(code[i+7]) == .EQ {
 			c_idx := code[i+6]
 			if int(c_idx) < len(chunk.constants) {
@@ -133,8 +133,8 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			if a == b {
 				sq: Maybe(Opcode)
 				switch {
-				case op3 == .MUL || op3 == .MUL_I64: sq = .SQUARE_I64
-				case op3 == .MUL_F64:                 sq = .SQUARE_F64
+				case op3 == .MUL_I64: sq = .SQUARE_I64   // typed only; bare .MUL may be float in a generic body
+				case op3 == .MUL_F64: sq = .SQUARE_F64
 				}
 				if sq_op, ok2 := sq.?; ok2 {
 					code[i]   = u8(sq_op)
@@ -144,17 +144,21 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 					continue
 				}
 			}
+			// Only fuse the TYPED i64 ops: the _LOCALS superinstructions assume i64
+			// operands, but a bare untyped op (e.g. inside an un-typechecked generic
+			// body, which may run on floats) must fall through to the polymorphic
+			// dynamic opcode instead.
 			fused: Maybe(Opcode)
-			switch {
-			case op3 == .ADD  || op3 == .ADD_I64: fused = .ADD_LOCALS
-			case op3 == .MUL  || op3 == .MUL_I64: fused = .MUL_LOCALS
-			case op3 == .SUB  || op3 == .SUB_I64: fused = .SUB_LOCALS
-			case op3 == .DIV  || op3 == .DIV_I64: fused = .DIV_LOCALS
-			case op3 == .MOD  || op3 == .MOD_I64: fused = .MOD_LOCALS
-			case op3 == .LT   || op3 == .LT_I64:  fused = .LT_LOCALS
-			case op3 == .LTE  || op3 == .LTE_I64: fused = .LTE_LOCALS
-			case op3 == .GT   || op3 == .GT_I64:  fused = .GT_LOCALS
-			case op3 == .GTE  || op3 == .GTE_I64: fused = .GTE_LOCALS
+			#partial switch op3 {
+			case .ADD_I64: fused = .ADD_LOCALS
+			case .MUL_I64: fused = .MUL_LOCALS
+			case .SUB_I64: fused = .SUB_LOCALS
+			case .DIV_I64: fused = .DIV_LOCALS
+			case .MOD_I64: fused = .MOD_LOCALS
+			case .LT_I64:  fused = .LT_LOCALS
+			case .LTE_I64: fused = .LTE_LOCALS
+			case .GT_I64:  fused = .GT_LOCALS
+			case .GTE_I64: fused = .GTE_LOCALS
 			}
 			// Compare-and-branch: a relational <CMP>_LOCALS immediately followed by
 			// JUMP_IF_FALSE_POP collapses into a single BRANCH_<CMP>_LOCALS dispatch.
@@ -191,14 +195,16 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			slot := code[i+1]
 			c    := code[i+3]
 			op3  := Opcode(code[i+4])
+			// Typed i64 ops only (these superinstructions assume i64); EQ_LOCAL_CONST
+			// is polymorphic so bare .EQ is safe.
 			fused: Maybe(Opcode)
-			switch {
-			case op3 == .LT  || op3 == .LT_I64:  fused = .LT_LOCAL_CONST
-			case op3 == .LTE || op3 == .LTE_I64: fused = .LTE_LOCAL_CONST
-			case op3 == .GT  || op3 == .GT_I64:  fused = .GT_LOCAL_CONST
-			case op3 == .GTE || op3 == .GTE_I64: fused = .GTE_LOCAL_CONST
-			case op3 == .SUB || op3 == .SUB_I64: fused = .SUB_LOCAL_CONST
-			case op3 == .EQ:                      fused = .EQ_LOCAL_CONST
+			#partial switch op3 {
+			case .LT_I64:  fused = .LT_LOCAL_CONST
+			case .LTE_I64: fused = .LTE_LOCAL_CONST
+			case .GT_I64:  fused = .GT_LOCAL_CONST
+			case .GTE_I64: fused = .GTE_LOCAL_CONST
+			case .SUB_I64: fused = .SUB_LOCAL_CONST
+			case .EQ:      fused = .EQ_LOCAL_CONST
 			}
 			if s, ok2 := fused.?; ok2 {
 				code[i]   = u8(s)
@@ -218,13 +224,13 @@ peephole_optimize_chunk :: proc(chunk: ^Chunk) {
 			lo   := code[i+4]
 			op3  := Opcode(code[i+5])
 			fused: Maybe(Opcode)
-			switch {
-			case op3 == .LT  || op3 == .LT_I64:  fused = .LT_LOCAL_CONST
-			case op3 == .LTE || op3 == .LTE_I64: fused = .LTE_LOCAL_CONST
-			case op3 == .GT  || op3 == .GT_I64:  fused = .GT_LOCAL_CONST
-			case op3 == .GTE || op3 == .GTE_I64: fused = .GTE_LOCAL_CONST
-			case op3 == .SUB || op3 == .SUB_I64: fused = .SUB_LOCAL_CONST
-			case op3 == .EQ:                      fused = .EQ_LOCAL_CONST
+			#partial switch op3 {
+			case .LT_I64:  fused = .LT_LOCAL_CONST
+			case .LTE_I64: fused = .LTE_LOCAL_CONST
+			case .GT_I64:  fused = .GT_LOCAL_CONST
+			case .GTE_I64: fused = .GTE_LOCAL_CONST
+			case .SUB_I64: fused = .SUB_LOCAL_CONST
+			case .EQ:      fused = .EQ_LOCAL_CONST
 			}
 			if s, ok2 := fused.?; ok2 {
 				code[i]   = u8(s)
