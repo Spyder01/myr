@@ -19,8 +19,9 @@ Myr is a strongly-typed, embedded language with FP ergonomics. The runtime is a 
 11. [Slices](#slices)
 12. [Strings](#strings)
 13. [Generic Functions and Structs](#generic-functions-and-structs)
-14. [Built-ins](#built-ins)
-15. [CLI](#cli)
+14. [Modules](#modules)
+15. [Built-ins](#built-ins)
+16. [CLI](#cli)
 
 ---
 
@@ -941,6 +942,89 @@ function main() {
     print(clamp(5, 0, 10))      // 5
 }
 ```
+
+---
+
+## Modules
+
+Myr organizes code by **directory**, not by file. The rules are:
+
+- **A directory is one module.** Every `.myr` file in the same directory is part of the same compilation unit and shares one scope — functions, structs, and enums in sibling files call each other directly, unqualified. (A directory may define only one `main`.)
+- **A subdirectory is a separate, importable module.** Its members are reached through a namespace; they are *not* visible unqualified to importers.
+
+### Importing
+
+`import` takes a directory name (relative to the importing file). Members are accessed with `module.member`:
+
+```
+project/
+  main.myr
+  math/
+    ops.myr
+```
+
+```
+// math/ops.myr — files inside a module call each other unqualified
+function square(x: int) -> int { return x * x }
+function add(a: int, b: int) -> int { return a + b }
+function sum_of_squares(a: int, b: int) -> int {
+    return add(square(a), square(b))   // square/add are module-mates
+}
+```
+
+```
+// main.myr
+import "math"
+
+function main() {
+    print(math.add(3, 4))            // 7
+    print(math.sum_of_squares(3, 4)) // 25
+}
+```
+
+### Aliasing
+
+Rename the namespace at the import site with `as`:
+
+```
+import "math" as m
+
+function main() {
+    print(m.square(5))   // 25
+}
+```
+
+### Module-qualified types
+
+Structs and enums from a module are referenced qualified, in both type position and literals (including `match` patterns):
+
+```
+// shapes/shapes.myr
+struct Vec { x: i64, y: i64 }
+enum Color { Red { v: i64 }, Blue { v: i64 } }
+```
+
+```
+import "shapes"
+
+function main() {
+    let v: shapes.Vec = shapes.Vec{ x = 3, y = 4 }
+    print(v.x)                                   // 3
+
+    let c = shapes.Color.Red{ v = 99 }
+    match c {
+        shapes.Color.Red  { v } => { print(v) }  // 99
+        shapes.Color.Blue { v } => { print(v) }
+    }
+}
+```
+
+### Semantics and limits
+
+- **Qualified-only access.** Imported members are reachable only as `module.member`; a bare reference to an imported name is an "undefined" error. This keeps modules isolated and lets two modules define same-named functions without collision.
+- **Transitive loading.** A module's files may themselves `import` other modules; the whole graph is loaded.
+- **Circular-import detection.** Import cycles are reported, e.g. `circular import: a -> b -> a`.
+- **Resolution** is relative to the entry file's directory.
 
 ---
 
