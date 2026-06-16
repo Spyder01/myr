@@ -1,8 +1,17 @@
-# Myr
+<p align="center">
+  <img src="assets/logo.png" alt="Myr logo" width="140">
+</p>
 
-A lightweight, embeddable, strongly-typed language with FP ergonomics.
+<h1 align="center">Myr</h1>
 
-Memory-efficient and performant by design — algebraic types, no hidden costs, no magic. Implemented in [Odin](https://odin-lang.org).
+<p align="center">
+  A lightweight, embeddable, strongly-typed language with FP ergonomics.
+</p>
+
+<p align="center">
+  Memory-efficient and performant by design — algebraic types, no hidden costs, no magic.<br>
+  Implemented in <a href="https://odin-lang.org">Odin</a>.
+</p>
 
 ---
 
